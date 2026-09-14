@@ -1,10 +1,8 @@
-recordings/
-audio-data/
+/data/guitar-perf-audio/
+/data/guitar-perf-gp/
 .venv/
 .tools/
 __pycache__/
-scores/
-raw-gp-file-data/
 datasets/
 checkpoints/
 runs/
