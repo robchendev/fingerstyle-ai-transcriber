@@ -1,4 +1,8 @@
 recordings/
+audio-data/
+.venv/
+.tools/
+__pycache__/
 scores/
 datasets/
 checkpoints/
