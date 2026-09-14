@@ -99,6 +99,20 @@ def compare_tuning(entry, inspection):
     return None
 
 
+def apply_owner_confirmation(result, rules):
+    confirmation = rules.get("ownerConfirmations", {}).get(result["catalogId"])
+    if confirmation is None:
+        return
+    if confirmation["gpSha256"] != result["sha256"]:
+        result["issues"].append("owner_confirmation_revision_mismatch")
+        return
+    if confirmation["capoType"] != "full":
+        raise GpInspectionError("Unsupported owner capo confirmation.")
+    result["ownerConfirmation"] = dict(confirmation)
+    result["resolvedInspectionIssues"] = [issue for issue in result["inspection"]["warnings"] if issue == "inconsistent_partial_capo_metadata"]
+    result["issues"] = [issue for issue in result["issues"] if issue not in result["resolvedInspectionIssues"]]
+
+
 def notes_per_track(root, tracks):
     bars = {item.get("id"): item for item in root.findall("./Bars/Bar")}
     voices = {item.get("id"): item for item in root.findall("./Voices/Voice")}

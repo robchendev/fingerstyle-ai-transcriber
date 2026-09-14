@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from zipfile import ZipFile
 
-from scripts.inspect_gp_files import candidate_priority, compare_tuning, inspect_gp, matches_entry
+from scripts.inspect_gp_files import apply_owner_confirmation, candidate_priority, compare_tuning, inspect_gp, matches_entry
 
 
 def score(track_count=1, partial_fret=0, flags="000000", annotation=""):
@@ -64,6 +64,37 @@ class GpInspectionTests(unittest.TestCase):
         self.assertIsNone(compare_tuning(entry, self.inspect(score())))
         entry["tunings"][0]["strings"][0] = "D2"
         self.assertEqual(compare_tuning(entry, self.inspect(score())), "catalog_gp_tuning_mismatch")
+
+    def test_owner_confirmation_resolves_only_stale_metadata_on_the_confirmed_revision(self):
+        inspection = self.inspect(score(partial_fret=4))
+        result = {"catalogId": "set-a-item-0218", "sha256": "a" * 64, "inspection": inspection, "issues": [*inspection["warnings"], "catalog_gp_tuning_mismatch"]}
+        rules = {"ownerConfirmations": {"set-a-item-0218": {"gpSha256": "a" * 64, "capoType": "full", "note": "Owner confirmed normal capo."}}}
+        apply_owner_confirmation(result, rules)
+        self.assertEqual(result["issues"], ["catalog_gp_tuning_mismatch"])
+        self.assertIn("inconsistent_partial_capo_metadata", inspection["warnings"])
+        apply_owner_confirmation(result, rules)
+        self.assertEqual(result["resolvedInspectionIssues"], ["inconsistent_partial_capo_metadata"])
+        other = {"catalogId": "set-a-item-0218", "sha256": "b" * 64, "issues": ["inconsistent_partial_capo_metadata"]}
+        apply_owner_confirmation(other, rules)
+        self.assertIn("inconsistent_partial_capo_metadata", other["issues"])
+        self.assertIn("owner_confirmation_revision_mismatch", other["issues"])
+        self.assertNotIn("ownerConfirmation", other)
+
+    def test_inspection_leaves_style_resources_untouched_and_out_of_the_music_hash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inspections = []
+            for index in (1, 2):
+                path = Path(directory) / f"styled-{index}.gp"
+                xml = score().replace("<Score>", f"<Score><FirstPageHeader>Custom font size {index}</FirstPageHeader>")
+                with ZipFile(path, "w") as archive:
+                    archive.writestr("Content/score.gpif", xml)
+                    archive.writestr("Content/Preferences.json", f'{{"customSetting": {index}}}')
+                    archive.writestr("Content/Stylesheets/score.gpss", bytes([index, 0, 255]))
+                    archive.writestr("Content/UnknownSetting.bin", bytes([index, 42]))
+                before = path.read_bytes()
+                inspections.append(inspect_gp(path))
+                self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(inspections[0]["musicXmlSha256"], inspections[1]["musicXmlSha256"])
 
     def test_matching_respects_full_title_boundaries_artists_and_years(self):
         rules = {"titleAliases": {}, "requiredFilenameText": {}, "excludedPathText": ["\\Noble\\"], "sourcePreference": ["Tabs\\Transcriptions 2022+\\", "Tabs\\MyMusicSheet Migration\\"]}
