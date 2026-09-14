@@ -4,6 +4,7 @@ audio-data/
 .tools/
 __pycache__/
 scores/
+raw-gp-file-data/
 datasets/
 checkpoints/
 runs/
