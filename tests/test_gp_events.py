@@ -9,7 +9,7 @@ from zipfile import ZipFile
 
 from scripts.download_audio import sha256
 from scripts.extract_gp_events import extract_entry
-from scripts.gp_events import EventExtractionError, decode_score, note_event, performance_events, playback_order, rhythm_duration
+from scripts.gp_events import EventExtractionError, catalog_timing, decode_score, note_event, performance_events, playback_order, rhythm_duration, validate_provided_timing
 
 
 TUNING = [40, 45, 50, 55, 59, 64]
@@ -67,6 +67,39 @@ def bar(start=False, end=0, endings=(), targets=(), jumps=()):
 
 
 class MusicalEventTests(unittest.TestCase):
+    def test_supplied_tempo_preserves_dotted_beat_unit_and_unreduced_meter(self):
+        root = musical_score()
+        for measure in root.findall("./MasterBars/MasterBar"):
+            measure.find("Time").text = "6/8"
+        timing = catalog_timing(decode_score(root, TUNING, 2))
+        self.assertEqual(timing["tempo"], {"bpm": 60, "beatUnit": [3, 8]})
+        self.assertEqual(timing["timeSignature"], [6, 8])
+        self.assertEqual(validate_provided_timing(timing["tempo"], timing["timeSignature"]), Fraction(90))
+        self.assertEqual(timing["sourceTempoChanges"], [])
+        self.assertEqual(timing["sourceTimeSignatureChanges"], [])
+        for tempo, meter in ((None, [4, 4]), ({"bpm": 120}, [4, 4]), ({"bpm": 120, "beatUnit": [1, 4]}, None), ({"bpm": 0, "beatUnit": [1, 4]}, [4, 4]), ({"bpm": True, "beatUnit": [1, 4]}, [4, 4]), ({"bpm": 90, "beatUnit": [1, 4]}, [4, 0])):
+            with self.subTest(tempo=tempo, meter=meter), self.assertRaises(EventExtractionError):
+                validate_provided_timing(tempo, meter)
+
+    def test_source_tempo_and_meter_changes_are_not_flattened(self):
+        root = musical_score()
+        root.findall("./MasterBars/MasterBar")[1].find("Time").text = "3/4"
+        root.find("./MasterTrack/Automations").append(ET.fromstring("<Automation><Type>Tempo</Type><Bar>1</Bar><Position>0.5</Position><Value>72 2</Value><Linear>true</Linear></Automation>"))
+        timing = catalog_timing(decode_score(root, TUNING, 2))
+        self.assertEqual(timing["sourceTempoChanges"], [{"measureIndex": 1, "positionRatio": [1, 2], "bpm": 72, "beatUnit": [1, 4], "linear": True}])
+        self.assertEqual(timing["sourceTimeSignatureChanges"], [{"measureIndex": 1, "timeSignature": [3, 4]}])
+        section = ET.SubElement(root.findall("./MasterBars/MasterBar")[1], "Section")
+        ET.SubElement(section, "Text").text = "Instructions"
+        reference = catalog_timing(decode_score(root, TUNING, 2))
+        self.assertEqual(reference["sourceTempoChanges"], [])
+        self.assertEqual(reference["sourceTimeSignatureChanges"], [])
+
+    def test_absent_initial_tempo_is_not_replaced_with_a_default(self):
+        root = musical_score()
+        root.find("./MasterTrack/Automations/Automation/Bar").text = "1"
+        with self.assertRaisesRegex(EventExtractionError, "start of the performance"):
+            catalog_timing(decode_score(root, TUNING, 2))
+
     def test_rational_rhythms_preserve_dots_and_tuplets(self):
         rhythm = ET.fromstring('<Rhythm><NoteValue>Quarter</NoteValue><AugmentationDot count="2"/><PrimaryTuplet num="3" den="2"/></Rhythm>')
         duration, notation = rhythm_duration(rhythm)
@@ -165,6 +198,10 @@ class MusicalEventTests(unittest.TestCase):
                 self.assertIsNone(output["audioAlignment"])
                 self.assertIsNone(entry["capoFret"])
                 self.assertEqual(path.read_bytes(), before)
+                entry["tempo"] = {"bpm": 61, "beatUnit": [3, 8]}
+                with self.assertRaisesRegex(EventExtractionError, "tempo conflicts"):
+                    extract_entry(entry, audit, {})
+                del entry["tempo"]
                 entry["capoFret"] = 3
                 with self.assertRaisesRegex(EventExtractionError, "conflicts"):
                     extract_entry(entry, audit, {})

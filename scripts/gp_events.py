@@ -17,6 +17,7 @@ NOTE_VALUES = {
     "64th": Fraction(1, 16), "128th": Fraction(1, 32),
 }
 HARMONIC_OFFSETS = {Fraction(5): 24, Fraction(7): 19, Fraction(9): 28, Fraction(12): 12, Fraction(19): 19, Fraction(24): 24}
+TEMPO_BEAT_UNITS = {1: Fraction(1, 8), 2: Fraction(1, 4), 3: Fraction(3, 8), 4: Fraction(1, 2), 5: Fraction(3, 4)}
 NOTE_FLAGS = {"Muted": "dead", "PalmMuted": "palmMuted", "HopoOrigin": "hopoOrigin", "HopoDestination": "hopoDestination", "LeftHandTapped": "leftHandTapped", "Tapped": "tapped"}
 NOTE_KNOWN = set(NOTE_FLAGS) | {"ConcertPitch", "TransposedPitch", "Fret", "String", "Midi", "Harmonic", "HarmonicFret", "HarmonicType", "Slide", "Bended", "BendDestinationOffset", "BendDestinationValue", "BendMiddleOffset1", "BendMiddleOffset2", "BendMiddleValue", "BendOriginOffset", "BendOriginValue"}
 BEAT_KNOWN = {"PrimaryPickupVolume", "PrimaryPickupTone", "PickStroke", "Brush", "Slapped", "Rasgueado"}
@@ -181,7 +182,6 @@ def beat_techniques(beat, identifier, issues):
 
 def tempo_events(root, measures):
     result = []
-    units = {1: Fraction(1, 2), 2: Fraction(1), 3: Fraction(3, 2), 4: Fraction(2), 5: Fraction(3)}
     for automation in root.findall("./MasterTrack/Automations/Automation"):
         if automation.findtext("Type") != "Tempo":
             continue
@@ -193,7 +193,7 @@ def tempo_events(root, measures):
         if len(values) != 2 or not 0 <= position <= 1:
             raise EventExtractionError("Invalid tempo value or position.")
         tempo, reference = Fraction(values[0]), integer(values[1], "tempo unit")
-        if tempo <= 0 or reference not in units:
+        if tempo <= 0 or reference not in TEMPO_BEAT_UNITS:
             raise EventExtractionError("Unsupported tempo reference or nonpositive tempo.")
         linear = required_text(automation, "Linear")
         if linear not in ("true", "false"):
@@ -201,12 +201,61 @@ def tempo_events(root, measures):
         result.append({
             "measureIndex": bar, "positionRatio": rational(position),
             "offsetQuarter": rational(position * Fraction(*measures[bar]["durationQuarter"])),
-            "quarterBpm": rational(tempo * units[reference]),
+            "quarterBpm": rational(tempo * TEMPO_BEAT_UNITS[reference] * 4),
+            "bpm": int(tempo) if tempo.denominator == 1 else float(tempo),
+            "beatUnit": rational(TEMPO_BEAT_UNITS[reference]),
             "gpReference": reference, "linear": linear == "true",
         })
     if not result:
         raise EventExtractionError("No explicit tempo metadata.")
     return result
+
+
+def validate_provided_timing(tempo, time_signature):
+    if not isinstance(tempo, dict) or "bpm" not in tempo or "beatUnit" not in tempo:
+        raise EventExtractionError("BPM and its beat unit are required inputs.")
+    bpm, unit = tempo["bpm"], tempo["beatUnit"]
+    if isinstance(bpm, bool) or not isinstance(bpm, (int, float)) or not math.isfinite(bpm) or bpm <= 0:
+        raise EventExtractionError("BPM must be a finite positive number.")
+    if not isinstance(unit, list) or len(unit) != 2 or any(type(value) is not int or value <= 0 for value in unit):
+        raise EventExtractionError("Tempo beat unit must be a positive [numerator, denominator] pair.")
+    if not isinstance(time_signature, list) or len(time_signature) != 2 or any(type(value) is not int or value <= 0 for value in time_signature):
+        raise EventExtractionError("Time signature is a required positive [numerator, denominator] pair.")
+    denominator = time_signature[1]
+    if denominator & (denominator - 1):
+        raise EventExtractionError("Unsupported time-signature denominator; do not silently normalize it.")
+    return Fraction(str(bpm)) * Fraction(*unit) * 4
+
+
+def catalog_timing(decoded):
+    musical_measures = [measure for measure in decoded["measures"] if not measure["referenceOnly"]]
+    if not musical_measures:
+        raise EventExtractionError("No performed measures to establish timing inputs.")
+    first = musical_measures[0]["index"]
+    tempo_events = sorted(decoded["tempoEvents"], key=lambda event: (event["measureIndex"], Fraction(*event["positionRatio"])))
+    initial_candidates = [event for event in tempo_events if (event["measureIndex"], Fraction(*event["positionRatio"])) <= (first, Fraction(0))]
+    if not initial_candidates:
+        raise EventExtractionError("No explicit tempo at the start of the performance.")
+    initial = initial_candidates[-1]
+    tempo = {"bpm": initial["bpm"], "beatUnit": initial["beatUnit"]}
+    signature = musical_measures[0]["timeSignature"]
+    validate_provided_timing(tempo, signature)
+    changes = []
+    initial_position = (initial["measureIndex"], Fraction(*initial["positionRatio"]))
+    for event in tempo_events:
+        position = (event["measureIndex"], Fraction(*event["positionRatio"]))
+        if position < initial_position or decoded["measures"][event["measureIndex"]]["referenceOnly"]:
+            continue
+        if event == initial and not event["linear"]:
+            continue
+        changes.append({key: event[key] for key in ("measureIndex", "positionRatio", "bpm", "beatUnit", "linear")})
+    meter_changes = []
+    previous = signature
+    for measure in musical_measures[1:]:
+        if measure["timeSignature"] != previous:
+            meter_changes.append({"measureIndex": measure["index"], "timeSignature": measure["timeSignature"]})
+            previous = measure["timeSignature"]
+    return {"tempo": tempo, "timeSignature": signature, "sourceTempoChanges": changes, "sourceTimeSignatureChanges": meter_changes}
 
 
 def decode_score(root, tuning, capo):
