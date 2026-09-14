@@ -352,8 +352,13 @@ def decode_score(root, tuning, capo):
     return {"measures": measures, "scoreEvents": events, "tempoEvents": tempo_events(root, measures), "issues": issues}
 
 
-def playback_order(measures):
+def playback_order(measures, fine_measure_index=None):
     """Expand flat repeats and common D.C./D.S./Coda navigation."""
+    if fine_measure_index is not None:
+        if type(fine_measure_index) is not int or not 0 <= fine_measure_index < len(measures) or measures[fine_measure_index].get("referenceOnly", False):
+            raise EventExtractionError("Confirmed Fine must identify a musical measure.")
+        if any(direction["kind"] == "Target" and direction["value"] == "Fine" for measure in measures for direction in measure["directions"]):
+            raise EventExtractionError("A confirmed Fine override cannot replace an explicit Fine target.")
     for measure in measures:
         for direction in measure["directions"]:
             if direction["kind"] not in ("Jump", "Target"):
@@ -397,7 +402,8 @@ def playback_order(measures):
         commands = [jump for jump in jumps if jump not in ("DaCoda", "DaDoubleCoda") and (index, jump) not in used_jumps]
         if len(commands) > 1:
             raise EventExtractionError("Multiple competing direction jumps on one bar.")
-        if return_mode == "Fine" and "Fine" in targets:
+        if return_mode == "Fine" and ("Fine" in targets or index == fine_measure_index):
+            return_mode = None
             break
         if return_mode in ("Coda", "DoubleCoda") and "Da" + return_mode in jumps:
             matches = [position for position, item in enumerate(measures) if not item.get("referenceOnly", False) and any(d["kind"] == "Target" and d["value"] == return_mode for d in item["directions"])]

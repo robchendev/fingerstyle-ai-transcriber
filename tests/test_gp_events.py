@@ -208,8 +208,47 @@ class MusicalEventTests(unittest.TestCase):
                 with self.assertRaisesRegex(EventExtractionError, "revision"):
                     extract_entry(entry, {"sha256": "0" * 64}, {})
 
+    def test_owner_confirmed_fine_preserves_source_and_excludes_instruction_measures(self):
+        score = musical_score()
+        measures = score.find("MasterBars")
+        ET.SubElement(ET.SubElement(measures[0], "Directions"), "Target").text = "Segno"
+        ET.SubElement(ET.SubElement(measures[1], "Directions"), "Jump").text = "DaSegnoAlFine"
+        measures.append(ET.fromstring("<MasterBar><Time>4/4</Time><Bars>1</Bars><Section><Text>Instructions</Text></Section></MasterBar>"))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "example.gp"
+            with ZipFile(path, "w") as archive:
+                archive.writestr("Content/score.gpif", ET.tostring(score))
+            before = path.read_bytes()
+            entry = {"id": "example", "title": "Example", "localGpPath": path.name, "localAudioPath": None, "rangeSeconds": None, "selectedTuningIndex": 0, "tunings": [{"strings": ["E2", "A2", "D3", "G3", "B3", "E4"]}], "capoFret": None}
+            audit = {"sha256": sha256(path)}
+            confirmation = {"gpSha256": audit["sha256"], "fineTarget": "last-musical-measure", "note": "Owner confirmed."}
+            rules = {"navigationOverrides": {"example": confirmation}}
+            with patch("scripts.extract_gp_events.ROOT", root), patch("scripts.extract_gp_events.GP_ROOT", root):
+                self.assertIsNone(extract_entry(entry, audit, {})["playback"])
+                output = extract_entry(entry, audit, rules)
+                self.assertEqual([visit["measureIndex"] for visit in output["playback"]["measureVisits"]], [0, 1, 0, 1])
+                self.assertEqual(output["navigationOverride"]["fineMeasureIndex"], 1)
+                self.assertFalse(any(direction["value"] == "Fine" for measure in output["measures"] for direction in measure["directions"]))
+                self.assertEqual(path.read_bytes(), before)
+                confirmation["gpSha256"] = "0" * 64
+                with self.assertRaisesRegex(EventExtractionError, "Navigation confirmation"):
+                    extract_entry(entry, audit, rules)
+
 
 class NavigationTests(unittest.TestCase):
+    def test_explicit_fine_is_a_successful_destination(self):
+        measures = [bar(targets=["Segno"]), bar(targets=["Fine"]), bar(jumps=["DaSegnoAlFine"])]
+        self.assertEqual(playback_order(measures), [0, 1, 2, 0, 1])
+        with self.assertRaisesRegex(EventExtractionError, "explicit Fine"):
+            playback_order(measures, fine_measure_index=2)
+
+    def test_confirmed_fine_must_be_a_musical_measure(self):
+        measures = [bar(targets=["Segno"]), bar(jumps=["DaSegnoAlFine"]), dict(bar(), referenceOnly=True)]
+        for index in (-1, 2, 3, True):
+            with self.subTest(index=index), self.assertRaisesRegex(EventExtractionError, "musical measure"):
+                playback_order(measures, fine_measure_index=index)
+
     def test_repeats_inherited_voltas_and_multiple_closings(self):
         self.assertEqual(playback_order([bar(start=True), bar(), bar(end=2, endings=[1]), bar(endings=[2]), bar()]), [0, 1, 2, 0, 1, 3, 4])
         self.assertEqual(playback_order([bar(start=True), bar(endings=[1]), bar(end=2), bar(endings=[2])]), [0, 1, 2, 0, 3])
