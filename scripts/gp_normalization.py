@@ -1,6 +1,7 @@
 """Lossless-template, score-time normalization of reviewed GP percussion."""
 
 from collections import Counter
+from bisect import bisect_left
 from copy import deepcopy
 from fractions import Fraction
 import hashlib
@@ -9,12 +10,12 @@ import xml.etree.ElementTree as ET
 from xml.dom import Node, minidom
 from zipfile import BadZipFile, ZipFile
 
-from .canonical_events import canonical_counts, canonicalize, fraction, normalized_text, rule_tokens, source_indices, is_percussive_hit_text
+from .canonical_events import canonical_counts, canonicalize, fraction, normalized_text, rule_tokens, source_indices, is_percussive_hit_text, performance_beats, performance_slot_keys
 from .gp_events import NOTE_VALUES, beat_techniques, catalog_timing, decode_score, index_section, performance_events, rational
 
 
 GPIF_ENTRY = "Content/score.gpif"
-NORMALIZATION_VERSION = 2
+NORMALIZATION_VERSION = 3
 GENERIC_TECHNIQUES = frozenset({
     "body_tap", "body_flam", "body_scratch", "body_slap", "body_rasgueado",
     "string_slap", "nail_attack", "slap_pluck", "finger_snap", "snare_tap",
@@ -23,9 +24,11 @@ GENERIC_TECHNIQUES = frozenset({
 })
 PLACEMENT_LIMITATION = (
     "Strings are free only under full notated sustain intervals [start, end). "
-    "A notated end is not evidence of acoustic decay. Unresolved/grace durations "
-    "and retained note symbols reserve their strings conservatively; generic strings are "
-    "notation carriers, not fingering labels."
+    "A notated end is not evidence of acoustic decay. Grace uncertainty reserves its "
+    "bounded source passage through a known segment end or next same-string attack; "
+    "unbounded uncertainty and retained symbols remain conservative. Generic strings are "
+    "notation carriers, not fingering labels. If a native carrier is unsafe, use explicit "
+    "(X) beat text at the original score slot without changing sounding notes."
 )
 
 
@@ -110,14 +113,55 @@ def ghost_dead_note(identifier, string, tuning, capo, *, pitch_profile):
     return note
 
 
-def select_free_string(notes, onset, *, reserved=()):
-    """Choose bass first; unknown duration reserves a string for the whole score."""
+def notated_uncertainty_intervals(notes, score):
+    attacks = {}
+    regular_beats = {}
+    for note in notes:
+        parts = note.get("sourceSegments", [])
+        if note.get("isAttack") is True and parts and parts[0]["graceMode"] is None:
+            attacks.setdefault(note["string"], set()).add(fraction(note["onsetQuarter"], note["id"]))
+    for voice, times in list(attacks.items()):
+        attacks[voice] = sorted(times)
+    for _, beat, onset in performance_beats(score):
+        if beat["graceMode"] is None:
+            regular_beats.setdefault(beat["voiceIndex"], set()).add(fraction(onset, beat["id"]))
+    regular_beats = {voice: sorted(times) for voice, times in regular_beats.items()}
+    score_end = fraction(score["playback"]["durationQuarter"], "score end")
+    bounds = {}
+    for note in notes:
+        if note.get("notatedDurationQuarter") is not None and note.get("labelMask", {}).get("notatedDuration", False):
+            continue
+        parts = note.get("sourceSegments", [])
+        if not parts:
+            continue
+        anchor = fraction(note["onsetQuarter"], note["id"])
+        start = anchor
+        if parts[0]["graceMode"] == "BeforeBeat":
+            times = regular_beats.get(note["voiceIndex"], [])
+            index = bisect_left(times, anchor)
+            start = times[index - 1] if index else Fraction(0)
+        last = parts[-1]
+        last_anchor = fraction(last["onsetQuarter"], note["id"])
+        if last["durationQuarter"] is not None:
+            end = last_anchor + fraction(last["durationQuarter"], note["id"])
+        else:
+            times = attacks.get(note["string"], [])
+            index = bisect_left(times, last_anchor)
+            end = times[index] if index < len(times) else score_end
+        bounds[note["id"]] = (start, end)
+    return bounds
+
+
+def select_free_string(notes, onset, *, reserved=(), uncertainty_intervals=None):
+    """Choose bass first without guessing an unknown note's release."""
     onset = fraction(onset, "hit onset") if isinstance(onset, list) else Fraction(onset)
     occupied = set(reserved)
     for note in notes:
         duration = note.get("notatedDurationQuarter")
         if duration is None or not note.get("labelMask", {}).get("notatedDuration", False):
-            occupied.add(note["string"])
+            interval = (uncertainty_intervals or {}).get(note["id"])
+            if interval is None or interval[0] <= onset < interval[1]:
+                occupied.add(note["string"])
             continue
         start = fraction(note["onsetQuarter"], note["id"])
         if start <= onset < start + fraction(duration, note["id"]):
@@ -175,7 +219,7 @@ def _archive_bytes(root, payloads, comment):
 
 def _native_gpif_bytes(root, original_xml):
     document = minidom.parseString(original_xml)
-    cdata_paths = set()
+    cdata_paths = {("GPIF", "Beats", "Beat", "FreeText")}
 
     def discover(node, path):
         if any(child.nodeType == Node.CDATA_SECTION_NODE for child in node.childNodes):
@@ -254,20 +298,20 @@ def _conversion_candidates(labels, annotations, score):
     result = []
     for gesture in labels["targets"]["gestures"]:
         technique = gesture["technique"]
+        retained = []
+        timing_uncertain = False
         if technique == "compound_gesture":
             components = gesture.get("attributes", {}).get("components", [])
             percussive = [component["technique"] in GENERIC_TECHNIQUES for component in components]
             if not any(percussive):
                 continue
-            if not all(percussive) or gesture["attributes"].get("timing") != "simultaneous":
-                raise NormalizationError(
-                    f"{gesture['id']}: mixed/ordered percussion compound cannot be collapsed "
-                    "without losing another technique or inventing subevent timing."
-                )
+            retained = [deepcopy(component) for component, generic in zip(components, percussive) if not generic]
+            if any(component["technique"] not in {"strum", "slap_harmonic", "strumming_pull_off", "wrist_thump"} for component in retained):
+                raise NormalizationError(f"{gesture['id']}: compound includes an unsupported retained technique.")
+            timing_uncertain = gesture["attributes"].get("timing") != "simultaneous"
         elif technique not in GENERIC_TECHNIQUES:
             continue
-        if gesture.get("scoreOnsetKnown") is not True or gesture.get("graceMode") is not None:
-            raise NormalizationError(f"{gesture['id']}: a generic hit needs a resolved regular score onset.")
+        timing_uncertain = timing_uncertain or gesture.get("scoreOnsetKnown") is not True or gesture.get("graceMode") is not None
         rule = rules.get(gesture["interpretationRuleId"])
         if gesture.get("evidenceSource") == "owner-short-text-length-policy":
             text = normalized_text(beats[gesture["writtenBeatId"]]["text"])
@@ -276,9 +320,9 @@ def _conversion_candidates(labels, annotations, score):
             rule = {"id": gesture["interpretationRuleId"], "match": {"text": text}, "consumedTokens": text.split()}
         if rule is None:
             raise NormalizationError(f"{gesture['id']}: no checksum-scoped reviewed rule.")
-        if "O" in rule_tokens(rule):
+        if "O" in rule_tokens(rule) and not any(component["technique"] == "wrist_thump" for component in retained):
             raise NormalizationError(f"{gesture['id']}: converting this rule would erase the owner's wrist-thump O.")
-        result.append({"gesture": gesture, "rule": rule})
+        result.append({"gesture": gesture, "rule": rule, "retainedComponents": retained, "timingUncertain": timing_uncertain})
     return result
 
 
@@ -348,8 +392,61 @@ def _validate_inputs(root, raw, score, labels, annotations, conventions):
             raise NormalizationError(f"Nonstatic {node.findtext('Type')} automation needs occurrence mapping.")
     if any(normalized_text(node.text) for node in root.findall("./Tracks/Track/Lyrics/Line/Text")):
         raise NormalizationError("Nonempty lyrics need occurrence mapping before a linear copy can be made.")
-    if any(event["linear"] for event in score["tempoEvents"]):
-        raise NormalizationError("Tempo ramps require an interpolation-aware playback mapper; no constant-tempo fallback.")
+    _validate_tempo_ramp_routes(score)
+
+
+def _terminal_ramp_endpoint(score, events):
+    last_measure = score["playback"]["measureVisits"][-1]["measureIndex"]
+    for index, event in enumerate(events):
+        if (
+            index and events[index - 1]["linear"] and not event["linear"]
+            and event["measureIndex"] == last_measure + 1
+            and fraction(event["positionRatio"], "tempo position") == 0
+            and score["measures"][event["measureIndex"]]["referenceOnly"]
+            and any(visit["measureIndex"] == events[index - 1]["measureIndex"] for visit in score["playback"]["measureVisits"])
+        ):
+            return index
+    return None
+
+
+def _validate_tempo_ramp_routes(score):
+    events = sorted(score["tempoEvents"], key=lambda event: (event["measureIndex"], fraction(event["positionRatio"], "tempo position")))
+    positions = [fraction(score["measures"][event["measureIndex"]]["scoreStartQuarter"], "tempo bar") + fraction(event["offsetQuarter"], "tempo offset") for event in events]
+    visits = score["playback"]["measureVisits"]
+    boundaries = [(a["measureIndex"], b["measureIndex"]) for a, b in zip(visits, visits[1:]) if b["measureIndex"] != a["measureIndex"] + 1]
+    for index, event in enumerate(events):
+        if not event["linear"]:
+            continue
+        if index + 1 == len(events) or positions[index + 1] <= positions[index]:
+            raise NormalizationError("Tempo ramps require an explicit later endpoint.")
+        start, end = positions[index:index + 2]
+        for before, after in boundaries:
+            exit_position = fraction(score["measures"][before]["scoreStartQuarter"], "bar start") + fraction(score["measures"][before]["durationQuarter"], "bar duration")
+            entry_position = fraction(score["measures"][after]["scoreStartQuarter"], "bar start")
+            if start < exit_position < end or start < entry_position < end:
+                raise NormalizationError(
+                    "A playback jump cuts through an active tempo ramp; interpolation across the jump is not inferred.",
+                    conflicts=[{"sourceRampStartMeasure": event["measureIndex"] + 1, "sourceRampEndMeasure": events[index + 1]["measureIndex"] + 1, "jumpFromMeasure": before + 1, "jumpToMeasure": after + 1}],
+                )
+        first = fraction(score["measures"][visits[0]["measureIndex"]]["scoreStartQuarter"], "first bar")
+        last = score["measures"][visits[-1]["measureIndex"]]
+        stop = fraction(last["scoreStartQuarter"], "last bar") + fraction(last["durationQuarter"], "last duration")
+        if start < first < end or start < stop < end:
+            raise NormalizationError("Playback starts or ends inside a tempo ramp; its endpoint must be preserved.")
+    expanded = [
+        (index, fraction(visit["onsetQuarter"], "visit") + fraction(event["offsetQuarter"], "tempo offset"))
+        for visit in visits for index, event in enumerate(events) if event["measureIndex"] == visit["measureIndex"]
+    ]
+    terminal = _terminal_ramp_endpoint(score, events)
+    if terminal is not None:
+        expanded.append((terminal, fraction(score["playback"]["durationQuarter"], "score end")))
+    for occurrence, (index, position) in enumerate(expanded):
+        if events[index]["linear"] and (
+            occurrence + 1 == len(expanded)
+            or expanded[occurrence + 1][0] != index + 1
+            or expanded[occurrence + 1][1] - position != positions[index + 1] - positions[index]
+        ):
+            raise NormalizationError("A played tempo ramp lost its contiguous endpoint during navigation expansion.")
 
 
 def _linear_tempos(root, source, score):
@@ -375,12 +472,21 @@ def _linear_tempos(root, source, score):
         if not has_start and (index == 0 or previous != baseline.findtext("Value")):
             reset = deepcopy(baseline)
             _set_text(reset, "Position", "0")
+            _set_text(reset, "Linear", "false")
             selected.append(reset)
         selected.extend(deepcopy(node) for node in within)
         for node in selected:
             _set_text(node, "Bar", index)
             output.append(node)
         previous = (within[-1] if within else baseline).findtext("Value")
+    events = sorted(score["tempoEvents"], key=lambda event: (event["measureIndex"], fraction(event["positionRatio"], "tempo position")))
+    terminal = _terminal_ramp_endpoint(score, events)
+    if terminal is not None:
+        # A ramp ending exactly at the first omitted reference bar still needs its endpoint.
+        endpoint = deepcopy(original[terminal])
+        _set_text(endpoint, "Bar", len(score["playback"]["measureVisits"]) - 1)
+        _set_text(endpoint, "Position", "1")
+        output.append(endpoint)
 
 
 class _OccurrenceWriter:
@@ -398,6 +504,8 @@ class _OccurrenceWriter:
                 raise NormalizationError(f"{section} has nonnumeric entity IDs.")
             self.next_ids[section] = max((int(identifier) for identifier in definitions), default=-1) + 1
         self.records, self.note_clones, self.rest_splits = {}, {}, []
+        performed = list(performance_beats(score))
+        self.slot_keys = {f"p{visit['visitIndex']}:{beat['id']}": slot for (visit, beat, _), slot in zip(performed, performance_slot_keys(performed))}
         for section, tag in (("MasterBars", "MasterBar"), ("Bars", "Bar"), ("Voices", "Voice"), ("Beats", "Beat"), ("Notes", "Note")):
             _remove(self.root.find(section), tag)
         masters = source.findall("./MasterBars/MasterBar")
@@ -514,7 +622,7 @@ def _strip_consumed_marks(writer, candidates, labels):
     converted = {item["gesture"]["id"] for item in candidates}
     other_meanings = {
         f"p{gesture['visitIndex']}:{gesture['writtenBeatId']}"
-        for gesture in labels["targets"]["gestures"] if gesture["id"] not in converted
+        for gesture in labels["targets"]["gestures"] if gesture["id"] not in converted and gesture["technique"] != "wrist_thump"
     } | {item["performanceBeatId"] for item in labels["review"]["unresolvedGestures"]}
     removed = []
     for candidate in candidates:
@@ -538,6 +646,32 @@ def _strip_consumed_marks(writer, candidates, labels):
     return removed
 
 
+def _retain_compound_notation(writer, candidates):
+    for candidate in candidates:
+        if not any(component["technique"] == "wrist_thump" for component in candidate["retainedComponents"]):
+            continue
+        gesture = candidate["gesture"]
+        record = writer.records[f"p{gesture['visitIndex']}:{gesture['writtenBeatId']}"]
+        text = normalized_text(record["node"].findtext("FreeText"))
+        if text not in ("", "O"):
+            raise NormalizationError(f"{gesture['id']}: preserving compound wrist O would overwrite another annotation.")
+        _set_text(record["node"], "FreeText", "O")
+
+
+def _text_hit_host(writer, key, beats):
+    record = writer.records[key]
+    same_slot = [
+        alternative for alternative_key, alternative in writer.records.items()
+        if writer.slot_keys[alternative_key] == writer.slot_keys[key]
+    ]
+    # An existing upper-voice annotation must not hide the replacement text.
+    visible = [alternative for alternative in same_slot if normalized_text(alternative["node"].findtext("FreeText"))]
+    host = min([record, *visible], key=lambda alternative: beats[alternative["writtenBeatId"]]["voiceIndex"])["node"]
+    text = host.findtext("FreeText") or ""
+    _set_text(host, "FreeText", f"{text} (X)" if text.strip() else "(X)")
+    return host
+
+
 def _place_hits(writer, candidates, labels, consumed):
     beats, _ = source_indices(writer.score)
     symbol_notes = [
@@ -545,6 +679,7 @@ def _place_hits(writer, candidates, labels, consumed):
         if not any(segment["performanceId"] in consumed for segment in symbol["sourceSegments"])
     ]
     occupied_notes = labels["targets"]["notes"] + symbol_notes
+    uncertainty_intervals = notated_uncertainty_intervals(occupied_notes, writer.score)
     meanings = {
         f"p{gesture['visitIndex']}:{gesture['writtenBeatId']}" for gesture in labels["targets"]["gestures"]
     } | {item["performanceBeatId"] for item in labels["review"]["unresolvedGestures"]}
@@ -555,23 +690,21 @@ def _place_hits(writer, candidates, labels, consumed):
     )):
         gesture = candidate["gesture"]
         onset = fraction(gesture["onsetQuarter"], gesture["id"])
-        try:
-            string = select_free_string(occupied_notes, onset, reserved=reserved.get(onset, set()))
-        except NormalizationError as error:
-            for conflict in error.conflicts:
-                conflict["sourceGestureId"] = gesture["id"]
-            raise
         key = f"p{gesture['visitIndex']}:{gesture['writtenBeatId']}"
         record = writer.records[key]
-        source_beat = beats[gesture["writtenBeatId"]]
         host = record["node"]
-        remaining_dead = any(
-            node["techniques"]["dead"] and f"p{gesture['visitIndex']}:{node['id']}" not in consumed
-            for node in source_beat["notes"]
-        )
+        string, fallback, conflicts = None, None, []
+        if gesture.get("scoreOnsetKnown") is not True or gesture.get("graceMode") is not None:
+            fallback = "unknown_score_onset"
+        else:
+            try:
+                string = select_free_string(occupied_notes, onset, reserved=reserved.get(onset, set()), uncertainty_intervals=uncertainty_intervals)
+            except NormalizationError as error:
+                fallback = "no_free_notated_string"
+                conflicts = error.conflicts
         musical_host = ET.fromstring(ET.tostring(host, encoding="utf-8"))
-        conflicting_marks = set(beat_techniques(musical_host, key, [])) & {"brush", "rasgueado", "slapped", "arpeggio"}
-        if remaining_dead or conflicting_marks or host.get("id") in used_hosts:
+        conflicting_marks = set(beat_techniques(musical_host, key, [])) & {"brush", "rasgueado", "arpeggio"}
+        if fallback is None and (conflicting_marks or host.get("id") in used_hosts):
             host = None
             for alternative_key, alternative in writer.records.items():
                 if alternative["visit"]["visitIndex"] != gesture["visitIndex"] or alternative_key in meanings:
@@ -581,35 +714,44 @@ def _place_hits(writer, candidates, labels, consumed):
                 start = fraction(alternative["visit"]["onsetQuarter"], "visit") + fraction(beat["offsetQuarter"], beat["id"])
                 duration = fraction(beat["notatedDurationQuarter"], beat["id"])
                 if (
-                    not beat["isRest"] or beat["graceMode"] is not None or beat["techniques"]
+                    beat["graceMode"] is not None or beat["techniques"]
                     or beat["chordRef"] is not None or normalized_text(node.findtext("FreeText"))
                     or node.get("id") in used_hosts or not start <= onset < start + duration
+                    or not beat["isRest"] and start != onset
                 ):
                     continue
                 host = node if start == onset else writer.split_rest(alternative, onset - start, duration)
                 used_hosts.add(node.get("id"))
                 break
             if host is None:
-                raise NormalizationError(
-                    f"{gesture['id']}: its beat has other symbolic/strum/slap meanings and no safe existing rest voice "
-                    "can carry the generic hit; sounding beats were not split."
-                )
-        note = ghost_dead_note(
-            writer.identifier("Notes"), string,
-            writer.score["instrument"]["openStringMidi"], writer.score["instrument"]["capoFret"],
-            pitch_profile=writer.pitch_profile,
-        )
-        writer.root.find("Notes").append(note)
-        _set_text(host, "Notes", " ".join([*host.findtext("Notes", "").split(), note.get("id")]))
-        used_hosts.add(host.get("id"))
-        reserved.setdefault(onset, set()).add(string)
+                fallback = "no_safe_voice_beat"
+                conflicts = [{"beatTechniques": sorted(conflicting_marks)}]
+        note = None
+        if fallback is not None:
+            host = _text_hit_host(writer, key, beats)
+            string = None
+        else:
+            note = ghost_dead_note(
+                writer.identifier("Notes"), string,
+                writer.score["instrument"]["openStringMidi"], writer.score["instrument"]["capoFret"],
+                pitch_profile=writer.pitch_profile,
+            )
+            writer.root.find("Notes").append(note)
+            _set_text(host, "Notes", " ".join([*host.findtext("Notes", "").split(), note.get("id")]))
+            used_hosts.add(host.get("id"))
+            reserved.setdefault(onset, set()).add(string)
         placements.append({
             "sourceGestureId": gesture["id"], "sourceTechnique": gesture["technique"],
             "sourceWrittenBeatId": gesture["writtenBeatId"], "sourceVisitIndex": gesture["visitIndex"],
             "sourceVoiceIndex": gesture["voiceIndex"], "onsetQuarter": gesture["onsetQuarter"],
-            "consumedSourceNoteIds": candidate["consumedNoteIds"], "gpNoteId": note.get("id"),
-            "gpBeatId": host.get("id"), "string": string, "gpStringIndex": 6 - string,
-            "stringRole": "notation-carrier-only", "fingeringLabelMask": False,
+            "retainedComponents": deepcopy(candidate["retainedComponents"]),
+            "scoreAnchorOnly": candidate["timingUncertain"],
+            "sourceCompoundTiming": gesture.get("attributes", {}).get("timing") if gesture["technique"] == "compound_gesture" else None,
+            "consumedSourceNoteIds": candidate["consumedNoteIds"], "gpNoteId": note.get("id") if note is not None else None,
+            "gpBeatId": host.get("id"), "string": string, "gpStringIndex": 6 - string if string is not None else None,
+            "notationKind": "generic-hit-text" if fallback else "ghost-dead",
+            "fallbackReason": fallback, "fallbackDetails": conflicts,
+            "stringRole": "notation-carrier-only" if string is not None else None, "fingeringLabelMask": False,
         })
     return placements
 
@@ -655,6 +797,8 @@ def _verify_music(writer, decoded, playback, consumed, by_note, note_map):
         new_beat, new_note = by_note[writer.note_clones[event["id"]].get("id")]
         if new_beat["voiceIndex"] != source_beat["voiceIndex"]:
             raise NormalizationError(f"{event['id']}: normalization changed the voice.")
+        if new_beat["techniques"] != source_beat["techniques"]:
+            raise NormalizationError(f"{event['id']}: a retained note's beat articulation changed.")
         if any(new_note[key] != value for key, value in note.items() if key not in {"id", "sourceNoteId"}):
             raise NormalizationError(f"{event['id']}: note pitch/fingering/articulation changed.")
         original = deepcopy(writer.definitions["Notes"][note["sourceNoteId"]])
@@ -675,6 +819,12 @@ def _verify_music(writer, decoded, playback, consumed, by_note, note_map):
 
 def _verify_native_carriers(writer, placements):
     for placement in placements:
+        if placement["notationKind"] == "generic-hit-text":
+            host = writer.root.find(f"./Beats/Beat[@id='{placement['gpBeatId']}']")
+            count = sum(item["notationKind"] == "generic-hit-text" and item["gpBeatId"] == placement["gpBeatId"] for item in placements)
+            if normalized_text(host.findtext("FreeText")).split().count("(X)") < count:
+                raise NormalizationError("A generic text fallback is missing from its GP beat.")
+            continue
         note = writer.root.find(f"./Notes/Note[@id='{placement['gpNoteId']}']")
         props = {prop.get("name"): prop for prop in note.findall("./Properties/Property")}
         if note.findtext("AntiAccent") != "Normal" or {"ConcertPitch", "TransposedPitch", "String", "Fret", "Midi", "Muted"} - set(props):
@@ -692,24 +842,27 @@ def _normalized_labels(source, score, placements, beat_map, note_map, by_note):
     generic = {placement["sourceGestureId"]: placement for placement in placements}
     gestures = []
     provenance_gestures = []
+    by_beat = {beat["sourceBeatId"]: beat for beat in score["scoreEvents"]}
     for source_gesture in source["targets"]["gestures"]:
         placement = generic.get(source_gesture["id"])
         source_beat_key = f"p{source_gesture['visitIndex']}:{source_gesture['writtenBeatId']}"
-        beat = beat_map[source_beat_key]
+        component_beat = beat = beat_map[source_beat_key]
         gesture = deepcopy(source_gesture)
         if placement:
-            beat, note = by_note[placement["gpNoteId"]]
-            note_id = f"p{beat['measureIndex']}:{note['id']}"
+            beat = by_beat[placement["gpBeatId"]]
+            note = by_note[placement["gpNoteId"]][1] if placement["gpNoteId"] is not None else None
+            note_id = f"p{beat['measureIndex']}:{note['id']}" if note is not None else None
             placement.update(
                 normalizedWrittenBeatId=beat["id"], normalizedNoteId=note_id,
-                normalizedWrittenNoteId=note["id"], normalizedVoiceIndex=beat["voiceIndex"],
+                normalizedWrittenNoteId=note["id"] if note is not None else None, normalizedVoiceIndex=beat["voiceIndex"],
                 normalizedMeasureIndex=beat["measureIndex"],
             )
             gesture.update(
-                technique="percussive_hit", attributes={}, symbolicNoteIds=[note_id],
+                technique="percussive_hit", attributes={}, symbolicNoteIds=[note_id] if note_id is not None else [],
                 sourcePitchedNoteIds=[], contextPitchedNoteIds=[],
-                notation={"kind": "ghost-dead", "gpNoteId": placement["gpNoteId"], "string": placement["string"], "stringRole": "notation-carrier-only"},
-                labelMask={"gesture": True, "fingering": False},
+                notation={"kind": placement["notationKind"], "gpNoteId": placement["gpNoteId"], "string": placement["string"], "stringRole": placement["stringRole"], "text": "(X)" if note is None else None},
+                labelMask={"gesture": True, "fingering": False, "onset": not placement["scoreAnchorOnly"]},
+                scoreOnsetKnown=source_gesture.get("scoreOnsetKnown", False) and not placement["scoreAnchorOnly"],
             )
         else:
             for field in ("symbolicNoteIds", "sourcePitchedNoteIds", "contextPitchedNoteIds"):
@@ -723,6 +876,20 @@ def _normalized_labels(source, score, placements, beat_map, note_map, by_note):
             gesture.pop(field, None)
         gestures.append(gesture)
         provenance_gestures.append({"normalizedGestureId": gesture["id"], "source": deepcopy(source_gesture)})
+        if placement:
+            for index, component in enumerate(placement["retainedComponents"]):
+                if component["technique"] == "wrist_thump" and any(g["technique"] == "wrist_thump" and g["visitIndex"] == source_gesture["visitIndex"] and g["onsetQuarter"] == source_gesture["onsetQuarter"] for g in source["targets"]["gestures"]):
+                    continue
+                retained = {
+                    **deepcopy(gesture), "id": f"{gesture['id']}:component-{index}",
+                    "writtenBeatId": component_beat["id"], "voiceIndex": component_beat["voiceIndex"],
+                    "technique": component["technique"], "attributes": deepcopy(component.get("attributes", {})),
+                    "symbolicNoteIds": [], "sourcePitchedNoteIds": [note_map[identifier] for identifier in source_gesture.get("sourcePitchedNoteIds", [])],
+                    "contextPitchedNoteIds": [note_map[identifier] for identifier in source_gesture.get("contextPitchedNoteIds", [])],
+                }
+                retained.pop("notation", None)
+                gestures.append(retained)
+                provenance_gestures.append({"normalizedGestureId": retained["id"], "source": deepcopy(source_gesture), "componentIndex": index})
     result["targets"]["gestures"] = gestures
     result["targets"]["noteRests"] = []
     for rest in source["targets"]["noteRests"]:
@@ -782,6 +949,7 @@ def normalize_gp_bytes(raw, score, labels, annotations=None, conventions=None):
     writer = _OccurrenceWriter(source, score, consumed | silenced)
     cleared = _strip_converted_text(writer, candidates, labels)
     removed_marks = _strip_consumed_marks(writer, candidates, labels)
+    _retain_compound_notation(writer, candidates)
     placements = _place_hits(writer, candidates, labels, consumed)
     if _protected_tree(source) != _protected_tree(writer.root):
         raise NormalizationError("Nonmusical GPIF nodes or settings changed.")
@@ -808,6 +976,8 @@ def normalize_gp_bytes(raw, score, labels, annotations=None, conventions=None):
         blockers.append("unresolved_source_gestures")
     if any(not all(note["labelMask"].values()) for note in normalized["targets"]["notes"]):
         blockers.append("unresolved_note_labels")
+    if any(not gesture.get("scoreOnsetKnown", False) for gesture in normalized["targets"]["gestures"]):
+        blockers.append("unresolved_gesture_timing")
     report = {
         "normalizationVersion": NORMALIZATION_VERSION, "trainingReady": False, "audioAligned": False,
         "trainingBlockers": blockers, "rawGpSha256": hashlib.sha256(raw).hexdigest(),
@@ -820,14 +990,18 @@ def normalize_gp_bytes(raw, score, labels, annotations=None, conventions=None):
         "rawWrittenMeasureCount": len(score["measures"]),
         "rawWrittenBeatCount": len(score["scoreEvents"]),
         "normalizedWrittenBeatCount": len(decoded["scoreEvents"]),
-        "genericHitCount": len(placements), "consumedSymbolicSegmentCount": len(consumed),
+        "genericHitCount": len(placements),
+        "nativeGhostHitCount": sum(item["notationKind"] == "ghost-dead" for item in placements),
+        "textFallbackHitCount": sum(item["notationKind"] == "generic-hit-text" for item in placements),
+        "textFallbackReasons": dict(sorted(Counter(item["fallbackReason"] for item in placements if item["fallbackReason"]).items())),
+        "consumedSymbolicSegmentCount": len(consumed),
         "silencedRepeatedEntrySegmentCount": len(silenced), "placements": placements,
         "unresolvedCounts": dict(sorted(Counter(item["reason"] for item in normalized["review"]["unresolvedGestures"]).items())),
         "placementPolicy": PLACEMENT_LIMITATION,
         "placementAvoidsRetainedSymbols": True,
         "omittedReferenceMeasureIndices": [measure["index"] for measure in score["measures"] if measure["referenceOnly"]],
         "referencePolicy": "Reference-only examples omitted from the performance copy; original GP and canonical evidence retained unchanged.",
-        "legendPolicy": "Native ghost-dead notation needs no arbitrary percussion text or replacement instruction bars.",
+        "legendPolicy": "Generic hits use native ghost-dead notes or explicit (X) text when unsafe; no arbitrary technique labels or replacement instruction bars.",
         "keyPolicy": "Raw key choice preserved; accidental optimization belongs to the later final writer.",
         "clearedSuppressedAnnotations": cleared, "removedPercussionMarks": removed_marks, "restSplits": writer.rest_splits,
         "linearMeasureCount": len(playback["measureVisits"]),

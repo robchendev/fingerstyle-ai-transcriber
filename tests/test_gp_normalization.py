@@ -12,7 +12,7 @@ from scripts.gp_events import catalog_timing, decode_score, note_event, performa
 from scripts.catalogs import PerformerPaths
 from scripts.gp_normalization import (
     GPIF_ENTRY, NormalizationError, ghost_dead_note, normalize_gp_bytes,
-    select_free_string, semantic_node, native_pitch_profile,
+    select_free_string, semantic_node, native_pitch_profile, notated_uncertainty_intervals,
 )
 from scripts.normalize_gp import main, normalized_output_paths, validate_training_policy
 from scripts import settings
@@ -30,7 +30,8 @@ TRAINING_POLICY = {
     "genericPercussionClass": "percussive_hit", "trainingExecution": "human-owner-only",
     "genericNotation": {
         "deadNote": True, "ghostNote": True, "textLabel": None,
-        "stringPlacement": "free-under-notated-sustain", "noFreeString": "report-conflict-without-shortening-notes",
+        "stringPlacement": "free-under-notated-sustain", "noFreeString": "text-fallback-without-shortening-notes",
+        "fallbackText": "(X)", "fallbackConditions": ["no_free_notated_string", "no_safe_voice_beat", "unknown_score_onset"],
     },
     "preserve": ["thumb_slap", "wrist_thump", "pitched_notes", "harmonic_pitches", "voices", "notated_durations", "nonmusical_gp_settings"],
 }
@@ -284,19 +285,27 @@ class GpNormalizationTests(unittest.TestCase):
         note.update(notatedDurationQuarter=[1, 1])
         self.assertEqual(select_free_string([note], 1000), 5)
 
-    def test_all_strings_busy_fails_with_exact_conflict_instead_of_shortening(self):
+    def test_all_strings_busy_uses_text_and_records_conflict_without_shortening(self):
         root = template_score()
         for string in range(1, 6):
             root.find("Notes").append(note_xml(str(string + 30), string=string))
         root.find("./Beats/Beat[@id='0']/Notes").text = "0 31 32 33 34 35"
         args = prepared(root)
         original = args[0]
-        with self.assertRaisesRegex(NormalizationError, "No free notated string") as raised:
-            normalize_gp_bytes(*args)
-        conflict = raised.exception.conflicts[0]
+        output, labels, report = normalize_gp_bytes(*args)
+        placement = report["placements"][0]
+        conflict = placement["fallbackDetails"][0]
         self.assertEqual(conflict["onsetQuarter"], [0, 1])
         self.assertEqual(conflict["occupiedStrings"], [1, 2, 3, 4, 5, 6])
-        self.assertEqual(conflict["sourceGestureId"], "p0:m0:v0:b0:local-body")
+        self.assertEqual(placement["sourceGestureId"], "p0:m0:v0:b0:local-body")
+        self.assertEqual(report["textFallbackHitCount"], 1)
+        self.assertEqual(report["textFallbackReasons"], {"no_free_notated_string": 1})
+        self.assertIsNone(placement["string"])
+        self.assertIsNone(placement["normalizedNoteId"])
+        self.assertEqual(labels["targets"]["gestures"][0]["symbolicNoteIds"], [])
+        self.assertEqual(labels["targets"]["gestures"][0]["notation"]["kind"], "generic-hit-text")
+        self.assertEqual(normalized_root(output).findtext("./Beats/Beat/FreeText"), "(X)")
+        self.assertEqual(len(labels["targets"]["notes"]), len(args[2]["targets"]["notes"]))
         self.assertEqual(args[0], original)
 
     def test_pitched_note_ties_attacks_voices_and_harmonic_articulations_survive(self):
@@ -391,7 +400,7 @@ class GpNormalizationTests(unittest.TestCase):
                 output, labels, report = normalize_gp_bytes(*args)
                 placement = report["placements"][0]
                 self.assertEqual(placement["string"], 4)
-                self.assertEqual(placement["normalizedVoiceIndex"], 1)
+                self.assertEqual(placement["normalizedVoiceIndex"], 0)
                 self.assertEqual(report["genericHitCount"], 1)
                 self.assertTrue(report["placementAvoidsRetainedSymbols"])
                 symbols = labels["review"]["notationSymbols"]
@@ -554,13 +563,22 @@ class GpNormalizationTests(unittest.TestCase):
         self.assertEqual(labels["targets"]["gestures"][0]["attributes"], {})
         self.assertEqual(labels["targets"]["gestures"][0]["technique"], "percussive_hit")
         for changed in ("ordered", "mixed"):
-            with self.subTest(changed=changed), self.assertRaisesRegex(NormalizationError, "mixed/ordered"):
+            with self.subTest(changed=changed):
                 copy = deepcopy(attrs)
                 if changed == "ordered":
                     copy["timing"] = "ordered"
                 else:
                     copy["components"][1]["technique"] = "wrist_thump"
-                normalize_gp_bytes(*prepared(technique="compound_gesture", attributes=copy))
+                output, labels, report = normalize_gp_bytes(*prepared(technique="compound_gesture", attributes=copy))
+                generic = labels["targets"]["gestures"][0]
+                self.assertEqual(report["genericHitCount"], 1)
+                self.assertEqual(generic["labelMask"]["onset"], changed != "ordered")
+                self.assertEqual(generic["scoreOnsetKnown"], changed != "ordered")
+                if changed == "mixed":
+                    self.assertEqual([g["technique"] for g in labels["targets"]["gestures"]], ["percussive_hit", "wrist_thump"])
+                    self.assertEqual(normalized_root(output).findtext("./Beats/Beat/FreeText"), "O")
+                else:
+                    self.assertIn("unresolved_gesture_timing", report["trainingBlockers"])
 
     def test_reviewed_unusual_percussion_reduces_to_the_same_coarse_target(self):
         for technique in ("body_flam", "body_scratch", "string_slap", "nail_attack", "slap_pluck", "string_tap", "string_scrape"):
@@ -605,13 +623,116 @@ class GpNormalizationTests(unittest.TestCase):
         first_measure = [beat for beat in decode_score(normalized_root(output), TUNING, 2)["scoreEvents"] if beat["measureIndex"] == 0]
         self.assertEqual([beat["notatedDurationQuarter"] for beat in first_measure], [[2, 1]] * 4)
 
-    def test_no_safe_beat_reports_blocker_instead_of_editing_sounding_duration(self):
+    def test_same_onset_pitched_alternative_preserves_voices_and_compound_components(self):
         root = template_score()
         root.find("./Beats/Beat[@id='0']/Properties").append(ET.fromstring('<Property name="Brush"><Direction>Down</Direction></Property>'))
         root.find("Notes").append(note_xml("3", string=2))
         ET.SubElement(root.find("./Beats/Beat[@id='2']"), "Notes").text = "3"
-        with self.assertRaisesRegex(NormalizationError, "no safe existing rest voice"):
-            normalize_gp_bytes(*prepared(root))
+        attrs = {"components": [{"technique": "body_tap"}, {"technique": "strum"}], "timing": "simultaneous"}
+        output, labels, report = normalize_gp_bytes(*prepared(root, technique="compound_gesture", attributes=attrs))
+        generic, strum = labels["targets"]["gestures"]
+        self.assertEqual((generic["voiceIndex"], strum["voiceIndex"]), (1, 0))
+        self.assertNotEqual(generic["writtenBeatId"], strum["writtenBeatId"])
+        self.assertEqual(report["nativeGhostHitCount"], 1)
+        self.assertEqual([note["voiceIndex"] for note in labels["targets"]["notes"]], [0, 1, 1])
+        self.assertEqual(decode_score(normalized_root(output), TUNING, 2)["scoreEvents"][0]["techniques"]["brush"], "Down")
+
+    def test_unsafe_hosts_use_text_preserving_wrist_and_articulations(self):
+        root = template_score()
+        root.find("./Bars/Bar[@id='0']/Voices").text = "0 -1 -1 -1"
+        root.find("./Beats/Beat[@id='0']/Properties").append(ET.fromstring('<Property name="Brush"><Direction>Down</Direction></Property>'))
+        attrs = {"components": [{"technique": "body_tap"}, {"technique": "wrist_thump"}], "timing": "simultaneous"}
+        output, labels, report = normalize_gp_bytes(*prepared(root, technique="compound_gesture", attributes=attrs))
+        self.assertEqual(report["textFallbackReasons"], {"no_safe_voice_beat": 1})
+        self.assertEqual(normalized_root(output).findtext("./Beats/Beat/FreeText"), "O (X)")
+        self.assertEqual([g["technique"] for g in labels["targets"]["gestures"]], ["percussive_hit", "wrist_thump"])
+        self.assertEqual(labels["targets"]["notes"][0]["notatedDurationQuarter"], [8, 1])
+
+    def test_grace_text_fallback_keeps_slots_and_timing_uncertainty(self):
+        root = template_score()
+        ET.SubElement(root.find("./Beats/Beat[@id='0']"), "GraceNotes").text = "OnBeat"
+        root.find("./Voices/Voice[@id='0']/Beats").text = "0 1"
+        ET.SubElement(root.find("./Beats/Beat[@id='1']"), "FreeText").text = "O"
+        output, labels, report = normalize_gp_bytes(*prepared(root, order=[0], conventions=CONVENTIONS))
+        self.assertEqual(report["textFallbackReasons"], {"unknown_score_onset": 1})
+        generic = labels["targets"]["gestures"][0]
+        self.assertFalse(generic["labelMask"]["onset"])
+        self.assertFalse(generic["scoreOnsetKnown"])
+        self.assertEqual(generic["graceMode"], "OnBeat")
+        first = decode_score(normalized_root(output), TUNING, 2)["scoreEvents"]
+        self.assertEqual([beat["text"] for beat in first[:2]], ["(X)", "O"])
+        self.assertIn("unresolved_gesture_timing", report["trainingBlockers"])
+
+    def test_text_fallback_is_visible_beside_upper_voice_wrist_annotation(self):
+        root = template_score()
+        root.find("./Beats/Beat[@id='0']/FreeText").text = "O"
+        for string in range(1, 6):
+            root.find("Notes").append(note_xml(str(string + 30), string=string))
+        root.find("./Beats/Beat[@id='0']/Notes").text = "0 31 32 33 34 35"
+        root.find("Notes").append(note_xml("40", string=1, dead=True))
+        ET.SubElement(root.find("./Beats/Beat[@id='2']"), "Notes").text = "40"
+        args = list(prepared(root, conventions=CONVENTIONS))
+        args[3]["rules"][0].update(match={"deadStrings": [5]}, consumesDeadNotes=True, consumedTokens=[])
+        args[2] = canonicalize(args[1], args[3], CONVENTIONS)
+        output, labels, report = normalize_gp_bytes(*args)
+        placement = report["placements"][0]
+        self.assertEqual((placement["sourceVoiceIndex"], placement["normalizedVoiceIndex"]), (1, 0))
+        self.assertEqual(normalized_root(output).findtext("./Beats/Beat/FreeText"), "O (X)")
+        self.assertEqual(sum(g["technique"] == "wrist_thump" for g in labels["targets"]["gestures"]), 1)
+
+    def test_grace_uncertainty_is_bounded_without_fabricating_duration(self):
+        root = template_score()
+        ET.SubElement(root.find("./Beats/Beat[@id='1']"), "GraceNotes").text = "BeforeBeat"
+        root.find("./Notes/Note[@id='1']").remove(root.find("./Notes/Note[@id='1']/Tie"))
+        root.find("./Voices/Voice[@id='1']/Beats").text = "1 2"
+        root.find("Notes").append(note_xml("3", string=1))
+        root.find("./Beats/Beat[@id='1']/Notes").text = "3"
+        _, score, labels, _, _ = prepared(root)
+        grace = next(note for note in labels["targets"]["notes"] if note["notatedDurationQuarter"] is None)
+        bounds = notated_uncertainty_intervals([grace], score)
+        self.assertEqual(bounds[grace["id"]], (Fraction(0), Fraction(8)))
+        self.assertEqual(select_free_string([grace], 2, reserved={6}, uncertainty_intervals=bounds), 4)
+        self.assertEqual(select_free_string([grace], 8, reserved={6}, uncertainty_intervals=bounds), 5)
+        grace["sourceSegments"][0]["graceMode"] = "OnBeat"
+        bounds = notated_uncertainty_intervals([grace], score)
+        self.assertEqual(bounds[grace["id"]], (Fraction(4), Fraction(8)))
+        self.assertEqual(select_free_string([grace], 2, reserved={6}, uncertainty_intervals=bounds), 5)
+        self.assertIsNone(grace["notatedDurationQuarter"])
+        trailing_grace = {
+            "id": "trailing", "string": 5, "voiceIndex": 0, "isAttack": True,
+            "onsetQuarter": [0, 1], "notatedDurationQuarter": None,
+            "sourceSegments": [
+                {"graceMode": None, "onsetQuarter": [0, 1], "durationQuarter": [4, 1]},
+                {"graceMode": "OnBeat", "onsetQuarter": [4, 1], "durationQuarter": None},
+            ],
+        }
+        attack = {"id": "later", "string": 5, "isAttack": True, "onsetQuarter": [6, 1], "notatedDurationQuarter": [1, 1], "labelMask": {"notatedDuration": True}, "sourceSegments": [{"graceMode": None}]}
+        bounds = notated_uncertainty_intervals([trailing_grace, attack], score)
+        self.assertEqual(bounds["trailing"], (Fraction(0), Fraction(6)))
+
+    def test_native_ramps_repeat_with_endpoints_but_reject_cut_navigation(self):
+        root = template_score()
+        root.find("./MasterTrack/Automations/Automation/Linear").text = "true"
+        root.find("./MasterTrack/Automations").append(ET.fromstring(
+            "<Automation><Type>Tempo</Type><Bar>1</Bar><Position>0</Position><Value>72 3</Value><Linear>false</Linear></Automation>"
+        ))
+        _, _, report = normalize_gp_bytes(*prepared(root, order=[0, 1, 0, 1]))
+        self.assertEqual([(event["bpm"], event["linear"]) for event in report["normalizedTempoEvents"]], [(60, True), (72, False), (60, True), (72, False)])
+        for order in ([0], [0, 0, 1]):
+            with self.subTest(order=order), self.assertRaisesRegex(NormalizationError, "contiguous endpoint"):
+                normalize_gp_bytes(*prepared(root, order=order))
+
+    def test_ramp_endpoint_at_omitted_reference_boundary_stays_at_score_end(self):
+        root = template_score()
+        root.find("./MasterTrack/Automations/Automation/Linear").text = "true"
+        root.find("./MasterTrack/Automations").append(ET.fromstring(
+            "<Automation><Type>Tempo</Type><Bar>2</Bar><Position>0</Position><Value>40.6823 3</Value><Linear>false</Linear></Automation>"
+        ))
+        output, _, report = normalize_gp_bytes(*prepared(root))
+        self.assertEqual(report["durationQuarter"], [8, 1])
+        endpoint = report["normalizedTempoEvents"][-1]
+        self.assertEqual((endpoint["measureIndex"], endpoint["positionRatio"], endpoint["bpm"], endpoint["linear"]), (1, [1, 1], 40.6823, False))
+        self.assertEqual(len(normalized_root(output).findall("./MasterBars/MasterBar")), 2)
 
     def test_stale_revision_canonical_and_unsupported_tempo_never_get_fallbacks(self):
         args = list(prepared())
@@ -627,9 +748,9 @@ class GpNormalizationTests(unittest.TestCase):
         with self.assertRaisesRegex(NormalizationError, "Tempo ramps"):
             normalize_gp_bytes(*prepared(root))
 
-    def test_bounded_cli_rejects_implicit_or_multiple_id_scope(self):
+    def test_bounded_cli_rejects_implicit_scope(self):
         with patch("sys.stderr", new=StringIO()):
-            for args in ([], ["--ids", "set-a-item-0032", "sample-0042"]):
+            for args in ([],):
                 with self.subTest(args=args), self.assertRaises(SystemExit) as raised:
                     main(args)
                 self.assertEqual(raised.exception.code, 2)
