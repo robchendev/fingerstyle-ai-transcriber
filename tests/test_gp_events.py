@@ -174,6 +174,44 @@ class MusicalEventTests(unittest.TestCase):
                 self.assertIsNone(playback["noteEvents"][1]["isAttack"])
                 self.assertIsNone(playback["noteEvents"][1]["tieFrom"])
 
+    def test_repeat_entry_tie_is_silent_without_its_original_first_pass_origin(self):
+        decoded = decode_score(musical_score(), TUNING, 2)
+        playback = performance_events(decoded, [0, 1, 1], silence_repeated_entry_ties=True)
+        first, tied, returning = playback["noteEvents"]
+        self.assertEqual(tied["tieFrom"], first["id"])
+        self.assertFalse(returning["isAttack"])
+        self.assertIsNone(returning["tieFrom"])
+        self.assertTrue(returning["isSilent"])
+        self.assertEqual(returning["durationQuarter"], [4, 1])
+        self.assertEqual(playback["durationQuarter"], [12, 1])
+        self.assertEqual(decoded["issues"], [])
+        self.assertTrue(decoded["scoreEvents"][2]["notes"][0]["tie"]["destination"])
+
+    def test_replayed_original_origin_keeps_its_real_tie(self):
+        decoded = decode_score(musical_score(), TUNING, 2)
+        playback = performance_events(decoded, [0, 1, 0, 1], silence_repeated_entry_ties=True)
+        self.assertFalse(any(event.get("isSilent") for event in playback["noteEvents"]))
+        self.assertEqual(playback["noteEvents"][3]["tieFrom"], playback["noteEvents"][2]["id"])
+
+    def test_unknown_first_tie_is_not_silenced_by_an_unrelated_repeat(self):
+        decoded = decode_score(musical_score(), TUNING, 2)
+        playback = performance_events(decoded, [1, 1], silence_repeated_entry_ties=True)
+        self.assertIsNone(playback["noteEvents"][0]["isAttack"])
+        self.assertFalse(any(event.get("isSilent") for event in playback["noteEvents"]))
+
+    def test_silenced_repeat_entry_keeps_its_following_tie_segments_silent(self):
+        root = musical_score()
+        root.find("./Notes/Note[@id='1']/Tie").set("origin", "true")
+        root.find("Notes").append(note_xml("3", tie={"origin": "false", "destination": "true"}))
+        root.find("Beats").append(ET.fromstring('<Beat id="3"><Rhythm ref="0"/><Notes>3</Notes></Beat>'))
+        root.find("Voices").append(ET.fromstring('<Voice id="3"><Beats>3</Beats></Voice>'))
+        root.find("Bars").append(ET.fromstring('<Bar id="2"><Voices>3 2 -1 -1</Voices></Bar>'))
+        root.find("MasterBars").append(ET.fromstring('<MasterBar><Time>4/4</Time><Bars>2</Bars></MasterBar>'))
+        decoded = decode_score(root, TUNING, 2)
+        playback = performance_events(decoded, [0, 1, 2, 1, 2], silence_repeated_entry_ties=True)
+        self.assertEqual([event.get("isSilent", False) for event in playback["noteEvents"]], [False, False, False, True, True])
+        self.assertEqual(playback["noteEvents"][-1]["suppressionReason"], "continuation_of_silenced_repeat_entry")
+
     def test_playback_notes_are_time_ordered_across_overlapping_voices(self):
         root = musical_score()
         root.find("./Rhythms/Rhythm/NoteValue").text = "Half"

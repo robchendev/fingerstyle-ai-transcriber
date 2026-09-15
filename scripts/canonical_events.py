@@ -3,6 +3,7 @@
 from collections import Counter
 from copy import deepcopy
 from fractions import Fraction
+import json
 
 from .gp_events import rational, validate_provided_timing
 
@@ -55,16 +56,26 @@ def validate_rules(score, annotations, beats):
             if not isinstance(identifier, str) or identifier not in beats or not beats[identifier]["referenceOnly"]:
                 raise CanonicalLabelError(f"Gesture evidence is not a reference beat: {identifier}")
         match = rule["match"]
-        if not isinstance(match, dict) or not match or set(match) - {"tokens", "text", "deadStrings", "beatTechniques", "deadNoteMarks"}:
+        if not isinstance(match, dict) or not match or set(match) - {"tokens", "text", "deadStrings", "beatTechniques", "deadNoteMarks", "pitchedNoteMarks", "simultaneousPitchedNoteMarks"}:
             raise CanonicalLabelError(f"Unsupported or empty gesture match: {rule['id']}")
-        if not any(match.get(key) for key in ("tokens", "text", "deadStrings", "beatTechniques")):
+        if not any(match.get(key) for key in ("tokens", "text", "deadStrings", "beatTechniques", "pitchedNoteMarks", "simultaneousPitchedNoteMarks")):
             raise CanonicalLabelError(f"Gesture rule would match every beat: {rule['id']}")
         if "tokens" in match and (not isinstance(match["tokens"], list) or not match["tokens"] or any(not isinstance(token, str) or not token or len(token.split()) != 1 for token in match["tokens"])):
             raise CanonicalLabelError(f"Invalid gesture tokens: {rule['id']}")
         if "text" in match and not isinstance(match["text"], str) or "beatTechniques" in match and not isinstance(match["beatTechniques"], dict):
             raise CanonicalLabelError(f"Invalid gesture text or articulations: {rule['id']}")
-        if "deadNoteMarks" in match and (not isinstance(match["deadNoteMarks"], list) or any(not isinstance(mark, dict) or set(mark) != {"string", "techniques", "harmonic", "instrumentArticulation"} for mark in match["deadNoteMarks"])):
-            raise CanonicalLabelError(f"Invalid dead-note articulations: {rule['id']}")
+        for field in ("deadNoteMarks", "pitchedNoteMarks", "simultaneousPitchedNoteMarks"):
+            if field in match and (not isinstance(match[field], list) or any(not isinstance(mark, dict) or set(mark) != {"string", "techniques", "harmonic", "instrumentArticulation"} for mark in match[field])):
+                raise CanonicalLabelError(f"Invalid note articulations: {rule['id']}")
+            for mark in match.get(field, []):
+                if type(mark["string"]) is not int or not 1 <= mark["string"] <= 6 or not isinstance(mark["techniques"], dict) or mark["techniques"].get("dead") is not (field == "deadNoteMarks"):
+                    raise CanonicalLabelError(f"Invalid note kind/string in rule: {rule['id']}")
+                harmonic = mark["harmonic"]
+                if harmonic is not None:
+                    if not isinstance(harmonic, dict) or set(harmonic) != {"type", "fret"} or not isinstance(harmonic["type"], str) or not harmonic["type"]:
+                        raise CanonicalLabelError(f"Invalid harmonic predicate: {rule['id']}")
+                    if fraction(harmonic["fret"], rule["id"]) <= 0:
+                        raise CanonicalLabelError(f"Nonpositive harmonic fret in rule: {rule['id']}")
         if "deadStrings" in match and (not isinstance(match["deadStrings"], list) or any(type(string) is not int or not 1 <= string <= 6 for string in match["deadStrings"]) or len(set(match["deadStrings"])) != len(match["deadStrings"])):
             raise CanonicalLabelError(f"Invalid symbolic strings: {rule['id']}")
         if type(rule["consumesDeadNotes"]) is not bool:
@@ -79,7 +90,7 @@ def validate_rules(score, annotations, beats):
     return rules
 
 
-def matches_rule(beat, rule):
+def matches_rule(beat, rule, simultaneous_notes=None):
     match = rule["match"]
     text = normalized_text(beat["text"])
     tokens = Counter(text.split())
@@ -91,11 +102,22 @@ def matches_rule(beat, rule):
         and ("deadStrings" not in match or dead_strings == sorted(match["deadStrings"]))
         and ("beatTechniques" not in match or beat["techniques"] == match["beatTechniques"])
         and ("deadNoteMarks" not in match or dead_note_marks(beat) == match["deadNoteMarks"])
+        and ("pitchedNoteMarks" not in match or pitched_note_marks(beat) == match["pitchedNoteMarks"])
+        and ("simultaneousPitchedNoteMarks" not in match or simultaneous_notes is not None and note_marks(simultaneous_notes, dead=False) == match["simultaneousPitchedNoteMarks"])
     )
 
 
+def note_marks(notes, *, dead):
+    marks = [{key: note[key] for key in ("string", "techniques", "harmonic", "instrumentArticulation")} for note in notes if note["techniques"]["dead"] is dead]
+    return sorted(marks, key=lambda mark: (mark["string"], json.dumps(mark, sort_keys=True)))
+
+
 def dead_note_marks(beat):
-    return [{key: note[key] for key in ("string", "techniques", "harmonic", "instrumentArticulation")} for note in sorted(beat["notes"], key=lambda note: note["string"]) if note["techniques"]["dead"]]
+    return note_marks(beat["notes"], dead=True)
+
+
+def pitched_note_marks(beat):
+    return note_marks(beat["notes"], dead=False)
 
 
 def rule_tokens(rule):
@@ -104,6 +126,7 @@ def rule_tokens(rule):
 
 def logical_notes(score, written_notes):
     chains, owners, segments, successors = {}, {}, {}, {}
+    silenced = []
     for event in score["playback"]["noteEvents"]:
         identifier = event["id"]
         if identifier in segments:
@@ -121,12 +144,23 @@ def logical_notes(score, written_notes):
             raise CanonicalLabelError(f"Grace duration differs from written source: {identifier}")
         if duration is not None and fraction(duration, identifier) != fraction(beat["notatedDurationQuarter"], beat["id"]):
             raise CanonicalLabelError(f"Note duration differs from written source: {identifier}")
+        if event.get("isSilent"):
+            if score["playback"].get("silenceRepeatedEntryTies") is not True or event.get("isSilent") is not True or event["isAttack"] is not False or event["tieFrom"] is not None or not note["tie"]["destination"] or event.get("suppressionReason") not in {"repeated_entry_tie_without_original_origin", "continuation_of_silenced_repeat_entry"} or duration is None:
+                raise CanonicalLabelError(f"Invalid silenced repeat-entry tie: {identifier}")
+            segments[identifier] = (event, beat, note)
+            silenced.append({
+                "performanceId": identifier, "writtenNoteId": note["id"], "writtenBeatId": beat["id"],
+                "voiceIndex": beat["voiceIndex"], "measureIndex": beat["measureIndex"], "visitIndex": event["visitIndex"],
+                "onsetQuarter": event["onsetQuarter"], "durationQuarter": duration,
+                "sourceString": note["string"], "sourceFret": note["fret"], "reason": event["suppressionReason"],
+            })
+            continue
         attack = event["isAttack"]
         if attack is not None and type(attack) is not bool:
             raise CanonicalLabelError(f"Invalid attack status: {identifier}")
         prior_id = event["tieFrom"]
         if prior_id is not None:
-            if prior_id not in segments or prior_id in successors:
+            if prior_id not in owners or prior_id in successors:
                 raise CanonicalLabelError(f"Missing, forward, cyclic, or branching tie: {identifier}")
             prior, prior_beat, prior_note = segments[prior_id]
             prior_end = fraction(prior["onsetQuarter"], prior_id)
@@ -191,7 +225,7 @@ def logical_notes(score, written_notes):
             ],
         }
         (symbols if dead else notes).append(result)
-    return notes, symbols, issues, segments
+    return notes, symbols, issues, segments, silenced
 
 
 def performance_beats(score):
@@ -207,16 +241,94 @@ def performance_beats(score):
             yield visit, beat, rational(fraction(visit["onsetQuarter"], "measure visit") + fraction(beat["offsetQuarter"], beat["id"]))
 
 
-def gesture_events(score, rules, segments):
+def performance_slot_keys(beats):
+    grace_ordinals = Counter()
+    keys = []
+    for visit, beat, onset in beats:
+        position = (visit["visitIndex"], fraction(onset, beat["id"]), beat["graceMode"])
+        ordinal = 0
+        if beat["graceMode"] is not None:
+            voice_position = (*position, beat["voiceIndex"])
+            ordinal = grace_ordinals[voice_position]
+            grace_ordinals[voice_position] += 1
+        keys.append((*position, ordinal))
+    return keys
+
+
+def normalized_performance_text(score, conventions):
+    beats = list(performance_beats(score))
+    if conventions is None:
+        return beats, []
+    if conventions.get("schemaVersion") != 1 or conventions.get("uppercaseOIsWristThump") is not True or conventions.get("simultaneousTextPriority") != "lowest-voice-index":
+        raise CanonicalLabelError("Unsupported owner notation conventions.")
+    groups = {}
+    for index, ((visit, beat, onset), slot) in enumerate(zip(beats, performance_slot_keys(beats))):
+        if normalized_text(beat["text"]):
+            groups.setdefault(slot, []).append(index)
+    overrides, suppressed = {}, []
+    for indices in groups.values():
+        if len(indices) < 2:
+            continue
+        voices = [beats[index][1]["voiceIndex"] for index in indices]
+        if len(voices) != len(set(voices)):
+            raise CanonicalLabelError("Multiple annotated regular beats share one voice/onset.")
+        winner = min(indices, key=lambda index: beats[index][1]["voiceIndex"])
+        chosen = beats[winner][1]
+        for index in indices:
+            if index == winner:
+                continue
+            visit, beat, onset = beats[index]
+            overrides[index] = {**beat, "text": None}
+            suppressed.append({
+                "performanceBeatId": f"p{visit['visitIndex']}:{beat['id']}",
+                "writtenBeatId": beat["id"], "voiceIndex": beat["voiceIndex"],
+                "onsetQuarter": onset, "rawText": beat["text"],
+                "effectiveTextBeatId": chosen["id"], "effectiveText": chosen["text"],
+                "reason": "higher_priority_voice_text",
+            })
+    return [(visit, overrides.get(index, beat), onset) for index, (visit, beat, onset) in enumerate(beats)], suppressed
+
+
+def gesture_events(score, rules, segments, conventions=None):
     gestures, unresolved, rests = [], [], []
-    for visit, beat, onset in performance_beats(score):
+    performed, suppressed = normalized_performance_text(score, conventions)
+    filtered = []
+    for visit, beat, onset in performed:
+        notes = [note for note in beat["notes"] if not segments[f"p{visit['visitIndex']}:{note['id']}"][0].get("isSilent")]
+        filtered.append((visit, {**beat, "notes": notes, "isRest": not notes}, onset))
+    performed = filtered
+    suppressed_ids = {item["performanceBeatId"] for item in suppressed}
+    slots = performance_slot_keys(performed)
+    simultaneous = {}
+    for (visit, beat, _), slot in zip(performed, slots):
+        simultaneous.setdefault(slot, []).extend((f"p{visit['visitIndex']}:{note['id']}", note) for note in beat["notes"])
+    emitted = set()
+    for (visit, beat, onset), slot in zip(performed, slots):
         performance_id = f"p{visit['visitIndex']}:{beat['id']}"
         if beat["isRest"]:
             rests.append({"id": performance_id, "voiceIndex": beat["voiceIndex"], "onsetQuarter": onset, "notatedDurationQuarter": beat["notatedDurationQuarter"], "writtenBeatId": beat["id"], "measureIndex": beat["measureIndex"], "visitIndex": visit["visitIndex"]})
-        matched = [rule for rule in rules if matches_rule(beat, rule)]
+        # A hidden annotation must not be reinterpreted as an unmarked pattern.
+        context = simultaneous[slot]
+        matched = [] if performance_id in suppressed_ids else [rule for rule in rules if matches_rule(beat, rule, [note for _, note in context])]
+        owner_wrist = conventions is not None and normalized_text(beat["text"]) == "O"
+        if owner_wrist:
+            gestures.append({
+                "id": f"{performance_id}:owner-uppercase-O", "technique": "wrist_thump",
+                "attributes": {}, "voiceIndex": beat["voiceIndex"], "onsetQuarter": onset,
+                "durationQuarter": None, "writtenBeatId": beat["id"], "visitIndex": visit["visitIndex"],
+                "graceMode": beat["graceMode"], "scoreOnsetKnown": beat["graceMode"] is None,
+                "symbolicNoteIds": [], "interpretationRuleId": "owner-uppercase-O",
+                "evidenceBeatIds": [], "evidenceSource": "owner-notation-conventions",
+            })
+            matched = [rule for rule in matched if not (rule["technique"] == "wrist_thump" and "O" in rule_tokens(rule))]
         dead_ids = [f"p{visit['visitIndex']}:{note['id']}" for note in beat["notes"] if note["techniques"]["dead"]]
         candidates = []
         for rule in matched:
+            if any(field in rule["match"] for field in ("pitchedNoteMarks", "simultaneousPitchedNoteMarks")):
+                relevant = [(f"p{visit['visitIndex']}:{note['id']}", note) for note in beat["notes"]] if "pitchedNoteMarks" in rule["match"] else context
+                attacks = [segments[identifier][0]["isAttack"] for identifier, note in relevant if not note["techniques"]["dead"]]
+                if not attacks or any(attack is not True for attack in attacks):
+                    continue
             if rule["consumesDeadNotes"] and dead_ids:
                 attacks = [segments[identifier][0]["isAttack"] for identifier in dead_ids]
                 if all(attack is False for attack in attacks):
@@ -229,20 +341,31 @@ def gesture_events(score, rules, segments):
             first_tokens = rule_tokens(first_rule)
             for second_rule in candidates[index + 1:]:
                 second_tokens = rule_tokens(second_rule)
-                if first_tokens & second_tokens or dead_ids and first_rule["consumesDeadNotes"] and second_rule["consumesDeadNotes"]:
+                shared_pitched_scope = all(any(field in rule["match"] for field in ("pitchedNoteMarks", "simultaneousPitchedNoteMarks")) for rule in (first_rule, second_rule))
+                if first_tokens & second_tokens or dead_ids and first_rule["consumesDeadNotes"] and second_rule["consumesDeadNotes"] or shared_pitched_scope:
                     conflicting.update((first_rule["id"], second_rule["id"]))
         if conflicting:
             unresolved.append({"performanceBeatId": performance_id, "onsetQuarter": onset, "reason": "ambiguous_gesture_rules", "ruleIds": sorted(conflicting), "symbolicNoteIds": dead_ids})
             candidates = [rule for rule in candidates if rule["id"] not in conflicting]
-        consumed = set()
+        consumed = {"O"} if owner_wrist else set()
         for rule in candidates:
             consumed.update(rule_tokens(rule))
+            grouped = "simultaneousPitchedNoteMarks" in rule["match"]
+            key = (slot, rule["id"])
+            if grouped and key in emitted:
+                continue
+            if grouped:
+                emitted.add(key)
+            pitched = [(f"p{visit['visitIndex']}:{note['id']}", note) for note in beat["notes"]] if "pitchedNoteMarks" in rule["match"] else context if grouped else []
             gestures.append({
                 "id": f"{performance_id}:{rule['id']}", "technique": rule["technique"],
                 "attributes": rule.get("attributes", {}),
                 "voiceIndex": beat["voiceIndex"], "onsetQuarter": onset, "durationQuarter": None,
+                "graceMode": beat["graceMode"], "scoreOnsetKnown": beat["graceMode"] is None,
                 "writtenBeatId": beat["id"], "visitIndex": visit["visitIndex"],
                 "symbolicNoteIds": dead_ids if rule["consumesDeadNotes"] else [],
+                "sourcePitchedNoteIds": [identifier for identifier, note in pitched if not note["techniques"]["dead"]] if any(field in rule["match"] for field in ("pitchedNoteMarks", "simultaneousPitchedNoteMarks")) else [],
+                "contextPitchedNoteIds": [identifier for identifier, note in context if not note["techniques"]["dead"]] if grouped else [],
                 "interpretationRuleId": rule["id"], "evidenceBeatIds": rule["evidenceBeatIds"],
             })
         uncovered_dead = dead_ids and not any(rule["consumesDeadNotes"] for rule in candidates)
@@ -250,10 +373,10 @@ def gesture_events(score, rules, segments):
             unresolved.append({"performanceBeatId": performance_id, "onsetQuarter": onset, "reason": "uninterpreted_dead_note_cluster", "symbolicNoteIds": dead_ids})
         if set(normalized_text(beat["text"]).split()) - consumed:
             unresolved.append({"performanceBeatId": performance_id, "onsetQuarter": onset, "reason": "uninterpreted_annotation", "writtenBeatId": beat["id"]})
-    return gestures, unresolved, rests
+    return gestures, unresolved, rests, suppressed
 
 
-def canonicalize(score, annotations=None):
+def canonicalize(score, annotations=None, conventions=None):
     if score["schemaVersion"] != 1 or score["timeUnit"] != "quarter-note" or score["playback"] is None:
         raise CanonicalLabelError("Canonical labels require version-1 score events with resolved playback.")
     if score.get("audioAlignment") is not None:
@@ -279,8 +402,8 @@ def canonicalize(score, annotations=None):
     if set(expected) != {event["id"] for event in score["playback"]["noteEvents"]}:
         raise CanonicalLabelError("Playback omits written note occurrences.")
     rules = validate_rules(score, annotations, beats)
-    notes, symbols, issues, segments = logical_notes(score, written_notes)
-    gestures, unresolved, rests = gesture_events(score, rules, segments)
+    notes, symbols, issues, segments, silenced = logical_notes(score, written_notes)
+    gestures, unresolved, rests, suppressed = gesture_events(score, rules, segments, conventions)
     timing_resolved = not any(issue["code"] in {"underfull_measure", "overfull_measure", "unresolved_playback_order"} for issue in score["issues"])
     output = {
         "schemaVersion": 1, "catalogId": score["catalogId"], "timeUnit": "quarter-note",
@@ -291,8 +414,8 @@ def canonicalize(score, annotations=None):
             "providedTiming": {key: score["providedTiming"][key] for key in ("tempo", "timeSignature", "sourceTempoChanges", "sourceTimeSignatureChanges")},
         },
         "measureVisits": score["playback"]["measureVisits"],
-        "targets": {"notes": notes, "rests": rests, "gestures": gestures},
-        "review": {"notationSymbols": symbols, "unresolvedGestures": unresolved, "issues": issues, "sourceIssues": score["issues"]},
+        "targets": {"notes": notes, "rests": rests, "noteRests": silenced, "gestures": gestures},
+        "review": {"notationSymbols": symbols, "unresolvedGestures": unresolved, "suppressedAnnotations": suppressed, "issues": issues, "sourceIssues": score["issues"]},
         "provenance": {"sourceGpSha256": score["sourceGpSha256"], "fretConvention": instrument["fretConvention"], "ruleIds": [rule["id"] for rule in rules], "referenceBeatIds": [beat["id"] for beat in score["scoreEvents"] if beat["referenceOnly"]]},
     }
     return deepcopy(output)
@@ -305,7 +428,8 @@ def canonical_counts(labels):
     return {
         "logicalNoteCount": len(notes),
         "symbolicNoteCount": len(symbols),
-        "sourceSegmentCount": sum(len(note["sourceSegments"]) for note in notes + symbols),
+        "sourceSegmentCount": sum(len(note["sourceSegments"]) for note in notes + symbols) + len(labels["targets"]["noteRests"]),
+        "silencedRepeatTieCount": len(labels["targets"]["noteRests"]),
         "mergedContinuationCount": sum(len(note["sourceSegments"]) - 1 for note in notes + symbols),
         "unknownAttackCount": sum(note["isAttack"] is None for note in notes + symbols),
         "unknownDurationCount": sum(not note["labelMask"]["notatedDuration"] for note in notes + symbols),
@@ -315,5 +439,6 @@ def canonical_counts(labels):
         "uninterpretedClusterCount": unresolved["uninterpreted_dead_note_cluster"],
         "uninterpretedAnnotationCount": unresolved["uninterpreted_annotation"],
         "ambiguousGestureCount": unresolved["ambiguous_gesture_rules"],
+        "suppressedAnnotationCount": len(labels["review"]["suppressedAnnotations"]),
         "scoreTimingResolved": labels["scoreTimingResolved"],
     }

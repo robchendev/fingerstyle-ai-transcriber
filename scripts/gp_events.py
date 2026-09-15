@@ -452,10 +452,14 @@ def playback_order(measures, fine_measure_index=None):
     return visits
 
 
-def performance_events(decoded, order):
+def performance_events(decoded, order, *, silence_repeated_entry_ties=False):
+    if type(silence_repeated_entry_ties) is not bool:
+        raise EventExtractionError("Repeated-entry tie policy must be an explicit boolean.")
     visits, notes = [], []
     position = Fraction(0)
     previous = {}
+    visited = set()
+    first_tie_origins = {}
     for visit_index, measure_index in enumerate(order):
         measure = decoded["measures"][measure_index]
         visits.append({"visitIndex": visit_index, "measureIndex": measure_index, "onsetQuarter": rational(position)})
@@ -468,22 +472,39 @@ def performance_events(decoded, order):
                 prior = previous.get((beat["voiceIndex"], note["string"]))
                 tie_origin = None
                 attack = not note["tie"]["destination"]
+                suppression = None
                 if note["tie"]["destination"]:
+                    returning_entry = measure_index in visited and visit_index > 0 and order[visit_index - 1] != measure_index - 1 and beat["offsetQuarter"][0] == 0 and beat["graceMode"] is None
+                    original_origin = first_tie_origins.get(note["id"])
+                    if silence_repeated_entry_ties and returning_entry and original_origin is not None and (prior is None or prior["sourceEventId"] != original_origin):
+                        suppression = "repeated_entry_tie_without_original_origin"
+                    elif silence_repeated_entry_ties and prior and prior["isSilent"] and prior["end"] == onset and prior["pitch"] == note["basePitchMidi"]:
+                        suppression = "continuation_of_silenced_repeat_entry"
                     # GPIF's destination establishes the tie; its origin flag is redundant.
-                    if prior and prior["end"] == onset and prior["pitch"] == note["basePitchMidi"]:
+                    if suppression:
+                        attack = False
+                    elif prior and prior["end"] == onset and prior["pitch"] == note["basePitchMidi"]:
                         tie_origin = prior["id"]
+                        first_tie_origins.setdefault(note["id"], prior["sourceEventId"])
                     else:
                         attack = None
                         decoded["issues"].append({"code": "unresolved_tie_destination", "eventId": identifier})
-                notes.append({
+                event = {
                     "id": identifier, "sourceEventId": note["id"], "visitIndex": visit_index,
                     "onsetQuarter": rational(onset), "durationQuarter": None if beat["graceMode"] else rational(duration),
                     "isAttack": attack, "tieFrom": tie_origin,
-                })
+                }
+                if suppression:
+                    event.update(isSilent=True, suppressionReason=suppression)
+                notes.append(event)
                 previous[(beat["voiceIndex"], note["string"])] = {
-                    "id": identifier,
+                    "id": identifier, "sourceEventId": note["id"], "isSilent": suppression is not None,
                     "end": onset if beat["graceMode"] else onset + duration, "pitch": note["basePitchMidi"],
                 }
         position += Fraction(*measure["durationQuarter"])
+        visited.add(measure_index)
     notes.sort(key=lambda event: (Fraction(*event["onsetQuarter"]), event["visitIndex"]))
-    return {"policy": "Repeats/voltas on first pass; D.C./D.S. return ignores repeats and voltas until its Coda/Fine/end; repeats resume at Coda.", "measureVisits": visits, "noteEvents": notes, "durationQuarter": rational(position)}
+    result = {"policy": "Repeats/voltas on first pass; D.C./D.S. return ignores repeats and voltas until its Coda/Fine/end; repeats resume at Coda.", "measureVisits": visits, "noteEvents": notes, "durationQuarter": rational(position)}
+    if silence_repeated_entry_ties:
+        result["silenceRepeatedEntryTies"] = True
+    return result

@@ -5,7 +5,7 @@ import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 
-from scripts.canonical_events import CanonicalLabelError, canonical_counts, canonicalize, dead_note_marks, matches_rule
+from scripts.canonical_events import CanonicalLabelError, canonical_counts, canonicalize, dead_note_marks, matches_rule, pitched_note_marks, note_marks
 from scripts.catalogs import PerformerPaths, sha256, write_json
 from scripts.gp_events import catalog_timing, decode_score, performance_events, playback_order
 from scripts.prepare_labels import prepare_entry
@@ -43,7 +43,245 @@ def gesture_rules(technique="right_hand_string_slap"):
     return {"gpSha256": "a" * 64, "rules": [{"id": "slap", "technique": technique, "evidenceBeatIds": ["m1:v0:b0"], "match": {"deadStrings": [5, 6], "text": ""}, "consumesDeadNotes": True}]}
 
 
+def harmonic_gesture_score(companion=False):
+    root = musical_score()
+    root.find("Notes").clear()
+    root.find("Notes").append(note_xml("0", harmonic=("Tap", 12)))
+    root.find("Notes").append(note_xml("1", harmonic=("Tap", 12)))
+    root.find("./Beats/Beat[@id='0']/FreeText").text = None
+    root.find("./Beats/Beat[@id='0']/Properties").clear()
+    ET.SubElement(ET.SubElement(root.findall("./MasterBars/MasterBar")[1], "Section"), "Text").text = "Instructions"
+    ET.SubElement(root.find("./Beats/Beat[@id='1']"), "FreeText").text = "Slap harmonic"
+    if companion:
+        tapped = note_xml("2", string=3)
+        ET.SubElement(ET.SubElement(tapped.find("Properties"), "Property", name="LeftHandTapped"), "Enable")
+        root.find("Notes").append(tapped)
+        ET.SubElement(root.find("./Beats/Beat[@id='2']"), "Notes").text = "2"
+    return extracted(root)
+
+
+OWNER_CONVENTIONS = {"schemaVersion": 1, "uppercaseOIsWristThump": True, "simultaneousTextPriority": "lowest-voice-index"}
+
+
 class CanonicalEventTests(unittest.TestCase):
+    def test_silent_repeat_entry_becomes_rest_without_shortening_score(self):
+        score = extracted(order=[0, 1, 1])
+        score["issues"] = []
+        score["playback"] = performance_events(score, [0, 1, 1], silence_repeated_entry_ties=True)
+        labels = canonicalize(score)
+        self.assertEqual(len(labels["targets"]["notes"]), 1)
+        self.assertEqual(labels["targets"]["notes"][0]["notatedDurationQuarter"], [8, 1])
+        self.assertEqual(labels["targets"]["noteRests"][0]["durationQuarter"], [4, 1])
+        primary_rests = [rest for rest in labels["targets"]["rests"] if rest["voiceIndex"] == 0]
+        self.assertEqual(len(primary_rests), 1)
+        self.assertEqual(primary_rests[0]["onsetQuarter"], [8, 1])
+        self.assertEqual(canonical_counts(labels)["sourceSegmentCount"], 3)
+        self.assertEqual(canonical_counts(labels)["silencedRepeatTieCount"], 1)
+
+    def test_silencing_one_tied_chord_note_preserves_other_attacks(self):
+        root = musical_score()
+        root.find("Notes").append(note_xml("3", string=2))
+        root.find("./Beats/Beat[@id='1']/Notes").text = "1 3"
+        score = extracted(root, order=[0, 1, 1])
+        score["issues"] = []
+        score["playback"] = performance_events(score, [0, 1, 1], silence_repeated_entry_ties=True)
+        labels = canonicalize(score)
+        returning = [note for note in labels["targets"]["notes"] if note["onsetQuarter"] == [8, 1]]
+        self.assertEqual(len(returning), 1)
+        self.assertEqual(returning[0]["string"], 4)
+        self.assertTrue(returning[0]["isAttack"])
+        self.assertFalse(any(rest["voiceIndex"] == 0 for rest in labels["targets"]["rests"]))
+        self.assertEqual(len(labels["targets"]["noteRests"]), 1)
+
+    def test_pitched_harmonic_pattern_does_not_match_ordinary_notes(self):
+        score = harmonic_gesture_score()
+        rules = gesture_rules("slap_harmonic")
+        rules["rules"][0].update(match={"text": "", "pitchedNoteMarks": pitched_note_marks(score["scoreEvents"][0])}, consumesDeadNotes=False)
+        labels = canonicalize(score, rules)
+        self.assertEqual(len(labels["targets"]["gestures"]), 1)
+        self.assertEqual(labels["targets"]["gestures"][0]["sourcePitchedNoteIds"], ["p0:m0:v0:b0:n0"])
+        ordinary = deepcopy(score["scoreEvents"][0])
+        ordinary["notes"][0]["harmonic"] = None
+        self.assertFalse(matches_rule(ordinary, rules["rules"][0]))
+        different_harmonic = deepcopy(score["scoreEvents"][0])
+        different_harmonic["notes"][0]["harmonic"]["type"] = "Natural"
+        self.assertFalse(matches_rule(different_harmonic, rules["rules"][0]))
+
+    def test_simultaneous_pitched_compound_binds_both_voices_once(self):
+        score = harmonic_gesture_score(companion=True)
+        marks = note_marks([note for beat in score["scoreEvents"][:2] for note in beat["notes"]], dead=False)
+        rules = gesture_rules("compound_gesture")
+        rules["rules"][0].update(match={"text": "", "simultaneousPitchedNoteMarks": marks}, consumesDeadNotes=False)
+        labels = canonicalize(score, rules)
+        self.assertEqual(len(labels["targets"]["gestures"]), 1)
+        self.assertEqual(set(labels["targets"]["gestures"][0]["sourcePitchedNoteIds"]), {"p0:m0:v0:b0:n0", "p0:m0:v1:b0:n0"})
+        self.assertEqual(len(labels["targets"]["notes"]), 2)
+        self.assertFalse(matches_rule(score["scoreEvents"][0], rules["rules"][0]))
+        without_tapping = deepcopy([note for beat in score["scoreEvents"][:2] for note in beat["notes"]])
+        without_tapping[1]["techniques"]["leftHandTapped"] = False
+        self.assertFalse(matches_rule(score["scoreEvents"][0], rules["rules"][0], without_tapping))
+
+    def test_held_context_bass_does_not_hide_a_fresh_harmonic_attack(self):
+        score = harmonic_gesture_score(companion=True)
+        bass = score["scoreEvents"][1]["notes"][0]
+        bass["tie"] = {"origin": False, "destination": True}
+        score["playback"] = performance_events(score, [0, 0])
+        current = pitched_note_marks(score["scoreEvents"][0])
+        context = note_marks([note for beat in score["scoreEvents"][:2] for note in beat["notes"]], dead=False)
+        rules = gesture_rules("slap_harmonic")
+        rules["rules"][0].update(match={"pitchedNoteMarks": current, "simultaneousPitchedNoteMarks": context}, consumesDeadNotes=False)
+        labels = canonicalize(score, rules)
+        hits = labels["targets"]["gestures"]
+        self.assertEqual(len(hits), 2)
+        self.assertEqual(hits[1]["sourcePitchedNoteIds"], ["p1:m0:v0:b0:n0"])
+        self.assertEqual(len(hits[1]["contextPitchedNoteIds"]), 2)
+        self.assertEqual(len([note for note in labels["targets"]["notes"] if note["voiceIndex"] == 1]), 1)
+        self.assertFalse(next(note for note in score["playback"]["noteEvents"] if note["id"] == "p1:m0:v1:b0:n0")["isAttack"])
+
+    def test_pitched_gesture_rules_do_not_create_attacks_on_tie_continuations(self):
+        score = extracted()
+        rules = gesture_rules("slap_harmonic")
+        score["scoreEvents"].append({**deepcopy(score["scoreEvents"][0]), "id": "reference", "referenceOnly": True, "notes": []})
+        rules["rules"][0].update(match={"pitchedNoteMarks": pitched_note_marks(score["scoreEvents"][0])}, consumesDeadNotes=False, evidenceBeatIds=["reference"])
+        labels = canonicalize(score, rules)
+        self.assertEqual(len(labels["targets"]["gestures"]), 1)
+        self.assertEqual(labels["targets"]["gestures"][0]["visitIndex"], 0)
+
+    def test_overlapping_pitched_rules_are_masked_not_double_counted(self):
+        score = harmonic_gesture_score()
+        rules = gesture_rules("slap_harmonic")
+        rules["rules"][0].update(match={"pitchedNoteMarks": pitched_note_marks(score["scoreEvents"][0])}, consumesDeadNotes=False)
+        rules["rules"].append({**deepcopy(rules["rules"][0]), "id": "different", "technique": "harmonic_rake"})
+        labels = canonicalize(score, rules)
+        self.assertEqual(labels["targets"]["gestures"], [])
+        self.assertEqual(labels["review"]["unresolvedGestures"][0]["reason"], "ambiguous_gesture_rules")
+
+    def test_invalid_pitched_note_predicates_fail_visibly(self):
+        score = harmonic_gesture_score()
+        for mutation in ("string", "dead", "harmonic"):
+            rules = gesture_rules("slap_harmonic")
+            marks = deepcopy(pitched_note_marks(score["scoreEvents"][0]))
+            if mutation == "string":
+                marks[0]["string"] = 0
+            elif mutation == "dead":
+                marks[0]["techniques"]["dead"] = True
+            else:
+                marks[0]["harmonic"]["fret"] = [12, 0]
+            rules["rules"][0].update(match={"pitchedNoteMarks": marks}, consumesDeadNotes=False)
+            with self.subTest(mutation=mutation), self.assertRaises(CanonicalLabelError):
+                canonicalize(score, rules)
+
+    def test_duplicate_voice_text_produces_one_wrist_hit_and_preserves_all_notes(self):
+        score = extracted()
+        score["scoreEvents"][1]["text"] = "O"
+        original = deepcopy(score)
+        labels = canonicalize(score, conventions=OWNER_CONVENTIONS)
+        self.assertEqual(score, original)
+        self.assertEqual(len(labels["targets"]["gestures"]), 1)
+        self.assertEqual(labels["targets"]["gestures"][0]["voiceIndex"], 0)
+        self.assertEqual(labels["targets"]["notes"], canonicalize(score)["targets"]["notes"])
+        suppressed = labels["review"]["suppressedAnnotations"]
+        self.assertEqual(len(suppressed), 1)
+        self.assertEqual(suppressed[0]["rawText"], "O")
+        self.assertEqual(suppressed[0]["effectiveTextBeatId"], "m0:v0:b0")
+
+    def test_visible_upper_voice_text_overrides_different_lower_voice_marker(self):
+        for upper, lower in (("NA", "O"), ("a", "2"), ("i", "1"), ("m", "3"), ("a m i", "i 1 3")):
+            score = extracted()
+            score["scoreEvents"][0]["text"] = upper
+            score["scoreEvents"][1]["text"] = lower
+            with self.subTest(upper=upper, lower=lower):
+                labels = canonicalize(score, conventions=OWNER_CONVENTIONS)
+                self.assertEqual(labels["targets"]["gestures"], [])
+                self.assertEqual(len(labels["review"]["suppressedAnnotations"]), 1)
+                self.assertEqual(labels["review"]["suppressedAnnotations"][0]["rawText"], lower)
+                self.assertEqual(labels["review"]["suppressedAnnotations"][0]["effectiveText"], upper)
+                self.assertEqual(labels["review"]["unresolvedGestures"][0]["writtenBeatId"], "m0:v0:b0")
+
+    def test_successive_percussive_finger_labels_keep_their_individual_positions(self):
+        root = musical_score()
+        root.find("MasterBars").remove(root.findall("./MasterBars/MasterBar")[1])
+        root.find("./MasterBars/MasterBar/Time").text = "3/4"
+        root.find("Rhythms").append(ET.fromstring('<Rhythm id="1"><NoteValue>Quarter</NoteValue></Rhythm>'))
+        root.find("Notes").clear()
+        root.find("Notes").append(note_xml("0", dead=True))
+        for identifier, text in zip(range(3, 9), ("a", "m", "i", "2", "1", "3")):
+            beat = ET.SubElement(root.find("Beats"), "Beat", id=str(identifier))
+            ET.SubElement(beat, "Rhythm", ref="1")
+            ET.SubElement(beat, "Notes").text = "0"
+            ET.SubElement(beat, "FreeText").text = text
+        root.find("./Voices/Voice[@id='0']/Beats").text = "3 4 5"
+        root.find("./Voices/Voice[@id='2']/Beats").text = "6 7 8"
+        score = extracted(root)
+        original = deepcopy(score)
+        labels = canonicalize(score, conventions=OWNER_CONVENTIONS)
+        suppressed = labels["review"]["suppressedAnnotations"]
+        self.assertEqual([item["effectiveText"] for item in suppressed], ["a", "m", "i"])
+        self.assertEqual([item["rawText"] for item in suppressed], ["2", "1", "3"])
+        self.assertEqual([item["onsetQuarter"] for item in suppressed], [[0, 1], [1, 1], [2, 1]])
+        self.assertEqual(labels["review"]["notationSymbols"], canonicalize(score)["review"]["notationSymbols"])
+        self.assertEqual(canonical_counts(labels)["sourceSegmentCount"], 6)
+        self.assertEqual(score, original)
+
+    def test_lower_voice_text_is_used_when_upper_voice_has_none(self):
+        score = extracted()
+        score["scoreEvents"][0]["text"] = None
+        score["scoreEvents"][1]["text"] = "O"
+        labels = canonicalize(score, conventions=OWNER_CONVENTIONS)
+        self.assertEqual(len(labels["targets"]["gestures"]), 1)
+        self.assertEqual(labels["targets"]["gestures"][0]["voiceIndex"], 1)
+        self.assertEqual(labels["review"]["suppressedAnnotations"], [])
+
+    def test_voice_priority_does_not_depend_on_source_iteration_order(self):
+        score = extracted()
+        score["scoreEvents"][0]["text"] = "O"
+        score["scoreEvents"][1]["text"] = "L"
+        score["scoreEvents"][0], score["scoreEvents"][1] = score["scoreEvents"][1], score["scoreEvents"][0]
+        labels = canonicalize(score, conventions=OWNER_CONVENTIONS)
+        self.assertEqual(len(labels["targets"]["gestures"]), 1)
+        self.assertEqual(labels["targets"]["gestures"][0]["voiceIndex"], 0)
+        self.assertEqual(labels["review"]["suppressedAnnotations"][0]["rawText"], "L")
+
+    def test_unapproved_conventions_fail_instead_of_silently_reinterpreting_text(self):
+        for conventions in ({}, {**OWNER_CONVENTIONS, "uppercaseOIsWristThump": False}, {**OWNER_CONVENTIONS, "simultaneousTextPriority": "highest-voice-index"}):
+            with self.subTest(conventions=conventions), self.assertRaises(CanonicalLabelError):
+                canonicalize(extracted(), conventions=conventions)
+
+    def test_wrist_convention_is_case_sensitive_and_does_not_label_fret_zero(self):
+        for text in ("o", "0", "O means wrist thump", "O O", None):
+            score = extracted()
+            score["scoreEvents"][0]["text"] = text
+            with self.subTest(text=text):
+                self.assertEqual(canonicalize(score, conventions=OWNER_CONVENTIONS)["targets"]["gestures"], [])
+
+    def test_owner_wrist_convention_does_not_duplicate_a_source_legend_rule(self):
+        score = gesture_score()
+        score["scoreEvents"][0]["text"] = "O"
+        rules = gesture_rules("wrist_thump")
+        rules["rules"][0].update(match={"tokens": ["O"]}, consumesDeadNotes=False)
+        labels = canonicalize(score, rules, OWNER_CONVENTIONS)
+        self.assertEqual(len(labels["targets"]["gestures"]), 1)
+
+    def test_distinct_score_positions_keep_separate_wrist_hits(self):
+        score = extracted()
+        score["scoreEvents"][2]["text"] = "O"
+        labels = canonicalize(score, conventions=OWNER_CONVENTIONS)
+        self.assertEqual([event["onsetQuarter"] for event in labels["targets"]["gestures"]], [[0, 1], [4, 1]])
+
+    def test_parallel_grace_voice_markers_deduplicate_without_consuming_the_main_beat(self):
+        root = musical_score()
+        for beat_id in ("0", "2"):
+            ET.SubElement(root.find(f"./Beats/Beat[@id='{beat_id}']"), "GraceNotes").text = "OnBeat"
+        ET.SubElement(root.find("./Beats/Beat[@id='2']"), "FreeText").text = "O"
+        root.find("./Voices/Voice[@id='0']/Beats").text = "0 1"
+        ET.SubElement(root.find("./Beats/Beat[@id='1']"), "FreeText").text = "O"
+        labels = canonicalize(extracted(root, order=[0]), conventions=OWNER_CONVENTIONS)
+        hits = labels["targets"]["gestures"]
+        self.assertEqual(len(hits), 2)
+        self.assertEqual([hit["graceMode"] for hit in hits], ["OnBeat", None])
+        self.assertEqual([hit["scoreOnsetKnown"] for hit in hits], [False, True])
+        self.assertEqual(len(labels["review"]["suppressedAnnotations"]), 1)
+
     def test_ties_become_one_note_without_mutating_the_source(self):
         score = extracted()
         before = deepcopy(score)
@@ -337,6 +575,8 @@ class CanonicalEventTests(unittest.TestCase):
             prepared = prepare_entry(entry, audit, None, paths)
             self.assertEqual(prepared["provenance"]["eventSha256"], sha256(events))
             self.assertEqual([path.read_bytes() for path in (gp, audio, events)], before)
+            with self.assertRaisesRegex(CanonicalLabelError, "stale owner tie policy"):
+                prepare_entry(entry, audit, None, paths, {**OWNER_CONVENTIONS, "playback": {"silenceRepeatedEntryTies": True}})
             entry["rangeSeconds"] = [0, 1]
             with self.assertRaisesRegex(CanonicalLabelError, "bounds"):
                 prepare_entry(entry, audit, None, paths)
