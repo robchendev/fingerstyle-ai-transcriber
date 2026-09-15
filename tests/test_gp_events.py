@@ -148,6 +148,32 @@ class MusicalEventTests(unittest.TestCase):
         self.assertFalse(playback["noteEvents"][1]["isAttack"])
         self.assertEqual(playback["noteEvents"][1]["tieFrom"], playback["noteEvents"][0]["id"])
 
+    def test_explicit_tie_destination_does_not_require_redundant_origin_flag(self):
+        root = musical_score()
+        root.find("./Notes/Note[@id='0']/Tie").set("origin", "false")
+        decoded = decode_score(root, TUNING, 2)
+        playback = performance_events(decoded, playback_order(decoded["measures"]))
+        self.assertFalse(decoded["scoreEvents"][0]["notes"][0]["tie"]["origin"])
+        self.assertFalse(playback["noteEvents"][1]["isAttack"])
+        self.assertEqual(playback["noteEvents"][1]["tieFrom"], playback["noteEvents"][0]["id"])
+        self.assertNotIn("unresolved_tie_destination", [issue["code"] for issue in decoded["issues"]])
+
+    def test_tie_destination_still_requires_matching_pitch_and_adjacent_score_time(self):
+        for change in ("pitch", "gap"):
+            root = musical_score()
+            root.find("./Notes/Note[@id='0']/Tie").set("origin", "false")
+            if change == "pitch":
+                root.find("Notes").remove(root.find("./Notes/Note[@id='1']"))
+                root.find("Notes").append(note_xml("1", fret=1, tie={"origin": "false", "destination": "true"}))
+            else:
+                root.find("Rhythms").append(ET.fromstring('<Rhythm id="1"><NoteValue>Half</NoteValue></Rhythm>'))
+                root.find("./Beats/Beat[@id='0']/Rhythm").set("ref", "1")
+            decoded = decode_score(root, TUNING, 2)
+            playback = performance_events(decoded, playback_order(decoded["measures"]))
+            with self.subTest(change=change):
+                self.assertIsNone(playback["noteEvents"][1]["isAttack"])
+                self.assertIsNone(playback["noteEvents"][1]["tieFrom"])
+
     def test_playback_notes_are_time_ordered_across_overlapping_voices(self):
         root = musical_score()
         root.find("./Rhythms/Rhythm/NoteValue").text = "Half"

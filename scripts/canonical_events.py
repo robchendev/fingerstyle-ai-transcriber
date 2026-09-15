@@ -132,7 +132,7 @@ def logical_notes(score, written_notes):
             prior_end = fraction(prior["onsetQuarter"], prior_id)
             if prior["durationQuarter"] is not None:
                 prior_end += fraction(prior["durationQuarter"], prior_id)
-            if attack is not False or not note["tie"]["destination"] or not prior_note["tie"]["origin"]:
+            if attack is not False or not note["tie"]["destination"]:
                 raise CanonicalLabelError(f"Tie flags contradict the link: {identifier}")
             if (beat["voiceIndex"], note["string"], note["basePitchMidi"]) != (prior_beat["voiceIndex"], prior_note["string"], prior_note["basePitchMidi"]) or prior_end != onset:
                 raise CanonicalLabelError(f"Tie crosses voice, string, pitch, or a timing gap: {identifier}")
@@ -152,16 +152,13 @@ def logical_notes(score, written_notes):
         first, beat, source_note = segments[root]
         parts = [segments[identifier] for identifier in identifiers]
         duration_known = first["isAttack"] is True and all(event["durationQuarter"] is not None for event, _, _ in parts)
-        if parts[-1][2]["tie"]["origin"]:
-            duration_known = False
-            issues.append({"code": "unresolved_tie_origin", "performanceId": identifiers[-1]})
         if first["isAttack"] is None:
             issues.append({"code": "unresolved_logical_note_start", "performanceId": root})
         pitches = {note["soundingPitchMidi"] for _, _, note in parts}
         dead_states = {note["techniques"]["dead"] for _, _, note in parts}
         if len(dead_states) != 1:
             raise CanonicalLabelError(f"Tie changes between a pitched note and symbolic percussion: {root}")
-        pitch_known = len(pitches) == 1 and None not in pitches
+        pitch_known = first["isAttack"] is True and len(pitches) == 1 and None not in pitches
         if len(pitches) > 1:
             issues.append({"code": "changing_tied_pitch", "performanceId": root})
         observed = sum((fraction(event["durationQuarter"], event["id"]) for event, _, _ in parts if event["durationQuarter"] is not None), Fraction(0))
@@ -174,7 +171,7 @@ def logical_notes(score, written_notes):
             "string": source_note["string"], "fret": source_note["fret"],
             "basePitchMidi": source_note["basePitchMidi"],
             "soundingPitchMidi": next(iter(pitches)) if pitch_known else None,
-            "labelMask": {"attack": first["isAttack"] is True, "notatedDuration": duration_known, "pitch": pitch_known and not dead, "fingering": not dead},
+            "labelMask": {"attack": first["isAttack"] is True, "notatedDuration": duration_known, "pitch": pitch_known and not dead, "fingering": first["isAttack"] is True and not dead},
             "sourceSegments": [
                 {
                     "performanceId": event["id"], "writtenNoteId": note["id"], "writtenBeatId": source_beat["id"],
@@ -184,7 +181,9 @@ def logical_notes(score, written_notes):
                     "rhythm": source_beat["rhythm"], "graceMode": source_beat["graceMode"],
                     "harmonic": note["harmonic"], "bend": note["bend"], "techniques": note["techniques"],
                     "basePitchMidi": note["basePitchMidi"], "soundingPitchMidi": note["soundingPitchMidi"],
+                    "string": note["string"], "fret": note["fret"],
                     "storedMidi": note["storedMidi"], "instrumentArticulation": note["instrumentArticulation"],
+                    "tie": note["tie"],
                     "techniqueMask": {key: value is not False and value is not None for key, value in note["techniques"].items()},
                     "beatTechniques": source_beat["techniques"], "dynamic": source_beat["dynamic"],
                 }

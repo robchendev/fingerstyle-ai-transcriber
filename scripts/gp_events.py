@@ -469,7 +469,8 @@ def performance_events(decoded, order):
                 tie_origin = None
                 attack = not note["tie"]["destination"]
                 if note["tie"]["destination"]:
-                    if prior and prior["isOrigin"] and prior["end"] == onset and prior["pitch"] == note["basePitchMidi"]:
+                    # GPIF's destination establishes the tie; its origin flag is redundant.
+                    if prior and prior["end"] == onset and prior["pitch"] == note["basePitchMidi"]:
                         tie_origin = prior["id"]
                     else:
                         attack = None
@@ -480,7 +481,7 @@ def performance_events(decoded, order):
                     "isAttack": attack, "tieFrom": tie_origin,
                 })
                 previous[(beat["voiceIndex"], note["string"])] = {
-                    "id": identifier, "isOrigin": note["tie"]["origin"],
+                    "id": identifier,
                     "end": onset if beat["graceMode"] else onset + duration, "pitch": note["basePitchMidi"],
                 }
         position += Fraction(*measure["durationQuarter"])

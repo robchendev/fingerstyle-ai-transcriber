@@ -82,19 +82,33 @@ class CanonicalEventTests(unittest.TestCase):
     def test_unresolved_destination_is_not_an_attack_or_complete_duration(self):
         root = musical_score()
         root.find("./Notes/Note[@id='0']/Tie").set("origin", "false")
+        root.find("Rhythms").append(ET.fromstring('<Rhythm id="1"><NoteValue>Half</NoteValue></Rhythm>'))
+        root.find("./Beats/Beat[@id='0']/Rhythm").set("ref", "1")
         labels = canonicalize(extracted(root))
         unresolved = labels["targets"]["notes"][1]
         self.assertIsNone(unresolved["isAttack"])
         self.assertFalse(unresolved["labelMask"]["attack"])
+        self.assertFalse(unresolved["labelMask"]["pitch"])
+        self.assertFalse(unresolved["labelMask"]["fingering"])
+        self.assertIsNone(unresolved["soundingPitchMidi"])
         self.assertIsNone(unresolved["notatedDurationQuarter"])
         self.assertEqual(unresolved["observedDurationQuarter"], [4, 1])
 
-    def test_dangling_origin_preserves_attack_but_masks_complete_duration(self):
+    def test_redundant_origin_without_destination_does_not_invent_missing_sustain(self):
         labels = canonicalize(extracted(order=[0]))
         note = labels["targets"]["notes"][0]
         self.assertTrue(note["isAttack"])
-        self.assertFalse(note["labelMask"]["notatedDuration"])
-        self.assertEqual(labels["review"]["issues"][0]["code"], "unresolved_tie_origin")
+        self.assertTrue(note["labelMask"]["notatedDuration"])
+        self.assertEqual(note["notatedDurationQuarter"], [4, 1])
+        self.assertTrue(note["sourceSegments"][0]["tie"]["origin"])
+        self.assertEqual(labels["review"]["issues"], [])
+
+    def test_chain_merges_when_only_the_destination_carries_the_tie(self):
+        root = musical_score()
+        root.find("./Notes/Note[@id='0']/Tie").set("origin", "false")
+        labels = canonicalize(extracted(root))
+        self.assertEqual(len(labels["targets"]["notes"]), 1)
+        self.assertEqual(labels["targets"]["notes"][0]["notatedDurationQuarter"], [8, 1])
 
     def test_grace_chain_retains_spelling_without_inventing_a_duration(self):
         root = musical_score()
