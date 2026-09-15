@@ -9,7 +9,7 @@ import xml.etree.ElementTree as ET
 from xml.dom import Node, minidom
 from zipfile import BadZipFile, ZipFile
 
-from .canonical_events import canonical_counts, canonicalize, fraction, normalized_text, rule_tokens, source_indices
+from .canonical_events import canonical_counts, canonicalize, fraction, normalized_text, rule_tokens, source_indices, is_percussive_hit_text
 from .gp_events import NOTE_VALUES, beat_techniques, catalog_timing, decode_score, index_section, performance_events, rational
 
 
@@ -19,6 +19,7 @@ GENERIC_TECHNIQUES = frozenset({
     "body_tap", "body_flam", "body_scratch", "body_slap", "body_rasgueado",
     "string_slap", "nail_attack", "slap_pluck", "finger_snap", "snare_tap",
     "string_tap", "string_scrape",
+    "percussive_hit",
 })
 PLACEMENT_LIMITATION = (
     "Strings are free only under full notated sustain intervals [start, end). "
@@ -247,8 +248,9 @@ def _decode_musical_tree(root, instrument):
     return decode_score(musical, instrument["openStringMidi"], instrument["capoFret"])
 
 
-def _conversion_candidates(labels, annotations):
+def _conversion_candidates(labels, annotations, score):
     rules = {rule["id"]: rule for rule in (annotations or {}).get("rules", [])}
+    beats, _ = source_indices(score)
     result = []
     for gesture in labels["targets"]["gestures"]:
         technique = gesture["technique"]
@@ -267,6 +269,11 @@ def _conversion_candidates(labels, annotations):
         if gesture.get("scoreOnsetKnown") is not True or gesture.get("graceMode") is not None:
             raise NormalizationError(f"{gesture['id']}: a generic hit needs a resolved regular score onset.")
         rule = rules.get(gesture["interpretationRuleId"])
+        if gesture.get("evidenceSource") == "owner-short-text-length-policy":
+            text = normalized_text(beats[gesture["writtenBeatId"]]["text"])
+            if technique != "percussive_hit" or not is_percussive_hit_text(text):
+                raise NormalizationError(f"{gesture['id']}: stale short-text percussion classification.")
+            rule = {"id": gesture["interpretationRuleId"], "match": {"text": text}, "consumedTokens": text.split()}
         if rule is None:
             raise NormalizationError(f"{gesture['id']}: no checksum-scoped reviewed rule.")
         if "O" in rule_tokens(rule):
@@ -769,7 +776,7 @@ def normalize_gp_bytes(raw, score, labels, annotations=None, conventions=None):
     """
     source, payloads, comment = _parse_archive(raw)
     _validate_inputs(source, raw, score, labels, annotations, conventions)
-    candidates = _conversion_candidates(labels, annotations)
+    candidates = _conversion_candidates(labels, annotations, score)
     consumed = _consumed_symbols(candidates, labels)
     silenced = {event["id"] for event in score["playback"]["noteEvents"] if event.get("isSilent")}
     writer = _OccurrenceWriter(source, score, consumed | silenced)
@@ -808,6 +815,7 @@ def normalize_gp_bytes(raw, score, labels, annotations=None, conventions=None):
         "nativePitchOffsets": dict(writer.pitch_profile["offsets"]),
         "nativeGhostEncoding": "AntiAccent=Normal; Muted Enable; complete ConcertPitch/TransposedPitch",
         "nativeTextEncoding": "Preserve source CDATA fields, including titles and retained FreeText",
+        "percussiveHitTextDetectionMaxLen": labels["provenance"]["percussiveHitTextDetectionMaxLen"],
         "rawCounts": canonical_counts(labels), "normalizedCounts": canonical_counts(normalized),
         "rawWrittenMeasureCount": len(score["measures"]),
         "rawWrittenBeatCount": len(score["scoreEvents"]),

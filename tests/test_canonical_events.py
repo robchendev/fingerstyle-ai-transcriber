@@ -3,9 +3,11 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 import xml.etree.ElementTree as ET
 
-from scripts.canonical_events import CanonicalLabelError, canonical_counts, canonicalize, dead_note_marks, matches_rule, pitched_note_marks, note_marks
+from scripts.canonical_events import CanonicalLabelError, canonical_counts, canonicalize, dead_note_marks, matches_rule, pitched_note_marks, note_marks, is_percussive_hit_text
+from scripts import settings
 from scripts.catalogs import PerformerPaths, sha256, write_json
 from scripts.gp_events import catalog_timing, decode_score, performance_events, playback_order
 from scripts.prepare_labels import prepare_entry
@@ -64,6 +66,48 @@ OWNER_CONVENTIONS = {"schemaVersion": 1, "uppercaseOIsWristThump": True, "simult
 
 
 class CanonicalEventTests(unittest.TestCase):
+    def test_short_percussion_text_limit_is_configurable_and_excludes_instructions(self):
+        for text in ("a", "m1", "PM2", "***", "  a  "):
+            with self.subTest(text=text):
+                self.assertTrue(is_percussive_hit_text(text))
+        for text in (None, "", "   ", "Bend", "rall", "Rasg", "capo to fret 5", "???"):
+            with self.subTest(text=text):
+                self.assertFalse(is_percussive_hit_text(text))
+        with patch.object(settings, "PERCUSSIVE_HIT_TEXT_DETECTION_MAX_LEN", 2):
+            self.assertFalse(is_percussive_hit_text("PM2"))
+            self.assertTrue(is_percussive_hit_text("m1"))
+        with patch.object(settings, "PERCUSSIVE_HIT_TEXT_DETECTION_MAX_LEN", True):
+            with self.assertRaises(CanonicalLabelError):
+                canonicalize(extracted())
+
+    def test_short_unmapped_text_creates_one_hit_without_changing_pitched_notes(self):
+        score = extracted()
+        score["scoreEvents"][0]["text"] = "PM2"
+        labels = canonicalize(score)
+        self.assertEqual(len(labels["targets"]["gestures"]), 1)
+        self.assertEqual(labels["targets"]["gestures"][0]["technique"], "percussive_hit")
+        self.assertEqual(labels["targets"]["gestures"][0]["symbolicNoteIds"], [])
+        self.assertEqual(labels["targets"]["notes"][0]["notatedDurationQuarter"], [8, 1])
+        self.assertEqual(labels["provenance"]["percussiveHitTextDetectionMaxLen"], 3)
+        self.assertEqual(labels["review"]["unresolvedGestures"], [])
+
+    def test_long_instruction_and_unknown_question_marks_remain_text_not_hits(self):
+        for text in ("capo to fret 5", "Bend", "rall", "???"):
+            score = extracted()
+            score["scoreEvents"][0]["text"] = text
+            with self.subTest(text=text):
+                labels = canonicalize(score)
+                self.assertEqual(labels["targets"]["gestures"], [])
+                self.assertEqual(labels["review"]["unresolvedGestures"][0]["reason"], "uninterpreted_annotation")
+
+    def test_reviewed_short_musical_meaning_takes_precedence_over_length_fallback(self):
+        score = gesture_score()
+        score["scoreEvents"][0]["text"] = "P"
+        rules = gesture_rules("strum")
+        rules["rules"][0].update(match={"tokens": ["P"]}, consumesDeadNotes=False)
+        labels = canonicalize(score, rules)
+        self.assertEqual([g["technique"] for g in labels["targets"]["gestures"]], ["strum"])
+
     def test_silent_repeat_entry_becomes_rest_without_shortening_score(self):
         score = extracted(order=[0, 1, 1])
         score["issues"] = []
@@ -192,11 +236,15 @@ class CanonicalEventTests(unittest.TestCase):
             score["scoreEvents"][1]["text"] = lower
             with self.subTest(upper=upper, lower=lower):
                 labels = canonicalize(score, conventions=OWNER_CONVENTIONS)
-                self.assertEqual(labels["targets"]["gestures"], [])
+                if len(upper) <= 3:
+                    self.assertEqual([(g["technique"], g["writtenBeatId"]) for g in labels["targets"]["gestures"]], [("percussive_hit", "m0:v0:b0")])
+                else:
+                    self.assertEqual(labels["targets"]["gestures"], [])
                 self.assertEqual(len(labels["review"]["suppressedAnnotations"]), 1)
                 self.assertEqual(labels["review"]["suppressedAnnotations"][0]["rawText"], lower)
                 self.assertEqual(labels["review"]["suppressedAnnotations"][0]["effectiveText"], upper)
-                self.assertEqual(labels["review"]["unresolvedGestures"][0]["writtenBeatId"], "m0:v0:b0")
+                if len(upper) > 3:
+                    self.assertEqual(labels["review"]["unresolvedGestures"][0]["writtenBeatId"], "m0:v0:b0")
 
     def test_successive_percussive_finger_labels_keep_their_individual_positions(self):
         root = musical_score()
@@ -245,8 +293,8 @@ class CanonicalEventTests(unittest.TestCase):
         before = deepcopy(score)
         labels = canonicalize(score, conventions=OWNER_CONVENTIONS)
         self.assertEqual(labels["review"]["suppressedAnnotations"], [])
-        annotations = [item for item in labels["review"]["unresolvedGestures"] if item["reason"] == "uninterpreted_annotation"]
-        self.assertEqual([(item["writtenBeatId"], item["onsetQuarter"]) for item in annotations], [("m0:v1:b1", [2, 1])])
+        hits = [item for item in labels["targets"]["gestures"] if item["technique"] == "percussive_hit"]
+        self.assertEqual([(item["writtenBeatId"], item["onsetQuarter"]) for item in hits], [("m0:v1:b1", [2, 1])])
         upper = labels["targets"]["notes"][0]
         self.assertEqual(upper["notatedDurationQuarter"], [4, 1])
         self.assertEqual(score, before)
@@ -274,7 +322,10 @@ class CanonicalEventTests(unittest.TestCase):
             score = extracted()
             score["scoreEvents"][0]["text"] = text
             with self.subTest(text=text):
-                self.assertEqual(canonicalize(score, conventions=OWNER_CONVENTIONS)["targets"]["gestures"], [])
+                gestures = canonicalize(score, conventions=OWNER_CONVENTIONS)["targets"]["gestures"]
+                self.assertFalse(any(gesture["technique"] == "wrist_thump" for gesture in gestures))
+                if text is None:
+                    self.assertEqual(gestures, [])
 
     def test_owner_wrist_convention_does_not_duplicate_a_source_legend_rule(self):
         score = gesture_score()

@@ -15,6 +15,7 @@ from scripts.gp_normalization import (
     select_free_string, semantic_node, native_pitch_profile,
 )
 from scripts.normalize_gp import main, normalized_output_paths, validate_training_policy
+from scripts import settings
 from tests.test_gp_events import TUNING, musical_score, note_xml
 
 
@@ -414,12 +415,30 @@ class GpNormalizationTests(unittest.TestCase):
         with self.assertRaisesRegex(NormalizationError, "duplicate-string GP notes"):
             normalize_gp_bytes(*prepared(root))
 
-    def test_unreviewed_annotation_is_not_treated_as_body_percussion(self):
-        output, labels, report = normalize_gp_bytes(*prepared(rule=False))
+    def test_long_instruction_is_not_treated_as_body_percussion(self):
+        root = template_score()
+        root.find("./Beats/Beat[@id='0']/FreeText").text = "capo to fret 5"
+        output, labels, report = normalize_gp_bytes(*prepared(root, rule=False))
         self.assertEqual(report["genericHitCount"], 0)
         self.assertEqual(labels["targets"]["gestures"], [])
         self.assertEqual(report["unresolvedCounts"], {"uninterpreted_annotation": 1})
-        self.assertTrue(any(node.text == "*" for node in normalized_root(output).findall("./Beats/Beat/FreeText")))
+        self.assertTrue(any(node.text == "capo to fret 5" for node in normalized_root(output).findall("./Beats/Beat/FreeText")))
+
+    def test_short_text_without_a_legend_or_x_becomes_native_generic_percussion(self):
+        output, labels, report = normalize_gp_bytes(*prepared(rule=False))
+        self.assertEqual(report["genericHitCount"], 1)
+        self.assertEqual([g["technique"] for g in labels["targets"]["gestures"]], ["percussive_hit"])
+        self.assertFalse(any(node.text == "*" for node in normalized_root(output).findall("./Beats/Beat/FreeText")))
+        ghost = normalized_root(output).find("./Notes/Note[AntiAccent='Normal']")
+        self.assertIsNotNone(ghost)
+        self.assertIsNotNone(ghost.find("./Properties/Property[@name='ConcertPitch']/Pitch"))
+        self.assertEqual(labels["provenance"]["percussiveHitTextDetectionMaxLen"], 3)
+
+    def test_changed_text_limit_rejects_stale_canonical_inputs(self):
+        args = prepared()
+        with patch.object(settings, "PERCUSSIVE_HIT_TEXT_DETECTION_MAX_LEN", 2):
+            with self.assertRaisesRegex(NormalizationError, "provenance is stale"):
+                normalize_gp_bytes(*args)
 
     def test_silent_repeated_entry_removes_only_suppressed_tie_not_other_chord_notes(self):
         root = template_score()

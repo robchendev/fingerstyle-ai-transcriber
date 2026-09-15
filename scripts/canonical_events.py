@@ -6,6 +6,7 @@ from fractions import Fraction
 import json
 
 from .gp_events import rational, validate_provided_timing
+from . import settings
 
 
 class CanonicalLabelError(ValueError):
@@ -20,6 +21,19 @@ def fraction(value, label):
 
 def normalized_text(value):
     return " ".join((value or "").split())
+
+
+def percussive_hit_text_max_len():
+    limit = settings.PERCUSSIVE_HIT_TEXT_DETECTION_MAX_LEN
+    if type(limit) is not int or limit < 1:
+        raise CanonicalLabelError("PERCUSSIVE_HIT_TEXT_DETECTION_MAX_LEN must be a positive integer.")
+    return limit
+
+
+def is_percussive_hit_text(value):
+    limit = percussive_hit_text_max_len()
+    text = normalized_text(value)
+    return bool(text) and len(text) <= limit and set(text.replace(" ", "")) != {"?"}
 
 
 def source_indices(score):
@@ -325,6 +339,15 @@ def gesture_events(score, rules, segments, conventions=None):
             })
             matched = [rule for rule in matched if not (rule["technique"] == "wrist_thump" and "O" in rule_tokens(rule))]
         dead_ids = [f"p{visit['visitIndex']}:{note['id']}" for note in beat["notes"] if note["techniques"]["dead"]]
+        text = normalized_text(beat["text"])
+        if not matched and not owner_wrist and "O" not in text.split() and is_percussive_hit_text(text):
+            matched.append({
+                "id": "owner-short-text-hit", "technique": "percussive_hit",
+                "attributes": {}, "evidenceBeatIds": [],
+                "match": {"text": text}, "consumedTokens": text.split(),
+                "consumesDeadNotes": bool(dead_ids),
+                "evidenceSource": "owner-short-text-length-policy",
+            })
         candidates = []
         for rule in matched:
             if any(field in rule["match"] for field in ("pitchedNoteMarks", "simultaneousPitchedNoteMarks")):
@@ -360,7 +383,7 @@ def gesture_events(score, rules, segments, conventions=None):
             if grouped:
                 emitted.add(key)
             pitched = [(f"p{visit['visitIndex']}:{note['id']}", note) for note in beat["notes"]] if "pitchedNoteMarks" in rule["match"] else context if grouped else []
-            gestures.append({
+            gesture = {
                 "id": f"{performance_id}:{rule['id']}", "technique": rule["technique"],
                 "attributes": rule.get("attributes", {}),
                 "voiceIndex": beat["voiceIndex"], "onsetQuarter": onset, "durationQuarter": None,
@@ -370,7 +393,10 @@ def gesture_events(score, rules, segments, conventions=None):
                 "sourcePitchedNoteIds": [identifier for identifier, note in pitched if not note["techniques"]["dead"]] if any(field in rule["match"] for field in ("pitchedNoteMarks", "simultaneousPitchedNoteMarks")) else [],
                 "contextPitchedNoteIds": [identifier for identifier, note in context if not note["techniques"]["dead"]] if grouped else [],
                 "interpretationRuleId": rule["id"], "evidenceBeatIds": rule["evidenceBeatIds"],
-            })
+            }
+            if "evidenceSource" in rule:
+                gesture["evidenceSource"] = rule["evidenceSource"]
+            gestures.append(gesture)
         uncovered_dead = dead_ids and not any(rule["consumesDeadNotes"] for rule in candidates)
         if uncovered_dead and not conflicting and any(segments[identifier][0]["isAttack"] is not False for identifier in dead_ids):
             unresolved.append({"performanceBeatId": performance_id, "onsetQuarter": onset, "reason": "uninterpreted_dead_note_cluster", "symbolicNoteIds": dead_ids})
@@ -419,7 +445,7 @@ def canonicalize(score, annotations=None, conventions=None):
         "measureVisits": score["playback"]["measureVisits"],
         "targets": {"notes": notes, "rests": rests, "noteRests": silenced, "gestures": gestures},
         "review": {"notationSymbols": symbols, "unresolvedGestures": unresolved, "suppressedAnnotations": suppressed, "issues": issues, "sourceIssues": score["issues"]},
-        "provenance": {"sourceGpSha256": score["sourceGpSha256"], "fretConvention": instrument["fretConvention"], "ruleIds": [rule["id"] for rule in rules], "referenceBeatIds": [beat["id"] for beat in score["scoreEvents"] if beat["referenceOnly"]]},
+        "provenance": {"sourceGpSha256": score["sourceGpSha256"], "fretConvention": instrument["fretConvention"], "ruleIds": [rule["id"] for rule in rules], "referenceBeatIds": [beat["id"] for beat in score["scoreEvents"] if beat["referenceOnly"]], "percussiveHitTextDetectionMaxLen": percussive_hit_text_max_len()},
     }
     return deepcopy(output)
 
