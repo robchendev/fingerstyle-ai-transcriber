@@ -1,10 +1,7 @@
 """Inspect modern Guitar Pro archives without modifying their contents."""
 
 from collections import Counter
-import hashlib
-from pathlib import PureWindowsPath
 import re
-import unicodedata
 import xml.etree.ElementTree as ET
 from zipfile import BadZipFile, ZipFile
 
@@ -31,45 +28,6 @@ def read_gp(path):
     if root.tag != "GPIF":
         raise GpInspectionError(f"Unsupported GPIF root: {root.tag}")
     return root
-
-
-def normalized(value):
-    value = unicodedata.normalize("NFKD", value).casefold()
-    return "".join(character for character in value if character.isalnum() and not unicodedata.combining(character))
-
-
-def matches_entry(entry, record, rules):
-    path = record["sourcePath"]
-    filename = PureWindowsPath(path)
-    if any(text.casefold() in path.casefold() for text in rules["excludedPathText"]):
-        return False
-    qualifier = rules["requiredFilenameText"].get(entry["id"])
-    if qualifier and normalized(qualifier) not in normalized(filename.stem):
-        return False
-    year = re.search(r"\((20\d\d)\)", entry["title"])
-    file_year = re.search(r"\((20\d\d)\)", filename.name)
-    if (year.group(1) if year else None) != (file_year.group(1) if file_year else None):
-        return False
-    titles = [entry["title"], *rules["titleAliases"].get(entry["id"], [])]
-    titles = {normalized(re.sub(r"\s*\(20\d\d\)", "", title)) for title in titles}
-    stem = re.sub(r"\s*\(20\d\d\)|\(UPDATED?\)|_UPDATED?$", "", filename.stem, flags=re.IGNORECASE).strip()
-    parts = stem.split(" - ")
-    filename_titles = {normalized(" - ".join(parts[index:])) for index in range(len(parts))}
-    if rules.get("filenameTitleAfterLeadingContext"):
-        leading_context = re.fullmatch(r"\([^)]*\)\s+(.+)", stem)
-        if leading_context:
-            filename_titles.add(normalized(leading_context.group(1)))
-    return normalized(record.get("title", "")) in titles or bool(titles & filename_titles)
-
-
-def candidate_priority(record, rules):
-    path = record["sourcePath"]
-    if rules.get("selectionPolicy") == "first-matching-tier":
-        return record["sourceTier"], 0 if record["preferredUpdatedFolder"] else 1, -record["mtimeNs"], path.casefold(), path
-    if rules.get("selectionPolicy") == "newest-modified":
-        return -record["mtimeNs"], path.casefold(), path
-    group = next((index for index, prefix in enumerate(rules["sourcePreference"]) if path.startswith(prefix)), len(rules["sourcePreference"]))
-    return group, 0 if "updat" in path.casefold() else 1, path.casefold()
 
 
 def properties(element):
@@ -235,10 +193,4 @@ def inspect_gp(path):
     result["warnings"] = sorted(set(result["warnings"]))
     note_properties = Counter(prop.get("name") for prop in root.findall("./Notes/Note/Properties/Property"))
     result["notePropertyCounts"] = dict(sorted(note_properties.items()))
-    musical = ET.Element("Music")
-    for tag in ("MasterBars", "Bars", "Voices", "Beats", "Notes", "Rhythms"):
-        item = root.find(tag)
-        if item is not None:
-            musical.append(item)
-    result["musicXmlSha256"] = hashlib.sha256(ET.tostring(musical)).hexdigest()
     return result
