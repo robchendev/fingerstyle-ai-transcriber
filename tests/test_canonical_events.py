@@ -232,6 +232,28 @@ class CanonicalEventTests(unittest.TestCase):
         self.assertEqual(labels["targets"]["gestures"][0]["voiceIndex"], 1)
         self.assertEqual(labels["review"]["suppressedAnnotations"], [])
 
+    def test_lower_voice_only_beat_keeps_text_under_a_sustained_upper_note(self):
+        root = musical_score()
+        root.find("MasterBars").remove(root.findall("./MasterBars/MasterBar")[1])
+        root.find("Rhythms").append(ET.fromstring('<Rhythm id="1"><NoteValue>Half</NoteValue></Rhythm>'))
+        root.find("./Beats/Beat[@id='2']/Rhythm").set("ref", "1")
+        extra = ET.SubElement(root.find("Beats"), "Beat", id="3")
+        ET.SubElement(extra, "Rhythm", ref="1")
+        ET.SubElement(extra, "FreeText").text = "a"
+        root.find("./Voices/Voice[@id='2']/Beats").text = "2 3"
+        score = extracted(root)
+        before = deepcopy(score)
+        labels = canonicalize(score, conventions=OWNER_CONVENTIONS)
+        self.assertEqual(labels["review"]["suppressedAnnotations"], [])
+        annotations = [item for item in labels["review"]["unresolvedGestures"] if item["reason"] == "uninterpreted_annotation"]
+        self.assertEqual([(item["writtenBeatId"], item["onsetQuarter"]) for item in annotations], [("m0:v1:b1", [2, 1])])
+        upper = labels["targets"]["notes"][0]
+        self.assertEqual(upper["notatedDurationQuarter"], [4, 1])
+        self.assertEqual(score, before)
+        extra.find("FreeText").text = "O"
+        wrist_labels = canonicalize(extracted(root), conventions=OWNER_CONVENTIONS)
+        self.assertEqual([(event["voiceIndex"], event["onsetQuarter"]) for event in wrist_labels["targets"]["gestures"]], [(0, [0, 1]), (1, [2, 1])])
+
     def test_voice_priority_does_not_depend_on_source_iteration_order(self):
         score = extracted()
         score["scoreEvents"][0]["text"] = "O"
