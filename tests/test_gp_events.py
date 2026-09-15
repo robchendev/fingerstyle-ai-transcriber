@@ -1,4 +1,5 @@
 from fractions import Fraction
+import csv
 import json
 from pathlib import Path
 import tempfile
@@ -7,8 +8,8 @@ from unittest.mock import patch
 import xml.etree.ElementTree as ET
 from zipfile import ZipFile
 
-from scripts.download_audio import sha256
-from scripts.extract_gp_events import extract_entry
+from scripts.catalogs import PerformerPaths, sha256
+from scripts.extract_gp_events import extract_entry, update_csv
 from scripts.gp_events import EventExtractionError, catalog_timing, decode_score, note_event, performance_events, playback_order, rhythm_duration, validate_provided_timing
 
 
@@ -217,21 +218,21 @@ class MusicalEventTests(unittest.TestCase):
             before = path.read_bytes()
             entry = {"id": "example", "title": "Example", "localGpPath": str(path.relative_to(root)), "localAudioPath": None, "rangeSeconds": None, "selectedTuningIndex": 0, "tunings": [{"strings": ["E2", "A2", "D3", "G3", "B3", "E4"]}], "capoFret": None}
             audit = {"sha256": sha256(path)}
-            with patch("scripts.extract_gp_events.ROOT", root), patch("scripts.extract_gp_events.GP_ROOT", gp_root):
-                output = extract_entry(entry, audit, {})
+            with patch("scripts.extract_gp_events.ROOT", root):
+                output = extract_entry(entry, audit, {}, gp_root=gp_root)
                 self.assertEqual(output["instrument"]["capoFret"], 2)
                 self.assertIsNone(output["audioAlignment"])
                 self.assertIsNone(entry["capoFret"])
                 self.assertEqual(path.read_bytes(), before)
                 entry["tempo"] = {"bpm": 61, "beatUnit": [3, 8]}
                 with self.assertRaisesRegex(EventExtractionError, "tempo conflicts"):
-                    extract_entry(entry, audit, {})
+                    extract_entry(entry, audit, {}, gp_root=gp_root)
                 del entry["tempo"]
                 entry["capoFret"] = 3
                 with self.assertRaisesRegex(EventExtractionError, "conflicts"):
-                    extract_entry(entry, audit, {})
+                    extract_entry(entry, audit, {}, gp_root=gp_root)
                 with self.assertRaisesRegex(EventExtractionError, "revision"):
-                    extract_entry(entry, {"sha256": "0" * 64}, {})
+                    extract_entry(entry, {"sha256": "0" * 64}, {}, gp_root=gp_root)
 
     def test_owner_confirmed_fine_preserves_source_and_excludes_instruction_measures(self):
         score = musical_score()
@@ -249,16 +250,38 @@ class MusicalEventTests(unittest.TestCase):
             audit = {"sha256": sha256(path)}
             confirmation = {"gpSha256": audit["sha256"], "fineTarget": "last-musical-measure", "note": "Owner confirmed."}
             rules = {"navigationOverrides": {"example": confirmation}}
-            with patch("scripts.extract_gp_events.ROOT", root), patch("scripts.extract_gp_events.GP_ROOT", root):
-                self.assertIsNone(extract_entry(entry, audit, {})["playback"])
-                output = extract_entry(entry, audit, rules)
+            with patch("scripts.extract_gp_events.ROOT", root):
+                self.assertIsNone(extract_entry(entry, audit, {}, gp_root=root)["playback"])
+                output = extract_entry(entry, audit, rules, gp_root=root)
                 self.assertEqual([visit["measureIndex"] for visit in output["playback"]["measureVisits"]], [0, 1, 0, 1])
                 self.assertEqual(output["navigationOverride"]["fineMeasureIndex"], 1)
                 self.assertFalse(any(direction["value"] == "Fine" for measure in output["measures"] for direction in measure["directions"]))
                 self.assertEqual(path.read_bytes(), before)
                 confirmation["gpSha256"] = "0" * 64
                 with self.assertRaisesRegex(EventExtractionError, "Navigation confirmation"):
-                    extract_entry(entry, audit, rules)
+                    extract_entry(entry, audit, rules, gp_root=root)
+
+    def test_failed_extraction_clears_stale_csv_gp_fields_without_erasing_audio_flags(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = PerformerPaths("dataset-a", Path(directory))
+            csv_path = paths.metadata("review.csv")
+            csv_path.parent.mkdir(parents=True)
+            fields = ["id", "reviewIssues", "localGpPath", "capoFret", "selectedTuningIndex", "tunings", "gpTrackCount", "gpInspectionIssues", "gpRevisionReviewRequired", "gpEventsPath", "gpNoteEventCount", "gpExtractionIssues", "bpm", "bpmBeatUnit", "timeSignature", "sourceTempoChangeCount", "sourceTimeSignatureChangeCount"]
+            with csv_path.open("w", encoding="utf-8-sig", newline="") as stream:
+                writer = csv.DictWriter(stream, fields)
+                writer.writeheader()
+                writer.writerow({**dict.fromkeys(fields, "stale"), "id": "song", "reviewIssues": "source_title_conflict"})
+            entry = {"id": "song", "localGpPath": None, "tunings": [], "selectedTuningIndex": None, "capoFret": None, "review": {"recordingConfirmed": False, "tuningConfirmed": False}}
+            audit = {"entries": [{"catalogId": "song", "issues": ["no_matching_gp"]}]}
+            with patch("scripts.extract_gp_events.PerformerPaths", return_value=paths):
+                update_csv({"performerId": paths.performer, "entries": [entry]}, [{"catalogId": "song", "status": "failed", "error": "No allowed GP match."}], audit)
+            with csv_path.open(encoding="utf-8-sig", newline="") as stream:
+                row = next(csv.DictReader(stream))
+            for field in ("gpEventsPath", "gpNoteEventCount", "bpm", "timeSignature", "localGpPath", "tunings"):
+                self.assertEqual(row[field], "")
+            self.assertEqual(row["gpExtractionIssues"], "extraction_failed: No allowed GP match.")
+            self.assertIn("source_title_conflict", row["reviewIssues"])
+            self.assertIn("unknown_capo", row["reviewIssues"])
 
 
 class NavigationTests(unittest.TestCase):

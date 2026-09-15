@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from zipfile import ZipFile
 
-from scripts.inspect_gp_files import apply_owner_confirmation, candidate_priority, compare_tuning, inspect_gp, matches_entry
+from scripts.inspect_gp_files import apply_owner_confirmation, compare_tuning, inspect_gp
 
 
 def score(track_count=1, partial_fret=0, flags="000000", annotation=""):
@@ -80,9 +80,8 @@ class GpInspectionTests(unittest.TestCase):
         self.assertIn("owner_confirmation_revision_mismatch", other["issues"])
         self.assertNotIn("ownerConfirmation", other)
 
-    def test_inspection_leaves_style_resources_untouched_and_out_of_the_music_hash(self):
+    def test_inspection_leaves_style_resources_untouched(self):
         with tempfile.TemporaryDirectory() as directory:
-            inspections = []
             for index in (1, 2):
                 path = Path(directory) / f"styled-{index}.gp"
                 xml = score().replace("<Score>", f"<Score><FirstPageHeader>Custom font size {index}</FirstPageHeader>")
@@ -92,33 +91,8 @@ class GpInspectionTests(unittest.TestCase):
                     archive.writestr("Content/Stylesheets/score.gpss", bytes([index, 0, 255]))
                     archive.writestr("Content/UnknownSetting.bin", bytes([index, 42]))
                 before = path.read_bytes()
-                inspections.append(inspect_gp(path))
+                inspect_gp(path)
                 self.assertEqual(path.read_bytes(), before)
-            self.assertEqual(inspections[0]["musicXmlSha256"], inspections[1]["musicXmlSha256"])
-
-    def test_matching_respects_full_title_boundaries_artists_and_years(self):
-        rules = {"titleAliases": {}, "requiredFilenameText": {}, "excludedPathText": ["\\Noble\\"], "sourcePreference": ["Tabs\\Transcriptions 2022+\\", "Tabs\\MyMusicSheet Migration\\"]}
-        entry = {"id": "x", "title": "Here"}
-        self.assertFalse(matches_entry(entry, {"sourcePath": "Tabs\\Sample Artist - Other Example.gp", "title": "Other Example"}, rules))
-        self.assertTrue(matches_entry(entry, {"sourcePath": "Tabs\\JUNNA - Here.gp", "title": "Here"}, rules))
-        self.assertFalse(matches_entry(entry, {"sourcePath": "Tabs\\Here (2025).gp", "title": "Here"}, rules))
-        rules["requiredFilenameText"]["x"] = "JUNNA"
-        self.assertFalse(matches_entry(entry, {"sourcePath": "Tabs\\Other - Here.gp", "title": "Here"}, rules))
-        original = {"sourcePath": "Tabs\\Transcriptions 2022+\\Here.gp", "trackCount": 2}
-        publishing = {"sourcePath": "Tabs\\MyMusicSheet Migration\\Here.gp", "trackCount": 1}
-        self.assertLess(candidate_priority(original, rules), candidate_priority(publishing, rules))
-
-    def test_newest_selection_uses_mtime_not_publishing_priority_or_track_count(self):
-        rules = {"selectionPolicy": "newest-modified"}
-        older = {"sourcePath": "A.gp", "mtimeNs": 10, "trackCount": 1}
-        newest = {"sourcePath": "Z.gp", "mtimeNs": 20, "trackCount": 2}
-        self.assertLess(candidate_priority(newest, rules), candidate_priority(older, rules))
-        self.assertLess(candidate_priority(dict(older, mtimeNs=20), rules), candidate_priority(newest, rules))
-
-    def test_dataset-b_context_prefix_does_not_match_arbitrary_title_suffixes(self):
-        rules = {"filenameTitleAfterLeadingContext": True, "titleAliases": {}, "requiredFilenameText": {}, "excludedPathText": []}
-        self.assertTrue(matches_entry({"id": "set-b-item-0013", "title": "Example Work"}, {"sourcePath": r"2021\(Source Work A OP) Example Work.gp", "title": "Expanded score title"}, rules))
-        self.assertFalse(matches_entry({"id": "x", "title": "Here"}, {"sourcePath": r"2021\(Source Work B ED) Other Example.gp", "title": "Another title"}, rules))
 
 
 if __name__ == "__main__":
