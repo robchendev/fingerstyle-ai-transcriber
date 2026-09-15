@@ -12,7 +12,7 @@ from scripts.gp_events import catalog_timing, decode_score, note_event, performa
 from scripts.catalogs import PerformerPaths
 from scripts.gp_normalization import (
     GPIF_ENTRY, NormalizationError, ghost_dead_note, normalize_gp_bytes,
-    select_free_string, semantic_node,
+    select_free_string, semantic_node, native_pitch_profile,
 )
 from scripts.normalize_gp import main, normalized_output_paths, validate_training_policy
 from tests.test_gp_events import TUNING, musical_score, note_xml
@@ -61,6 +61,20 @@ def template_score():
 
 
 def archive_bytes(root):
+    root = deepcopy(root)
+    for note in root.findall("./Notes/Note"):
+        props = note.find("Properties")
+        if props is None or props.find("Property[@name='Midi']/Number") is None:
+            continue
+        midi = int(props.findtext("Property[@name='Midi']/Number"))
+        spellings = (("C", ""), ("C", "#"), ("D", ""), ("D", "#"), ("E", ""), ("F", ""), ("F", "#"), ("G", ""), ("G", "#"), ("A", ""), ("A", "#"), ("B", ""))
+        for name, offset in (("ConcertPitch", 0), ("TransposedPitch", 12)):
+            if props.find(f"Property[@name='{name}']") is not None:
+                continue
+            value = midi + offset
+            pitch = ET.SubElement(ET.SubElement(props, "Property", name=name), "Pitch")
+            for key, text in (("Step", spellings[value % 12][0]), ("Accidental", spellings[value % 12][1]), ("Octave", str(value // 12))):
+                ET.SubElement(pitch, key).text = text
     result = BytesIO()
     with ZipFile(result, "w") as archive:
         archive.comment = b"preserve unknown archive comment"
@@ -116,16 +130,79 @@ def normalized_root(raw):
 
 
 class GpNormalizationTests(unittest.TestCase):
+    def test_native_cdata_title_and_retained_wrist_text_are_preserved(self):
+        root = template_score()
+        ET.SubElement(root.find("./Beats/Beat[@id='1']"), "FreeText").text = "O"
+        raw, score, labels, annotations, conventions = prepared(root, conventions=CONVENTIONS)
+        rebuilt = BytesIO()
+        with ZipFile(BytesIO(raw)) as source, ZipFile(rebuilt, "w") as target:
+            target.comment = source.comment
+            for info in source.infolist():
+                payload = source.read(info.filename)
+                if info.filename == GPIF_ENTRY:
+                    payload = payload.replace(b"<Title>Example</Title>", b"<Title><![CDATA[Example]]></Title>")
+                    payload = payload.replace(b"<FreeText>O</FreeText>", b"<FreeText><![CDATA[O]]></FreeText>")
+                target.writestr(info, payload)
+        raw = rebuilt.getvalue()
+        digest = hashlib.sha256(raw).hexdigest()
+        score["sourceGpSha256"] = digest
+        labels["provenance"]["sourceGpSha256"] = digest
+        annotations["gpSha256"] = digest
+        output, _, _ = normalize_gp_bytes(raw, score, labels, annotations, conventions)
+        with ZipFile(BytesIO(output)) as archive:
+            xml = archive.read(GPIF_ENTRY)
+        self.assertIn(b"<Title><![CDATA[Example]]></Title>", xml)
+        self.assertIn(b"<FreeText><![CDATA[O]]></FreeText>", xml)
+        self.assertNotIn(b"<FreeText>*</FreeText>", xml)
+
+    def test_pitch_profile_preserves_native_display_transposition_instead_of_assuming_octave(self):
+        root = ET.fromstring('''<GPIF><Notes><Note id="0"><Properties>
+          <Property name="Midi"><Number>42</Number></Property>
+          <Property name="ConcertPitch"><Pitch><Step>F</Step><Accidental>#</Accidental><Octave>3</Octave></Pitch></Property>
+          <Property name="TransposedPitch"><Pitch><Step>D</Step><Accidental/><Octave>4</Octave></Pitch></Property>
+        </Properties></Note></Notes></GPIF>''')
+        profile = native_pitch_profile(root)
+        self.assertEqual(profile["offsets"], {"ConcertPitch": 0, "TransposedPitch": 8})
+        ghost = ghost_dead_note("1", 6, TUNING, 2, pitch_profile=profile)
+        self.assertEqual(ghost.findtext("./Properties/Property[@name='TransposedPitch']/Pitch/Step"), "D")
+        self.assertEqual(ghost.findtext("./Properties/Property[@name='TransposedPitch']/Pitch/Octave"), "4")
+        new_pitch = ghost_dead_note("2", 5, TUNING, 2, pitch_profile=profile)
+        self.assertEqual(new_pitch.findtext("./Properties/Property[@name='ConcertPitch']/Pitch/Step"), "B")
+        self.assertEqual(new_pitch.findtext("./Properties/Property[@name='TransposedPitch']/Pitch/Step"), "G")
+        self.assertEqual(new_pitch.findtext("./Properties/Property[@name='TransposedPitch']/Pitch/Octave"), "4")
+
+    def test_missing_native_pitch_metadata_fails_rather_than_writing_invisible_carriers(self):
+        with self.assertRaisesRegex(NormalizationError, "complete source concert/transposed"):
+            native_pitch_profile(musical_score())
+
+    def test_reader_compatible_but_native_incomplete_carrier_is_rejected(self):
+        original = ghost_dead_note
+
+        def incomplete(*args, **kwargs):
+            note = original(*args, **kwargs)
+            properties = note.find("Properties")
+            properties.remove(properties.find("Property[@name='ConcertPitch']"))
+            return note
+
+        with patch("scripts.gp_normalization.ghost_dead_note", side_effect=incomplete):
+            with self.assertRaisesRegex(NormalizationError, "native GP ghost-note fields"):
+                normalize_gp_bytes(*prepared())
+
     def test_ghost_dead_serialization_is_native_and_has_valid_pitch_properties(self):
-        node = ghost_dead_note("17", 6, TUNING, 2)
-        self.assertEqual(node.findtext("AntiAccent"), "normal")
+        profile = native_pitch_profile(normalized_root(archive_bytes(template_score())))
+        node = ghost_dead_note("17", 6, TUNING, 2, pitch_profile=profile)
+        self.assertEqual(node.findtext("AntiAccent"), "Normal")
         self.assertIsNotNone(node.find("./Properties/Property[@name='Muted']/Enable"))
+        self.assertEqual(node.findtext("./Properties/Property[@name='ConcertPitch']/Pitch/Step"), "F")
+        self.assertEqual(node.findtext("./Properties/Property[@name='ConcertPitch']/Pitch/Accidental"), "#")
+        self.assertEqual(node.findtext("./Properties/Property[@name='ConcertPitch']/Pitch/Octave"), "3")
+        self.assertEqual(node.findtext("./Properties/Property[@name='TransposedPitch']/Pitch/Octave"), "4")
         self.assertIsNone(node.find("FreeText"))
         issues = []
         note = note_event(node, "ghost", TUNING, 2, issues)
         self.assertEqual((note["gpStringIndex"], note["string"], note["fret"], note["storedMidi"]), (0, 6, 0, 42))
         self.assertTrue(note["techniques"]["dead"])
-        self.assertEqual(note["techniques"]["antiAccent"], "normal")
+        self.assertEqual(note["techniques"]["antiAccent"], "Normal")
         self.assertIsNone(note["soundingPitchMidi"])
         self.assertEqual(issues, [])
 
@@ -172,7 +249,7 @@ class GpNormalizationTests(unittest.TestCase):
         self.assertNotIn("interpretationRuleId", gesture)
         self.assertEqual(report["genericHitCount"], 1)
         node = normalized_root(output).find(f"./Notes/Note[@id='{placement['gpNoteId']}']")
-        self.assertEqual(node.findtext("AntiAccent"), "normal")
+        self.assertEqual(node.findtext("AntiAccent"), "Normal")
         self.assertIsNone(normalized_root(output).find(f"./Beats/Beat[@id='{placement['gpBeatId']}']/FreeText"))
         symbol = next(symbol for symbol in labels["review"]["notationSymbols"] if symbol["id"] == placement["normalizedNoteId"])
         self.assertTrue(symbol["labelMask"]["gesture"])
@@ -280,7 +357,7 @@ class GpNormalizationTests(unittest.TestCase):
     def test_unknown_symbols_remain_visible_masked_and_are_not_generic_hits(self):
         root = template_score()
         unknown = note_xml("40", string=3, dead=True)
-        ET.SubElement(unknown, "AntiAccent").text = "normal"
+        ET.SubElement(unknown, "AntiAccent").text = "Normal"
         root.find("Notes").append(unknown)
         root.find("./Beats/Beat[@id='1']/Notes").text = "1 40"
         output, labels, report = normalize_gp_bytes(*prepared(root))
@@ -293,7 +370,7 @@ class GpNormalizationTests(unittest.TestCase):
         self.assertEqual(unknowns[0]["string"], 3)
         self.assertFalse(unknowns[0]["labelMask"]["pitch"])
         self.assertFalse(unknowns[0]["labelMask"]["fingering"])
-        self.assertEqual(len([n for n in normalized_root(output).find("Notes") if n.findtext("AntiAccent") == "normal"]), 2)
+        self.assertEqual(len([n for n in normalized_root(output).find("Notes") if n.findtext("AntiAccent") == "Normal"]), 2)
 
     def test_generic_hit_avoids_simultaneous_retained_thumb_or_unknown_x(self):
         for reviewed_thumb in (False, True):

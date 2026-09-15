@@ -6,6 +6,7 @@ from fractions import Fraction
 import hashlib
 from io import BytesIO
 import xml.etree.ElementTree as ET
+from xml.dom import Node, minidom
 from zipfile import BadZipFile, ZipFile
 
 from .canonical_events import canonical_counts, canonicalize, fraction, normalized_text, rule_tokens, source_indices
@@ -13,7 +14,7 @@ from .gp_events import NOTE_VALUES, beat_techniques, catalog_timing, decode_scor
 
 
 GPIF_ENTRY = "Content/score.gpif"
-NORMALIZATION_VERSION = 1
+NORMALIZATION_VERSION = 2
 GENERIC_TECHNIQUES = frozenset({
     "body_tap", "body_flam", "body_scratch", "body_slap", "body_rasgueado",
     "string_slap", "nail_attack", "slap_pluck", "finger_snap", "snare_tap",
@@ -46,20 +47,65 @@ def semantic_node(node):
     )
 
 
-def ghost_dead_note(identifier, string, tuning, capo):
-    """GPIF uses AntiAccent=normal plus Muted, not literal '(X)' text."""
+def _pitch_value(prop):
+    pitch = prop.find("Pitch")
+    if pitch is None:
+        raise NormalizationError("A native pitch property has no Pitch element.")
+    step = pitch.findtext("Step")
+    accidental = pitch.findtext("Accidental") or ""
+    offsets = {"": 0, "Natural": 0, "#": 1, "b": -1, "x": 2, "##": 2, "bb": -2}
+    if not isinstance(step, str) or len(step) != 1 or step not in "CDEFGAB" or accidental not in offsets:
+        raise NormalizationError("Unsupported native GP pitch spelling.")
+    return int(pitch.findtext("Octave")) * 12 + {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}[step] + offsets[accidental]
+
+
+def native_pitch_profile(root):
+    offsets = {name: set() for name in ("ConcertPitch", "TransposedPitch")}
+    spellings = {}
+    for note in root.findall("./Notes/Note"):
+        props = {prop.get("name"): prop for prop in note.findall("./Properties/Property")}
+        if "Midi" not in props:
+            continue
+        midi = int(props["Midi"].findtext("Number"))
+        if not all(name in props for name in offsets):
+            raise NormalizationError("Native GP normalization requires complete source concert/transposed pitch properties.")
+        for name in offsets:
+            offsets[name].add(_pitch_value(props[name]) - midi)
+        spellings.setdefault(midi, {name: deepcopy(props[name]) for name in offsets})
+    if any(len(values) != 1 for values in offsets.values()):
+        raise NormalizationError("Source pitch display offsets are missing or inconsistent; no transposition default is inferred.")
+    return {"offsets": {name: next(iter(values)) for name, values in offsets.items()}, "spellings": spellings}
+
+
+def _pitch_property(name, midi):
+    step, accidental = (("C", ""), ("C", "#"), ("D", ""), ("D", "#"), ("E", ""), ("F", ""), ("F", "#"), ("G", ""), ("G", "#"), ("A", ""), ("A", "#"), ("B", ""))[midi % 12]
+    prop = ET.Element("Property", name=name)
+    pitch = ET.SubElement(prop, "Pitch")
+    for tag, text in (("Step", step), ("Accidental", accidental), ("Octave", str(midi // 12))):
+        ET.SubElement(pitch, tag).text = text
+    return prop
+
+
+def ghost_dead_note(identifier, string, tuning, capo, *, pitch_profile):
+    """Create the complete native GP ghost/dead-note representation."""
     if type(string) is not int or not 1 <= string <= 6 or len(tuning) != 6:
         raise NormalizationError("A ghost carrier requires one of six physical strings.")
     midi = tuning[6 - string] + capo
     if not 0 <= midi <= 127:
         raise NormalizationError("Ghost carrier MIDI is outside the GP note range.")
     note = ET.Element("Note", id=str(identifier))
-    ET.SubElement(note, "AntiAccent").text = "normal"
+    ET.SubElement(note, "AntiAccent").text = "Normal"
     ET.SubElement(note, "InstrumentArticulation").text = "0"
     props = ET.SubElement(note, "Properties")
-    for name, tag, value in (("String", "String", 6 - string), ("Fret", "Fret", 0), ("Midi", "Number", midi)):
+    spellings = pitch_profile["spellings"].get(midi)
+    concert = deepcopy(spellings["ConcertPitch"]) if spellings else _pitch_property("ConcertPitch", midi + pitch_profile["offsets"]["ConcertPitch"])
+    transposed = deepcopy(spellings["TransposedPitch"]) if spellings else _pitch_property("TransposedPitch", midi + pitch_profile["offsets"]["TransposedPitch"])
+    props.append(concert)
+    for name, tag, value in (("Fret", "Fret", 0), ("Midi", "Number", midi)):
         ET.SubElement(ET.SubElement(props, "Property", name=name), tag).text = str(value)
     ET.SubElement(ET.SubElement(props, "Property", name="Muted"), "Enable")
+    ET.SubElement(ET.SubElement(props, "Property", name="String"), "String").text = str(6 - string)
+    props.append(transposed)
     return note
 
 
@@ -111,17 +157,60 @@ def _parse_archive(raw):
 
 
 def _archive_bytes(root, payloads, comment):
+    original_xml = next(payload for info, payload in payloads if info.filename == GPIF_ENTRY)
+    gpif = _native_gpif_bytes(root, original_xml)
     result = BytesIO()
     with ZipFile(result, "w") as archive:
         archive.comment = comment
         for info, payload in payloads:
-            archive.writestr(info, ET.tostring(root, encoding="utf-8", xml_declaration=True) if info.filename == GPIF_ENTRY else payload)
+            archive.writestr(info, gpif if info.filename == GPIF_ENTRY else payload)
     output = result.getvalue()
     with ZipFile(BytesIO(output)) as archive:
         for info, payload in payloads:
             if info.filename != GPIF_ENTRY and archive.read(info.filename) != payload:
                 raise NormalizationError(f"Archive resource changed: {info.filename}")
     return output
+
+
+def _native_gpif_bytes(root, original_xml):
+    document = minidom.parseString(original_xml)
+    cdata_paths = set()
+
+    def discover(node, path):
+        if any(child.nodeType == Node.CDATA_SECTION_NODE for child in node.childNodes):
+            if any(child.nodeType == Node.ELEMENT_NODE for child in node.childNodes):
+                raise NormalizationError("Mixed XML/CDATA fields require a native-aware content mapper; text is not flattened.")
+            cdata_paths.add(path)
+        for child in node.childNodes:
+            if child.nodeType == Node.ELEMENT_NODE:
+                discover(child, (*path, child.tagName))
+
+    try:
+        discover(document.documentElement, (document.documentElement.tagName,))
+    finally:
+        document.unlink()
+    output = deepcopy(root)
+    serialized = ET.tostring(output, encoding="utf-8")
+    prefix = b"__GP_CDATA_"
+    while prefix in serialized:
+        prefix += b"_"
+    replacements = {}
+
+    def preserve(node, path):
+        if path in cdata_paths:
+            token = prefix + str(len(replacements)).encode("ascii") + b"__"
+            value = (node.text or "").encode("utf-8").replace(b"]]>", b"]]]]><![CDATA[>")
+            replacements[token] = b"<![CDATA[" + value + b"]]>"
+            node.text = token.decode("ascii")
+        for child in node:
+            if isinstance(child.tag, str):
+                preserve(child, (*path, child.tag))
+
+    preserve(output, (output.tag,))
+    result = ET.tostring(output, encoding="utf-8", xml_declaration=True)
+    for token, value in replacements.items():
+        result = result.replace(token, value)
+    return result
 
 
 def _remove(parent, tag):
@@ -290,6 +379,7 @@ def _linear_tempos(root, source, score):
 class _OccurrenceWriter:
     def __init__(self, source, score, omitted):
         self.source, self.score = source, score
+        self.pitch_profile = native_pitch_profile(source)
         self.root = deepcopy(source)
         self.definitions = {
             section: index_section(source, section, tag)
@@ -500,6 +590,7 @@ def _place_hits(writer, candidates, labels, consumed):
         note = ghost_dead_note(
             writer.identifier("Notes"), string,
             writer.score["instrument"]["openStringMidi"], writer.score["instrument"]["capoFret"],
+            pitch_profile=writer.pitch_profile,
         )
         writer.root.find("Notes").append(note)
         _set_text(host, "Notes", " ".join([*host.findtext("Notes", "").split(), note.get("id")]))
@@ -573,6 +664,20 @@ def _verify_music(writer, decoded, playback, consumed, by_note, note_map):
                 raise NormalizationError(f"Visit {visit['visitIndex']}: normalization changed {field}.")
         if measure["repeatStart"] or measure["repeatEndCount"] or measure["directions"] or measure["alternateEndings"] or measure["referenceOnly"]:
             raise NormalizationError("Navigation or a reference section survived into played bars.")
+
+
+def _verify_native_carriers(writer, placements):
+    for placement in placements:
+        note = writer.root.find(f"./Notes/Note[@id='{placement['gpNoteId']}']")
+        props = {prop.get("name"): prop for prop in note.findall("./Properties/Property")}
+        if note.findtext("AntiAccent") != "Normal" or {"ConcertPitch", "TransposedPitch", "String", "Fret", "Midi", "Muted"} - set(props):
+            raise NormalizationError("Generic percussion lacks native GP ghost-note fields.")
+        midi = int(props["Midi"].findtext("Number"))
+        for name, offset in writer.pitch_profile["offsets"].items():
+            if _pitch_value(props[name]) != midi + offset:
+                raise NormalizationError("Generic percussion pitch coordinates disagree with the source display transposition.")
+        if props["Muted"].find("Enable") is None:
+            raise NormalizationError("Generic percussion was not serialized as a dead note.")
 
 
 def _normalized_labels(source, score, placements, beat_map, note_map, by_note):
@@ -682,6 +787,7 @@ def normalize_gp_bytes(raw, score, labels, annotations=None, conventions=None):
     playback = performance_events(decoded, list(range(len(decoded["measures"]))))
     _, by_note, beat_map, note_map = _output_indices(writer, decoded)
     _verify_music(writer, decoded, playback, consumed, by_note, note_map)
+    _verify_native_carriers(writer, placements)
     output = _archive_bytes(writer.root, payloads, comment)
     normalized_score = {
         **deepcopy(score), **decoded, "playback": playback,
@@ -699,6 +805,9 @@ def normalize_gp_bytes(raw, score, labels, annotations=None, conventions=None):
         "normalizationVersion": NORMALIZATION_VERSION, "trainingReady": False, "audioAligned": False,
         "trainingBlockers": blockers, "rawGpSha256": hashlib.sha256(raw).hexdigest(),
         "normalizedGpSha256": hashlib.sha256(output).hexdigest(),
+        "nativePitchOffsets": dict(writer.pitch_profile["offsets"]),
+        "nativeGhostEncoding": "AntiAccent=Normal; Muted Enable; complete ConcertPitch/TransposedPitch",
+        "nativeTextEncoding": "Preserve source CDATA fields, including titles and retained FreeText",
         "rawCounts": canonical_counts(labels), "normalizedCounts": canonical_counts(normalized),
         "rawWrittenMeasureCount": len(score["measures"]),
         "rawWrittenBeatCount": len(score["scoreEvents"]),
