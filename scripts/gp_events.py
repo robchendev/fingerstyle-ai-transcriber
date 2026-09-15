@@ -268,7 +268,7 @@ def decode_score(root, tuning, capo):
     for measure_index, master in enumerate(root.findall("./MasterBars/MasterBar")):
         section = master.findtext("./Section/Text")
         if section and section.strip():
-            reference_only = re.search(r"\b(instructions?|legend)\b", section, re.IGNORECASE) is not None
+            reference_only = re.search(r"\b(instructions?|intructions|legend)\b", section, re.IGNORECASE) is not None
         unknown_elements = {child.tag for child in master} - {"Key", "Time", "Fermatas", "Bars", "Repeat", "AlternateEndings", "Section", "XProperties", "Directions", "TripletFeel", "DoubleBar"}
         if unknown_elements:
             issues.append({"code": "unknown_measure_elements", "measureIndex": measure_index, "elements": sorted(unknown_elements)})

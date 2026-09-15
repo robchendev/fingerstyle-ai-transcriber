@@ -169,15 +169,40 @@ class MusicalEventTests(unittest.TestCase):
             decode_score(root, TUNING, 2)
 
     def test_instruction_examples_remain_in_score_but_not_performance_events(self):
+        for label in ("Instructions", "\nIntructions\n", "LEGEND"):
+            with self.subTest(label=label):
+                root = musical_score()
+                section = ET.SubElement(root.findall("./MasterBars/MasterBar")[1], "Section")
+                ET.SubElement(section, "Text").text = label
+                decoded = decode_score(root, TUNING, 2)
+                self.assertEqual(len(decoded["scoreEvents"]), 4)
+                self.assertTrue(decoded["measures"][1]["referenceOnly"])
+                order = playback_order(decoded["measures"])
+                self.assertEqual(order, [0])
+                self.assertEqual(len(performance_events(decoded, order)["noteEvents"]), 1)
+
+    def test_instruction_rest_anchors_preserve_text_positions_without_playback_silence(self):
         root = musical_score()
         section = ET.SubElement(root.findall("./MasterBars/MasterBar")[1], "Section")
         ET.SubElement(section, "Text").text = "Instructions"
+        for identifier, value in (("1", "Quarter"), ("2", "Half")):
+            rhythm = ET.SubElement(root.find("Rhythms"), "Rhythm", id=identifier)
+            ET.SubElement(rhythm, "NoteValue").text = value
+        labels = ("Thumb slap: X", "Wrist thump: O", "Technique explanation")
+        for identifier, rhythm, label in zip(("3", "4", "5"), ("1", "1", "2"), labels):
+            beat = ET.SubElement(root.find("Beats"), "Beat", id=identifier)
+            ET.SubElement(beat, "Rhythm", ref=rhythm)
+            ET.SubElement(beat, "FreeText").text = label
+        root.find("./Voices/Voice[@id='1']/Beats").text = "3 4 5"
         decoded = decode_score(root, TUNING, 2)
-        self.assertEqual(len(decoded["scoreEvents"]), 4)
-        self.assertTrue(decoded["measures"][1]["referenceOnly"])
-        order = playback_order(decoded["measures"])
-        self.assertEqual(order, [0])
-        self.assertEqual(len(performance_events(decoded, order)["noteEvents"]), 1)
+        anchors = [beat for beat in decoded["scoreEvents"] if beat["referenceOnly"] and beat["voiceIndex"] == 0]
+        self.assertTrue(all(beat["isRest"] for beat in anchors))
+        self.assertEqual([beat["text"] for beat in anchors], list(labels))
+        self.assertEqual([beat["offsetQuarter"] for beat in anchors], [[0, 1], [1, 1], [2, 1]])
+        self.assertEqual([beat["notatedDurationQuarter"] for beat in anchors], [[1, 1], [1, 1], [2, 1]])
+        playback = performance_events(decoded, playback_order(decoded["measures"]))
+        self.assertEqual([visit["measureIndex"] for visit in playback["measureVisits"]], [0])
+        self.assertEqual(playback["durationQuarter"], [4, 1])
 
     def test_extractor_preserves_gp_bytes_and_honors_revision_and_capo_guards(self):
         with tempfile.TemporaryDirectory() as directory:
