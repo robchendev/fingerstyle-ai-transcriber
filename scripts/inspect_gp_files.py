@@ -55,11 +55,17 @@ def matches_entry(entry, record, rules):
     stem = re.sub(r"\s*\(20\d\d\)|\(UPDATED?\)|_UPDATED?$", "", filename.stem, flags=re.IGNORECASE).strip()
     parts = stem.split(" - ")
     filename_titles = {normalized(" - ".join(parts[index:])) for index in range(len(parts))}
+    if rules.get("filenameTitleAfterLeadingContext"):
+        leading_context = re.fullmatch(r"\([^)]*\)\s+(.+)", stem)
+        if leading_context:
+            filename_titles.add(normalized(leading_context.group(1)))
     return normalized(record.get("title", "")) in titles or bool(titles & filename_titles)
 
 
 def candidate_priority(record, rules):
     path = record["sourcePath"]
+    if rules.get("selectionPolicy") == "newest-modified":
+        return -record["mtimeNs"], path.casefold(), path
     group = next((index for index, prefix in enumerate(rules["sourcePreference"]) if path.startswith(prefix)), len(rules["sourcePreference"]))
     return group, 0 if "updat" in path.casefold() else 1, path.casefold()
 

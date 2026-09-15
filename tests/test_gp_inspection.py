@@ -108,6 +108,18 @@ class GpInspectionTests(unittest.TestCase):
         publishing = {"sourcePath": "Tabs\\MyMusicSheet Migration\\Here.gp", "trackCount": 1}
         self.assertLess(candidate_priority(original, rules), candidate_priority(publishing, rules))
 
+    def test_newest_selection_uses_mtime_not_publishing_priority_or_track_count(self):
+        rules = {"selectionPolicy": "newest-modified"}
+        older = {"sourcePath": "A.gp", "mtimeNs": 10, "trackCount": 1}
+        newest = {"sourcePath": "Z.gp", "mtimeNs": 20, "trackCount": 2}
+        self.assertLess(candidate_priority(newest, rules), candidate_priority(older, rules))
+        self.assertLess(candidate_priority(dict(older, mtimeNs=20), rules), candidate_priority(newest, rules))
+
+    def test_dataset-b_context_prefix_does_not_match_arbitrary_title_suffixes(self):
+        rules = {"filenameTitleAfterLeadingContext": True, "titleAliases": {}, "requiredFilenameText": {}, "excludedPathText": []}
+        self.assertTrue(matches_entry({"id": "set-b-item-0013", "title": "Example Work"}, {"sourcePath": r"2021\(Source Work A OP) Example Work.gp", "title": "Expanded score title"}, rules))
+        self.assertFalse(matches_entry({"id": "x", "title": "Here"}, {"sourcePath": r"2021\(Source Work B ED) Other Example.gp", "title": "Another title"}, rules))
+
 
 if __name__ == "__main__":
     unittest.main()
