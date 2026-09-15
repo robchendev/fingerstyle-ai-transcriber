@@ -205,6 +205,24 @@ class MusicalEventTests(unittest.TestCase):
         self.assertEqual([visit["measureIndex"] for visit in playback["measureVisits"]], [0])
         self.assertEqual(playback["durationQuarter"], [4, 1])
 
+    def test_additional_remarks_remain_reference_only_until_music_resumes(self):
+        root = musical_score()
+        measures = root.find("MasterBars")
+        ET.SubElement(ET.SubElement(measures[1], "Section"), "Text").text = "Instructions"
+        measures.append(ET.fromstring("<MasterBar><Time>4/4</Time><Bars>2</Bars><Section><Text>Additional Remarks</Text></Section></MasterBar>"))
+        measures.append(ET.fromstring("<MasterBar><Time>4/4</Time><Bars>0</Bars><Section><Text>Chorus</Text></Section></MasterBar>"))
+        ET.SubElement(ET.SubElement(root.find("Bars"), "Bar", id="2"), "Voices").text = "2 -1 -1 -1"
+        ET.SubElement(root.find("./Beats/Beat[@id='2']"), "FreeText").text = "Sections differ; do not repeat them identically."
+        decoded = decode_score(root, TUNING, 2)
+        self.assertEqual([measure["referenceOnly"] for measure in decoded["measures"]], [False, True, True, False])
+        remarks = [beat for beat in decoded["scoreEvents"] if beat["measureIndex"] == 2]
+        self.assertEqual(len(remarks), 1)
+        self.assertTrue(remarks[0]["isRest"])
+        self.assertEqual(remarks[0]["text"], "Sections differ; do not repeat them identically.")
+        order = playback_order(decoded["measures"])
+        self.assertEqual(order, [0, 3])
+        self.assertEqual(performance_events(decoded, order)["durationQuarter"], [8, 1])
+
     def test_extractor_preserves_gp_bytes_and_honors_revision_and_capo_guards(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
