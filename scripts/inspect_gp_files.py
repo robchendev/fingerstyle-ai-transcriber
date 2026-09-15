@@ -64,6 +64,8 @@ def matches_entry(entry, record, rules):
 
 def candidate_priority(record, rules):
     path = record["sourcePath"]
+    if rules.get("selectionPolicy") == "first-matching-tier":
+        return record["sourceTier"], 0 if record["preferredUpdatedFolder"] else 1, -record["mtimeNs"], path.casefold(), path
     if rules.get("selectionPolicy") == "newest-modified":
         return -record["mtimeNs"], path.casefold(), path
     group = next((index for index, prefix in enumerate(rules["sourcePreference"]) if path.startswith(prefix)), len(rules["sourcePreference"]))
