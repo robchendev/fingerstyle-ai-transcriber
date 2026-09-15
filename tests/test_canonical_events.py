@@ -534,6 +534,17 @@ class CanonicalEventTests(unittest.TestCase):
         with self.assertRaisesRegex(CanonicalLabelError, "reference beat"):
             canonicalize(gesture_score(), rules)
 
+    def test_owner_passage_scope_does_not_relabel_other_identical_figures(self):
+        score = gesture_score()
+        rule = gesture_rules()["rules"][0]
+        rule["match"]["writtenBeatIds"] = ["m0:v0:b0"]
+        self.assertTrue(matches_rule(score["scoreEvents"][0], rule))
+        other = {**score["scoreEvents"][0], "id": "another-written-beat"}
+        self.assertFalse(matches_rule(other, rule))
+        rule["match"]["writtenBeatIds"] = ["m1:v0:b0"]
+        with self.assertRaisesRegex(CanonicalLabelError, "musical-beat scope"):
+            canonicalize(score, {"gpSha256": score["sourceGpSha256"], "rules": [rule]})
+
     def test_malformed_or_overbroad_interpretation_rules_fail(self):
         for change in ({"match": {}}, {"match": {"deadStrings": []}}, {"match": {"beatTechniques": []}}, {"match": {"tokens": [""]}}, {"consumedTokens": ["unmatched"]}, {"attributes": []}, {"technique": []}):
             rules = gesture_rules()

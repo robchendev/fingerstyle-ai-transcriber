@@ -1,5 +1,6 @@
 /data/guitar-perf-audio/
 /data/guitar-perf-gp/
+/data/guitar-perf-gp-normalized/
 .venv/
 .tools/
 __pycache__/

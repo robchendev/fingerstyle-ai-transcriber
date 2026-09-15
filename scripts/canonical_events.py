@@ -56,7 +56,7 @@ def validate_rules(score, annotations, beats):
             if not isinstance(identifier, str) or identifier not in beats or not beats[identifier]["referenceOnly"]:
                 raise CanonicalLabelError(f"Gesture evidence is not a reference beat: {identifier}")
         match = rule["match"]
-        if not isinstance(match, dict) or not match or set(match) - {"tokens", "text", "deadStrings", "beatTechniques", "deadNoteMarks", "pitchedNoteMarks", "simultaneousPitchedNoteMarks"}:
+        if not isinstance(match, dict) or not match or set(match) - {"tokens", "text", "deadStrings", "beatTechniques", "deadNoteMarks", "pitchedNoteMarks", "simultaneousPitchedNoteMarks", "writtenBeatIds"}:
             raise CanonicalLabelError(f"Unsupported or empty gesture match: {rule['id']}")
         if not any(match.get(key) for key in ("tokens", "text", "deadStrings", "beatTechniques", "pitchedNoteMarks", "simultaneousPitchedNoteMarks")):
             raise CanonicalLabelError(f"Gesture rule would match every beat: {rule['id']}")
@@ -87,6 +87,8 @@ def validate_rules(score, annotations, beats):
             raise CanonicalLabelError(f"Rule consumes markers it does not match: {rule['id']}")
         if "attributes" in rule and not isinstance(rule["attributes"], dict):
             raise CanonicalLabelError(f"Invalid gesture attributes: {rule['id']}")
+        if "writtenBeatIds" in match and (not isinstance(match["writtenBeatIds"], list) or not match["writtenBeatIds"] or any(not isinstance(identifier, str) or identifier not in beats or beats[identifier]["referenceOnly"] for identifier in match["writtenBeatIds"])):
+            raise CanonicalLabelError(f"Invalid musical-beat scope: {rule['id']}")
     return rules
 
 
@@ -104,6 +106,7 @@ def matches_rule(beat, rule, simultaneous_notes=None):
         and ("deadNoteMarks" not in match or dead_note_marks(beat) == match["deadNoteMarks"])
         and ("pitchedNoteMarks" not in match or pitched_note_marks(beat) == match["pitchedNoteMarks"])
         and ("simultaneousPitchedNoteMarks" not in match or simultaneous_notes is not None and note_marks(simultaneous_notes, dead=False) == match["simultaneousPitchedNoteMarks"])
+        and ("writtenBeatIds" not in match or beat["id"] in match["writtenBeatIds"])
     )
 
 
