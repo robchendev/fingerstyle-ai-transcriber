@@ -366,6 +366,28 @@ class MusicalEventTests(unittest.TestCase):
             self.assertIn("unknown_capo", row["reviewIssues"])
 
 
+class CsvAudioRevisionTests(unittest.TestCase):
+    def test_audio_ranges_and_duration_follow_catalog_without_erasing_notes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = PerformerPaths("dataset-a", Path(directory))
+            path = paths.metadata("review.csv")
+            path.parent.mkdir(parents=True)
+            fields = ["id", "reviewIssues", "localGpPath", "capoFret", "selectedTuningIndex", "tunings", "rangeSeconds", "localAudioPath", "audioSourceVideoId", "audioSourceTitle", "audioDurationSeconds", "audioAppliedRangeSeconds", "notes"]
+            with path.open("w", encoding="utf-8-sig", newline="") as stream:
+                writer = csv.DictWriter(stream, fields)
+                writer.writeheader()
+                writer.writerow({**dict.fromkeys(fields, "stale"), "id": "song", "reviewIssues": "", "notes": "owner note"})
+            entry = {"id": "song", "localGpPath": None, "tunings": [], "selectedTuningIndex": None, "capoFret": None, "review": {"recordingConfirmed": False, "tuningConfirmed": False}, "rangeSeconds": [4.934, 84], "localAudioPath": "clip.flac", "audioAsset": {"sourceVideoId": "01234567890", "sourceTitle": "Source", "appliedRangeSeconds": [4.934, 84], "durationSeconds": 79.06602083333334}}
+            with patch("scripts.extract_gp_events.PerformerPaths", return_value=paths):
+                update_csv({"performerId": paths.performer, "entries": [entry]}, [])
+            with path.open(encoding="utf-8-sig", newline="") as stream:
+                row = next(csv.DictReader(stream))
+            self.assertEqual(row["rangeSeconds"], "[4.934,84]")
+            self.assertEqual(row["audioAppliedRangeSeconds"], "[4.934, 84]")
+            self.assertEqual(row["audioDurationSeconds"], "79.066020833")
+            self.assertEqual(row["notes"], "owner note")
+
+
 class NavigationTests(unittest.TestCase):
     def test_explicit_fine_is_a_successful_destination(self):
         measures = [bar(targets=["Segno"]), bar(targets=["Fine"]), bar(jumps=["DaSegnoAlFine"])]
