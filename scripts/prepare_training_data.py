@@ -35,7 +35,10 @@ CONFIRMATIONS = {
     "confirm_notation": "notationReviewed", "approve_experimental_ranges": "approveExperimentalRangesAndSplit",
     "confirm_grouping": "groupingConfirmed",
 }
-ARTIFACTS = ("score.gp", "audio.flac", "normalized.gp", "events.json", "canonical.json", "normalization.json", "alignment.json", "notation.json")
+RAW_GP_NAME = "raw.gp"
+TRIMMED_AUDIO_NAME = "trimmed.flac"
+SOURCE_AUDIO_PREFIX = "trimmed-source"
+ARTIFACTS = (RAW_GP_NAME, TRIMMED_AUDIO_NAME, "normalized.gp", "events.json", "canonical.json", "normalization.json", "alignment.json", "notation.json")
 CODE_FILES = (
     "prepare_training_data.py", "inspect_gp_files.py", "gp_events.py", "canonical_events.py",
     "gp_normalization.py", "settings.py", "audio_alignment.py", "score_alignment.py",
@@ -157,8 +160,8 @@ def add_pair(workspace, identifier, group, gp, audio, performer=None, *, title=N
     directory = regular_path(workspace / "pairs" / identifier)
     if directory.exists():
         raise ValueError("An unregistered pair directory already exists; do not overwrite its files.")
-    audio_name = "audio.flac" if suffix == ".flac" else f"source{suffix}"
-    pair = {"id": identifier, "groupId": group, "gpPath": f"pairs\\{identifier}\\score.gp", "audioPath": f"pairs\\{identifier}\\{audio_name}"}
+    audio_name = TRIMMED_AUDIO_NAME if suffix == ".flac" else f"{SOURCE_AUDIO_PREFIX}{suffix}"
+    pair = {"id": identifier, "groupId": group, "gpPath": f"pairs\\{identifier}\\{RAW_GP_NAME}", "audioPath": f"pairs\\{identifier}\\{audio_name}"}
     if performer is not None:
         pair["performerId"] = performer
     if title is not None:
@@ -171,7 +174,7 @@ def add_pair(workspace, identifier, group, gp, audio, performer=None, *, title=N
     staging = regular_path(workspace / "pairs" / f".importing-{uuid4().hex}")
     staging.mkdir(parents=True)
     try:
-        for source, name in ((gp, "score.gp"), (audio, audio_name)):
+        for source, name in ((gp, RAW_GP_NAME), (audio, audio_name)):
             shutil.copyfile(source, staging / name)
             if sha256(staging / name) != original[source] or sha256(source) != original[source]:
                 raise ValueError("A source changed during import; no pair was registered.")
@@ -193,9 +196,9 @@ def source_paths(workspace, pair):
         if path.is_absolute() or path.drive or ".." in path.parts:
             raise ValueError("Registered inputs must be workspace-relative owned source files.")
         path = workspace / path
-        allowed = {"score.gp"} if field == "gpPath" else {"audio.flac", "source.wav", "source.aif", "source.aiff", "source.mp3", "source.m4a", "source.aac", "source.ogg", "source.opus"}
+        allowed = {RAW_GP_NAME} if field == "gpPath" else {TRIMMED_AUDIO_NAME, *(f"{SOURCE_AUDIO_PREFIX}{suffix}" for suffix in (".wav", ".aif", ".aiff", ".mp3", ".m4a", ".aac", ".ogg", ".opus"))}
         if path.parent != directory or path.name not in allowed:
-            raise ValueError("Registered inputs must be this pair's own score.gp and original audio, never normalized or another pair's outputs.")
+            raise ValueError(f"Registered inputs must be this pair's own {RAW_GP_NAME} and imported trimmed audio, never normalized or another pair's outputs.")
         path = regular_path(path)
         if not path.is_file():
             raise ValueError(f"{pair['id']}: missing local {field}: {path}")
@@ -370,18 +373,18 @@ def prepare_pair(workspace, pair, *, accept_conventions=False, ffmpeg_dir=None):
     staging = regular_path(directory / f".preparing-{uuid4().hex}")
     staging.mkdir()
     try:
-        shutil.copyfile(source_gp, staging / "score.gp")
-        audio = convert_audio(source_audio, staging / "audio.flac", ffmpeg_dir)
-        score, pickup = extract_score(staging / "score.gp", pair, rules)
+        shutil.copyfile(source_gp, staging / RAW_GP_NAME)
+        audio = convert_audio(source_audio, staging / TRIMMED_AUDIO_NAME, ffmpeg_dir)
+        score, pickup = extract_score(staging / RAW_GP_NAME, pair, rules)
         annotations = {"gpSha256": score["sourceGpSha256"], "rules": rules["rules"]}
         labels = canonicalize(score, annotations, CONVENTIONS)
         if not labels["scoreTimingResolved"]:
             raise ValueError("Unresolved score timing; correct/select the GP rather than inventing bar lengths.")
-        normalized_gp, labels, normalization = normalize_gp_bytes((staging / "score.gp").read_bytes(), score, labels, annotations, CONVENTIONS)
+        normalized_gp, labels, normalization = normalize_gp_bytes((staging / RAW_GP_NAME).read_bytes(), score, labels, annotations, CONVENTIONS)
         if "performerId" in pair:
             labels["performerId"] = pair["performerId"]
         write_bytes(staging / "normalized.gp", normalized_gp)
-        candidate = automatic_candidate(labels, normalization, staging / "audio.flac")
+        candidate = automatic_candidate(labels, normalization, staging / TRIMMED_AUDIO_NAME)
         notation = {
             "rawPickup": pickup, "normalizedPickup": read_gp(staging / "normalized.gp").find("./MasterTrack/Anacrusis") is not None,
             "conditioning": labels["conditioning"], "counts": canonical_counts(labels),
@@ -507,7 +510,7 @@ def render_cue(directory, state, key, position):
     rate, total = state["audio"]["sampleRate"], state["audio"]["sampleCount"]
     marker = min(total - 1, math.floor(position * rate))
     start, stop = max(0, marker - 3 * rate), min(total, marker + 5 * rate)
-    with sf.SoundFile(directory / "audio.flac") as stream:
+    with sf.SoundFile(directory / TRIMMED_AUDIO_NAME) as stream:
         stream.seek(start)
         samples = stream.read(stop - start, dtype="int32", always_2d=True)
         subtype = stream.subtype
@@ -659,7 +662,7 @@ def release_dataset(workspace, version, validation_group, identifiers=None, *, r
             "targetsPath": f"targets\\{pair['id']}.json",
         }
         entries.append(entry)
-        payloads[pair["id"]], sources[pair["id"]] = payload, directory / "audio.flac"
+        payloads[pair["id"]], sources[pair["id"]] = payload, directory / TRIMMED_AUDIO_NAME
         review_hashes[directory / "review.json"] = sha256(directory / "review.json")
         counts[split] += len(windows)
     if not all(counts.values()):

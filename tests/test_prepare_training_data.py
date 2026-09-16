@@ -197,8 +197,8 @@ class TrainingPreparationTests(unittest.TestCase):
         gp.write_bytes(archive_bytes(fresh_score("owned raw score")))
         fresh_audio(audio)
         pair = self.run_cli("add", "--id", "pair-A", "--group", "group-A", "--gp", str(gp), "--audio", str(audio))
-        self.assertEqual(pair["gpPath"], "pairs\\pair-A\\score.gp")
-        self.assertEqual(pair["audioPath"], "pairs\\pair-A\\audio.flac")
+        self.assertEqual(pair["gpPath"], "pairs\\pair-A\\raw.gp")
+        self.assertEqual(pair["audioPath"], "pairs\\pair-A\\trimmed.flac")
         owned_gp, owned_audio = source_paths(self.workspace, pair)
         before = {path: (sha256(path), path.stat().st_mtime_ns) for path in (owned_gp, owned_audio)}
         self.assertEqual(sha256(gp), sha256(owned_gp))
@@ -212,11 +212,11 @@ class TrainingPreparationTests(unittest.TestCase):
         self.assertEqual(sha256(owned_gp.parent / "review.json"), review)
         self.assertEqual(before, {path: (sha256(path), path.stat().st_mtime_ns) for path in before})
         self.assertEqual(list(owned_gp.parent.glob("*.flac")), [owned_audio])
-        self.assertFalse(list(owned_gp.parent.glob("source.*")))
+        self.assertFalse(list(owned_gp.parent.glob("trimmed-source.*")))
         for field, relative in (
             ("gpPath", "pairs\\pair-A\\normalized.gp"),
-            ("gpPath", "pairs\\other\\score.gp"),
-            ("audioPath", "pairs\\other\\audio.flac"),
+            ("gpPath", "pairs\\other\\raw.gp"),
+            ("audioPath", "pairs\\other\\trimmed.flac"),
             ("gpPath", str(gp)),
         ):
             with self.subTest(field=field, relative=relative), self.assertRaises(ValueError):
@@ -230,7 +230,7 @@ class TrainingPreparationTests(unittest.TestCase):
         bars = score.find("MasterBars")
         ET.SubElement(ET.SubElement(bars[0], "Directions"), "Target").text = "Segno"
         ET.SubElement(ET.SubElement(bars[3], "Directions"), "Jump").text = "DaSegnoAlFine"
-        gp = directory / "score.gp"
+        gp = directory / "raw.gp"
         gp.write_bytes(archive_bytes(score))
         original = (sha256(gp), gp.stat().st_mtime_ns)
         self.run_cli("prepare", "--accept-owner-conventions", error="Fine")
@@ -299,7 +299,7 @@ class TrainingPreparationTests(unittest.TestCase):
         labels, normalization = read_json(directory / "canonical.json"), read_json(directory / "normalization.json")
         result = {"reference_indices": np.arange(4), "audio_indices": np.array([0, 1, 1, 2]), "local_costs": np.zeros(4), "diagnostics": {}}
         with patch("scripts.prepare_training_data.audio_features", return_value=SimpleNamespace(times=np.arange(3, dtype=float))), patch("scripts.prepare_training_data.reference_features", return_value=SimpleNamespace(times=np.arange(4, dtype=float))), patch("scripts.prepare_training_data.align_first_attack", return_value=result):
-            candidate = automatic_candidate(labels, normalization, directory / "audio.flac")
+            candidate = automatic_candidate(labels, normalization, directory / "trimmed.flac")
         self.assertEqual(candidate["method"], "first-attack-dtw")
         self.assertEqual([point["clipSeconds"] for point in candidate["denseMapping"]], [0., 1., 1., 2.])
         self.assertEqual(candidate["timingRisks"], [{"kind": "score-time-plateau", "clipSeconds": 1., "referenceSecondsStart": 1., "referenceSecondsEnd": 2.}])
@@ -314,7 +314,7 @@ class TrainingPreparationTests(unittest.TestCase):
         self.run_cli("review", "--id", "pair-A", "--reviewer", "synthetic-human", "--acknowledge-uncertainty")
         _, records, _ = validate_release(self.release("plateau")["manifestPath"])
         self.assertEqual(records[0][1]["candidate"]["denseMapping"], candidate["denseMapping"])
-        (directory / "score.gp").write_bytes(archive_bytes(fresh_score("changed owned source")))
+        (directory / "raw.gp").write_bytes(archive_bytes(fresh_score("changed owned source")))
         self.run_cli("review", "--id", "pair-A", error="invalidate with a reason")
 
     def test_fresh_pairs_real_normalization_alignment_review_and_portable_release(self):
@@ -326,12 +326,12 @@ class TrainingPreparationTests(unittest.TestCase):
         for identifier in ("pair-A", "pair-B"):
             directory = self.workspace / "pairs" / identifier
             source, source_rate = sf.read(self.inputs / f"{identifier}.wav", dtype="int32", always_2d=True)
-            copy, copy_rate = sf.read(directory / "audio.flac", dtype="int32", always_2d=True)
+            copy, copy_rate = sf.read(directory / "trimmed.flac", dtype="int32", always_2d=True)
             self.assertEqual(source_rate, copy_rate)
             np.testing.assert_array_equal(source, copy)
             self.assertEqual(copy.shape[1], 2)
             self.assertLessEqual(np.max(np.abs(copy[:, 0] + copy[:, 1])), 256)
-            self.assertEqual(sha256(directory / "score.gp"), sha256(self.inputs / f"{identifier}.gp"))
+            self.assertEqual(sha256(directory / "raw.gp"), sha256(self.inputs / f"{identifier}.gp"))
             normalization = read_json(directory / "normalization.json")
             self.assertEqual(normalization["linearMeasureCount"], 4)
             self.assertTrue(normalization["normalizedTempoEvents"])
@@ -344,7 +344,7 @@ class TrainingPreparationTests(unittest.TestCase):
         self.assertEqual(len(report["cues"]), 2)
         excerpt = report["cues"][0]
         plain, rate = sf.read(excerpt["plainPath"], dtype="int32", always_2d=True)
-        original, _ = sf.read(self.workspace / "pairs" / "pair-A" / "audio.flac", dtype="int32", always_2d=True)
+        original, _ = sf.read(self.workspace / "pairs" / "pair-A" / "trimmed.flac", dtype="int32", always_2d=True)
         start = round(excerpt["excerptStartSeconds"] * rate)
         np.testing.assert_array_equal(plain, original[start:start + len(plain)])
         released = self.release()
@@ -387,7 +387,7 @@ class TrainingPreparationTests(unittest.TestCase):
         self.assertTrue(all(item["status"] == "reused" for item in rerun))
         self.assertEqual(original, {path: (sha256(path), path.stat().st_mtime_ns) for path in original})
         self.release()
-        gp = self.workspace / "pairs" / "pair-A" / "score.gp"
+        gp = self.workspace / "pairs" / "pair-A" / "raw.gp"
         gp.write_bytes(archive_bytes(fresh_score("deliberate new revision", pickup=True)))
         self.run_cli("prepare", "--ids", "pair-A", error="invalidate with a reason")
         self.run_cli("review", "--id", "pair-A", error="invalidate with a reason")
@@ -448,7 +448,7 @@ class TrainingPreparationTests(unittest.TestCase):
     def test_full_capo_confirmation_handles_only_inactive_stale_metadata(self):
         self.add("pair-A")
         directory = self.workspace / "pairs" / "pair-A"
-        gp = directory / "score.gp"
+        gp = directory / "raw.gp"
         root = fresh_score("reviewed full capo")
         properties = root.find("./Tracks/Track/Staves/Staff/Properties")
         for name, child, text in (("PartialCapoFret", "Fret", "4"), ("PartialCapoStringFlags", "Bitset", "000000")):
@@ -475,7 +475,7 @@ class TrainingPreparationTests(unittest.TestCase):
         gp, audio = self.add("pair-A")
         score = fresh_score("no initial tempo")
         score.find("./MasterTrack/Automations").clear()
-        (self.workspace / "pairs" / "pair-A" / "score.gp").write_bytes(archive_bytes(score))
+        (self.workspace / "pairs" / "pair-A" / "raw.gp").write_bytes(archive_bytes(score))
         self.run_cli("prepare", "--accept-owner-conventions", error="tempo")
         self.assertFalse((self.workspace / "pairs" / "pair-A" / "preparation.json").exists())
         self.run_cli("add", "--id", "CON", "--group", "new", "--gp", str(gp), "--audio", str(audio), error="device")
@@ -488,7 +488,7 @@ class TrainingPreparationTests(unittest.TestCase):
         self.run_cli("release", "--version", "v1", "--validation-group", "group-pair-B", error="reviewed split differs")
         self.approve("pair-A")
         self.run_cli("invalidate", "--id", "pair-B", "--reason", "duplicate recording synthetic check")
-        shutil.copyfile(self.workspace / "pairs" / "pair-A" / "source.wav", self.workspace / "pairs" / "pair-B" / "source.wav")
+        shutil.copyfile(self.workspace / "pairs" / "pair-A" / "trimmed-source.wav", self.workspace / "pairs" / "pair-B" / "trimmed-source.wav")
         self.run_cli("prepare", "--ids", "pair-B")
         self.approve("pair-B")
         self.run_cli("release", "--version", "v1", "--validation-group", "group-pair-B", error="Identical audio")
@@ -514,27 +514,27 @@ class TrainingPreparationTests(unittest.TestCase):
             self.run_cli("add", "--id", identifier, "--group", f"group-{identifier}", "--gp", str(score), "--audio", str(audio))
         original = {path: sha256(path) for path in (mp3, flac, wave, other)}
         self.run_cli("prepare", "--accept-owner-conventions")
-        converted = self.workspace / "pairs" / "pair-A" / "audio.flac"
+        converted = self.workspace / "pairs" / "pair-A" / "trimmed.flac"
 
         def pcm(path):
             return subprocess.run([ffmpeg, "-v", "error", "-nostdin", "-i", str(path), "-map", "0:a:0", "-f", "s24le", "-c:a", "pcm_s24le", "pipe:1"], capture_output=True, check=True).stdout
 
         self.assertEqual(pcm(mp3), pcm(converted))
-        self.assertEqual(sha256(flac), sha256(self.workspace / "pairs" / "pair-B" / "audio.flac"))
+        self.assertEqual(sha256(flac), sha256(self.workspace / "pairs" / "pair-B" / "trimmed.flac"))
         info = sf.info(converted)
         self.assertEqual((info.samplerate, info.channels, info.frames), (32000, 2, 17 * 32000))
         self.assertEqual(original, {path: sha256(path) for path in original})
 
     def test_float_pcm_is_not_silently_quantized(self):
         self.add("pair-A")
-        audio = self.workspace / "pairs" / "pair-A" / "source.wav"
+        audio = self.workspace / "pairs" / "pair-A" / "trimmed-source.wav"
         sf.write(audio, np.ones((8000, 2)) * .1, 8000, subtype="FLOAT")
         self.run_cli("prepare", "--accept-owner-conventions", error="silent quantization")
         self.assertFalse((self.workspace / "pairs" / "pair-A" / "preparation.json").exists())
 
     def test_release_preserves_complete_tempo_ramp_clock_and_half_open_targets(self):
         self.add("pair-A")
-        gp = self.workspace / "pairs" / "pair-A" / "score.gp"
+        gp = self.workspace / "pairs" / "pair-A" / "raw.gp"
         self.add("pair-B", 2)
         root = fresh_score("tempo ramp source")
         root.find("./MasterTrack/Automations/Automation/Linear").text = "true"
