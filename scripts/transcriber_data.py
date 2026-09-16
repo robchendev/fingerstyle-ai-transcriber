@@ -13,13 +13,10 @@ import soundfile
 import torch
 from torch.utils.data import Dataset, Sampler
 
-from .alignment_lineage import validate_candidate_sources
 from .canonical_events import fraction
-from .catalogs import ROOT, PerformerPaths, read_json, sha256
-from .prepare_labels import mapped_path
-from .release_pilot_dataset import repair_missing_gesture_masks, validate_release_approval
-from .score_alignment import load_alignment_input
-from .transcriber_audio import FeatureConfig, HarnessError, audio_features, conditioning_features, read_audio_window
+from .dataset_io import ROOT, sha256
+from .dataset_release import release_path, validate_release
+from .transcriber_audio import HarnessError, audio_features, conditioning_features, read_audio_window
 
 
 class EpochShuffleSampler(Sampler):
@@ -166,7 +163,7 @@ def negative_onset_coverage(labels):
     return allowed
 
 
-class WindowDataset(Dataset):
+class TrainingDataset(Dataset):
     @staticmethod
     def _stat(path):
         value = path.stat()
@@ -221,94 +218,13 @@ class WindowDataset(Dataset):
             "metadata": {"windowId": window["windowId"], "stringFrameCollisionsMasked": collisions},
         }
 
-
-class PilotDataset(WindowDataset):
     def __init__(self, manifest_path, split, feature_config, model_config, *, root=ROOT, cache_dir=None):
-        self.root = Path(root).resolve()
-        self.manifest_path = Path(manifest_path).resolve()
-        if not self.manifest_path.is_relative_to(self.root):
-            raise HarnessError("The pilot manifest must be inside its declared private data root.")
-        self.feature_config, self.model_config = feature_config, model_config
-        if split not in ("train", "validation"):
-            raise HarnessError("The initial pilot contains train and validation splits only.")
-        if feature_config.n_mels != model_config.n_mels or model_config.conditioning_dim != 12:
-            raise HarnessError("Feature/model dimensions disagree.")
-        manifest = read_json(self.manifest_path)
-        if manifest.get("kind") != "released-experimental-pilot-dataset" or manifest.get("trainingReady") is not True or manifest.get("visibility") != "private" or manifest.get("distributionAuthorized") is not False or manifest.get("trainingExecution") != "human-owner-only":
-            raise HarnessError("A current approved private pilot manifest is required.")
-        self.manifest_sha256 = sha256(self.manifest_path)
-        proposal = read_json(self.root / manifest["proposalPath"])
-        approval = read_json(self.root / manifest["approvalPath"])
-        if sha256(self.root / manifest["proposalPath"]) != manifest["proposalSha256"] or sha256(self.root / manifest["approvalPath"]) != manifest["approvalSha256"]:
-            raise HarnessError("Pilot proposal or approval changed after release.")
-        validate_release_approval(proposal, approval, manifest["proposalSha256"])
-        proposed_rows = {(row["performerId"], row["catalogId"]): row for row in proposal["entries"]}
-        if [(row["performerId"], row["catalogId"]) for row in manifest["entries"]] != list(proposed_rows):
-            raise HarnessError("Released recording scope differs from the approved proposal.")
-        if any(manifest["sourceBindings"].get(path) != digest for path, digest in proposal["sourceBindings"].items()):
-            raise HarnessError("Release source bindings differ from the approved proposal.")
-        self._guards = {}
-        for relative, digest in manifest["sourceBindings"].items():
-            path = (self.root / relative).resolve()
-            if not path.is_relative_to(self.root) or sha256(path) != digest:
-                raise HarnessError("A pilot source binding is stale or escapes its data root.")
-            self._guards[path] = self._stat(path)
-        self._guards[self.manifest_path] = self._stat(self.manifest_path)
-        groups, self.records, self.windows = {}, [], []
-        self.cache_dir = Path(cache_dir).resolve() if cache_dir is not None else None
-        if self.cache_dir is not None:
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
-        for row in manifest["entries"]:
-            proposed = proposed_rows[(row["performerId"], row["catalogId"])]
-            if any(row.get(key) != value for key, value in proposed.items() if key not in ("targetsPath", "targetsSha256")) or row.get("trainingReady") is not True:
-                raise HarnessError("Released window bounds, split or identities differ from the approved proposal.")
-            if row["groupId"] in groups and groups[row["groupId"]] != row["split"]:
-                raise HarnessError("A connected group crosses training and validation.")
-            groups[row["groupId"]] = row["split"]
-            if row["split"] != split:
-                continue
-            paths = PerformerPaths(row["performerId"], self.root)
-            data = load_alignment_input(paths, row["catalogId"])
-            candidate_path = mapped_path(row["candidatePath"], paths, self.root / "data" / "guitar-perf-alignment" / paths.performer / row["catalogId"])
-            target_path = mapped_path(row["targetsPath"], paths, self.root / "datasets" / "reviewed-pilot" / "releases" / manifest["releaseId"])
-            for path, digest in ((candidate_path, row["candidateSha256"]), (target_path, row["targetsSha256"])):
-                if sha256(path) != digest:
-                    raise HarnessError("Released pilot targets or alignment changed.")
-                self._guards[path] = self._stat(path)
-            candidate = read_json(candidate_path)
-            validate_candidate_sources(paths, data, candidate)
-            payload = read_json(target_path)
-            if payload.get("kind") != "released-pilot-window-targets" or payload.get("trainingReady") is not True or payload.get("visibility") != "private" or payload.get("distributionAuthorized") is not False or payload.get("approvalSha256") != manifest["approvalSha256"]:
-                raise HarnessError("Target payload is not part of this private approved release.")
-            if payload["conditioning"] != data.labels["conditioning"] or payload["catalogId"] != row["catalogId"] or len(payload["windows"]) != row["windowCount"]:
-                raise HarnessError("Released target identity or conditioning is inconsistent.")
-            original_path = mapped_path(proposed["targetsPath"], paths, self.root / "datasets" / "reviewed-pilot" / proposal["generation"])
-            if sha256(original_path) != proposed["targetsSha256"] or payload.get("proposalTargetsSha256") != proposed["targetsSha256"]:
-                raise HarnessError("Released targets lost their exact approved proposal binding.")
-            original = read_json(original_path)
-            repair_missing_gesture_masks(original, data.labels)
-            if payload["windows"] != original["windows"]:
-                raise HarnessError("Released musical targets or masks differ from the approved canonical projection.")
-            self._guards[original_path] = self._stat(original_path)
-            record = {"data": data, "candidate": candidate, "row": row, "negativeAllowed": negative_onset_coverage(data.labels)}
-            self.records.append(record)
-            for window in payload["windows"]:
-                if not any(a <= window["startSample"] < window["stopSampleExclusive"] <= b for a, b in row["rangeSampleBounds"]):
-                    raise HarnessError("Released window crosses its approved range.")
-                self.windows.append((record, window))
-        if not self.windows or len(self.windows) != manifest["counts"]["windowsBySplit"][split]:
-            raise HarnessError("Released split is empty or has an inconsistent window count.")
-
-class LocalDataset(WindowDataset):
-    def __init__(self, manifest_path, split, feature_config, model_config, *, root=ROOT, cache_dir=None):
-        from .local_dataset_release import release_path, validate_release
-
         self.root = Path(root).resolve()
         self.manifest_path = Path(manifest_path).absolute()
         if not self.manifest_path.is_relative_to(self.root):
             raise HarnessError("The release manifest must be inside its declared private data root.")
         if split not in ("train", "validation"):
-            raise HarnessError("Local releases contain train and validation splits only.")
+            raise HarnessError("Training releases contain train and validation splits only.")
         if feature_config.n_mels != model_config.n_mels or model_config.conditioning_dim != 12:
             raise HarnessError("Feature/model dimensions disagree.")
         self.feature_config, self.model_config = feature_config, model_config
@@ -332,4 +248,4 @@ class LocalDataset(WindowDataset):
             self.records.append(record)
             self.windows.extend((record, window) for window in payload["windows"])
         if len(self.windows) != manifest["counts"]["windowsBySplit"][split]:
-            raise HarnessError("Local release window count changed during loading.")
+            raise HarnessError("Training release window count changed during loading.")

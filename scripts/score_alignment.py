@@ -2,17 +2,12 @@
 
 from bisect import bisect_right
 from collections import Counter
-from dataclasses import dataclass
 import math
-from pathlib import Path
+
+import numpy as np
 
 from .canonical_events import fraction
-from .catalogs import read_json, sha256
-from .download_audio import sample_bounds
 from .gp_events import validate_provided_timing
-from .gp_normalization import NORMALIZATION_VERSION
-from .normalize_gp import _metadata_paths, normalized_output_paths, validate_training_policy
-from .prepare_labels import mapped_path
 
 
 CLOCK_POLICY = "Constant quarter-BPM segments; linear GP ramps use quarter-BPM linear in score position as a nominal matching reference, not a performed clock."
@@ -20,83 +15,6 @@ CLOCK_POLICY = "Constant quarter-BPM segments; linear GP ramps use quarter-BPM l
 
 class AlignmentInputError(ValueError):
     """An alignment input is invalid, stale, or outside its declared scope."""
-
-
-@dataclass(frozen=True)
-class AlignmentInput:
-    entry: dict
-    labels: dict
-    normalization: dict
-    audio_path: Path
-    source_hashes: dict
-    source_first_sample: int
-
-    @property
-    def source_offset_seconds(self):
-        return self.source_first_sample / self.entry["audioAsset"]["sampleRate"]
-
-
-def load_alignment_input(paths, identifier):
-    catalog = paths.load_catalog()
-    matches = [entry for entry in catalog["entries"] if entry["id"] == identifier]
-    if len(matches) != 1:
-        raise AlignmentInputError(f"{identifier}: expected one active catalog entry.")
-    entry = matches[0]
-    if identifier in paths.exclusions(catalog) or entry["source"] == "Produced" or entry["isBundle"]:
-        raise AlignmentInputError(f"{identifier}: excluded recordings cannot enter alignment.")
-    gp_path, canonical_path = normalized_output_paths(paths, identifier)
-    manifest_path = paths.normalized_gp / f"{identifier}.manifest.json"
-    manifest_hash = sha256(manifest_path)
-    manifest = read_json(manifest_path)
-    if manifest.get("status") != "completed" or manifest.get("inputMetadataUnchanged") is not True or manifest.get("trainingPolicyValidated") is not True or len(manifest.get("entries", [])) != 1:
-        raise AlignmentInputError(f"{identifier}: normalization did not publish a successful score manifest.")
-    expected_metadata = {str(path.relative_to(paths.root)).replace("/", "\\") for path in _metadata_paths(paths)}
-    if set(manifest.get("inputMetadataSha256", {})) != expected_metadata:
-        raise AlignmentInputError(f"{identifier}: incomplete normalization metadata provenance.")
-    row = manifest["entries"][0]
-    if row.get("status") != "normalized" or row.get("catalogId") != identifier or row.get("performerId") != paths.performer or row.get("normalizationVersion") != NORMALIZATION_VERSION:
-        raise AlignmentInputError(f"{identifier}: wrong or stale normalized score identity.")
-    policy_path = paths.root / "data" / "training-notation-policy.json"
-    validate_training_policy(read_json(policy_path))
-    source_hashes = {}
-
-    def bind(path, expected=None):
-        digest = sha256(path)
-        if expected is not None and digest != expected:
-            raise AlignmentInputError(f"{identifier}: stale input {path.name}.")
-        source_hashes[str(path.relative_to(paths.root)).replace("/", "\\")] = digest
-
-    bind(manifest_path, manifest_hash)
-    for relative, expected in manifest["inputMetadataSha256"].items():
-        path = mapped_path(relative, paths, paths.root)
-        bind(path, expected)
-    bind(policy_path, row["trainingNotationPolicySha256"])
-    for path, prefix in ((gp_path, "normalizedGp"), (canonical_path, "normalizedCanonical")):
-        if mapped_path(row[prefix + "Path"], paths, paths.normalized_gp) != path.resolve():
-            raise AlignmentInputError(f"{identifier}: normalized derivative path disagrees with its manifest.")
-        bind(path, row[prefix + "Sha256"])
-    audio_path = mapped_path(entry["localAudioPath"], paths, paths.audio)
-    for path, digest in (
-        (audio_path, entry["audioAsset"]["sha256"]),
-        (mapped_path(entry["localGpPath"], paths, paths.gp), entry["gpExtraction"]["sourceGpSha256"]),
-        (mapped_path(entry["gpExtraction"]["eventPath"], paths, paths.gp / "events"), entry["gpExtraction"]["eventSha256"]),
-        (mapped_path(row["rawCanonicalPath"], paths, paths.gp / "canonical"), row["rawCanonicalSha256"]),
-    ):
-        bind(path, digest)
-    if row["rawGpSha256"] != entry["gpExtraction"]["sourceGpSha256"] or row["rawEventSha256"] != entry["gpExtraction"]["eventSha256"] or row["rawAudioSha256"] != entry["audioAsset"]["sha256"] or row["rawAudioRangeSeconds"] != entry["rangeSeconds"]:
-        raise AlignmentInputError(f"{identifier}: normalized provenance differs from the current recording or score.")
-    labels = read_json(canonical_path)
-    if labels.get("catalogId") != identifier or labels.get("performerId") != paths.performer or labels["provenance"]["sourceGpSha256"] != row["normalizedGpSha256"]:
-        raise AlignmentInputError(f"{identifier}: canonical labels belong to another normalized score.")
-    if labels.get("audioAlignment") is not None or not labels.get("scoreTimingResolved") or labels.get("timeUnit") != "quarter-note":
-        raise AlignmentInputError(f"{identifier}: expected resolved, unaligned quarter-note labels.")
-    if labels["audio"]["sha256"] != entry["audioAsset"]["sha256"] or entry["audioAsset"]["appliedRangeSeconds"] != entry["rangeSeconds"]:
-        raise AlignmentInputError(f"{identifier}: audio/label cropping provenance is stale.")
-    bounds = sample_bounds(entry["rangeSeconds"], entry["audioAsset"]["sampleRate"])
-    if bounds and bounds[1] - bounds[0] != entry["audioAsset"]["sampleCount"]:
-        raise AlignmentInputError(f"{identifier}: inclusive source bounds disagree with the retained sample count.")
-    assert_inputs_current(paths.root, source_hashes)
-    return AlignmentInput(entry, labels, row, audio_path, source_hashes, bounds[0] if bounds else 0)
 
 
 class ScoreClock:
@@ -194,7 +112,58 @@ def matching_events(labels, clock):
     return events, dict(sorted(omitted.items()))
 
 
-def assert_inputs_current(root, hashes):
-    for relative, expected in hashes.items():
-        if sha256(root / relative) != expected:
-            raise AlignmentInputError(f"Alignment input changed during processing: {relative}")
+def candidate_mapping(reference, audio, alignment, clock, *, allow_audio_prefix=False, allow_audio_suffix=False):
+    reference_ids = np.asarray(alignment["reference_indices"])
+    audio_ids = np.asarray(alignment["audio_indices"])
+    costs = np.asarray(alignment["local_costs"], dtype=float)
+    for times in (np.asarray(reference.times), np.asarray(audio.times)):
+        if times.ndim != 1 or len(times) < 2 or not np.isfinite(times).all() or times[0] < 0 or np.any(np.diff(times) <= 0):
+            raise AlignmentInputError("Matching feature times must be finite, nonnegative and strictly increasing.")
+    if (
+        reference_ids.ndim != 1 or audio_ids.shape != reference_ids.shape or costs.shape != reference_ids.shape or len(costs) < 2
+        or reference_ids.dtype.kind not in "iu" or audio_ids.dtype.kind not in "iu"
+        or not np.isfinite(costs).all() or np.any(costs < 0)
+        or np.any(reference_ids < 0) or np.any(reference_ids >= len(reference.times))
+        or np.any(audio_ids < 0) or np.any(audio_ids >= len(audio.times))
+    ):
+        raise AlignmentInputError("The aligner returned an invalid candidate path.")
+    steps = np.column_stack((np.diff(reference_ids), np.diff(audio_ids)))
+    if np.any(steps < 0) or np.any(steps > 1) or np.any(steps.sum(axis=1) == 0) or (not allow_audio_prefix and audio_ids[0] != 0) or (not allow_audio_suffix and audio_ids[-1] != len(audio.times) - 1):
+        raise AlignmentInputError("The candidate path must monotonically account for every matched audio frame through the end.")
+    counts = np.bincount(reference_ids, minlength=len(reference.times))
+    present = counts > 0
+    if np.count_nonzero(present) < 2:
+        raise AlignmentInputError("The candidate collapsed onto a single score position.")
+    times = np.bincount(reference_ids, weights=np.asarray(audio.times)[audio_ids], minlength=len(reference.times))[present] / counts[present]
+    matching_costs = np.bincount(reference_ids, weights=costs, minlength=len(reference.times))[present] / counts[present]
+    reference_times = np.asarray(reference.times)[present]
+    present_ids = np.flatnonzero(present)
+    for reference_id, audio_id in alignment.get("fixedFrameAnchors", []):
+        if not np.any((reference_ids == reference_id) & (audio_ids == audio_id)):
+            raise AlignmentInputError("A fixed attack anchor is absent from the candidate path.")
+        times[present_ids == reference_id] = float(audio.times[audio_id])
+    if np.any(np.diff(times) < 0):
+        raise AlignmentInputError("Candidate score-to-audio time is not monotonic.")
+    warp_regions = []
+    for fixed, moving, moving_times, kind in (
+        (reference_ids, audio_ids, audio.times, "long_score_position_stall"),
+        (audio_ids, reference_ids, reference.times, "score_time_compression"),
+    ):
+        boundaries = np.r_[0, np.flatnonzero(np.diff(fixed)) + 1, len(fixed)]
+        for start, stop in zip(boundaries[:-1], boundaries[1:]):
+            duration = float(moving_times[moving[stop - 1]] - moving_times[moving[start]])
+            if duration >= 2:
+                warp_regions.append({
+                    "kind": kind, "durationSeconds": duration,
+                    "scoreQuarterStart": clock.quarter_at(float(reference.times[reference_ids[start]])),
+                    "scoreQuarterEnd": clock.quarter_at(float(reference.times[reference_ids[stop - 1]])),
+                    "clipSecondsStart": float(audio.times[audio_ids[start]]),
+                    "clipSecondsEnd": float(audio.times[audio_ids[stop - 1]]),
+                })
+    return {
+        "referenceSeconds": reference_times,
+        "clipSeconds": times,
+        "matchingCost": matching_costs,
+        "scoreQuarter": np.array([clock.quarter_at(float(value)) for value in reference_times]),
+        "warpRegions": warp_regions,
+    }

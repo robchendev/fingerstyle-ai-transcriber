@@ -7,6 +7,7 @@ import soundfile as sf
 import torch
 
 from scripts.transcriber_audio import FeatureConfig, HarnessError, audio_features, conditioning_features, read_audio_window
+from scripts.dataset_io import ROOT
 
 
 class TranscriberAudioTests(unittest.TestCase):
@@ -25,7 +26,7 @@ class TranscriberAudioTests(unittest.TestCase):
         np.testing.assert_array_equal(stereo, before)
 
     def test_native_sample_window_is_read_once_without_source_crop_or_downmix(self):
-        with TemporaryDirectory() as directory:
+        with TemporaryDirectory(dir=ROOT) as directory:
             path = Path(directory) / "synthetic.flac"
             original = np.column_stack((np.linspace(-.5, .5, 4800), np.linspace(.25, -.25, 4800))).astype(np.float32)
             sf.write(path, original, 48000, subtype="PCM_24")

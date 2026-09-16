@@ -1,16 +1,12 @@
 from copy import deepcopy
 import json
-from pathlib import Path
-import tempfile
 import unittest
 from unittest.mock import patch
 import xml.etree.ElementTree as ET
 
 from scripts.canonical_events import CanonicalLabelError, canonical_counts, canonicalize, dead_note_marks, matches_rule, pitched_note_marks, note_marks, is_percussive_hit_text
 from scripts import settings
-from scripts.catalogs import PerformerPaths, sha256, write_json
 from scripts.gp_events import catalog_timing, decode_score, performance_events, playback_order
-from scripts.prepare_labels import prepare_entry
 from tests.test_gp_events import TUNING, musical_score, note_xml
 
 
@@ -632,43 +628,6 @@ class CanonicalEventTests(unittest.TestCase):
         self.assertFalse(note["labelMask"]["pitch"])
         self.assertEqual([segment["soundingPitchMidi"] for segment in note["sourceSegments"]], [42, 54])
         self.assertEqual(labels["review"]["issues"][0]["code"], "changing_tied_pitch")
-
-    def test_preparation_binds_hashes_and_never_alters_inputs(self):
-        with tempfile.TemporaryDirectory() as directory:
-            paths = PerformerPaths("dataset-a", Path(directory))
-            paths.gp.mkdir(parents=True)
-            paths.audio.mkdir(parents=True)
-            gp = paths.gp / "example.gp"
-            gp.write_bytes(b"immutable GP archive stand-in")
-            audio = paths.audio / "example.flac"
-            audio.write_bytes(b"immutable audio stand-in")
-            events = paths.gp / "events" / "example.json"
-            score = extracted()
-            score["sourceGpSha256"] = sha256(gp)
-            score["audioPath"] = str(audio.relative_to(paths.root))
-            write_json(events, score)
-            entry = {
-                "id": "example", "localAudioPath": score["audioPath"], "localGpPath": str(gp.relative_to(paths.root)),
-                "rangeSeconds": None, "selectedTuningIndex": 0, "tunings": [{"strings": ["E2", "A2", "D3", "G3", "B3", "E4"]}],
-                "capoFret": 2, **score["providedTiming"],
-                "audioAsset": {"sha256": sha256(audio), "appliedRangeSeconds": None},
-                "gpExtraction": {"eventPath": str(events.relative_to(paths.root)), "eventSha256": sha256(events), "sourceGpSha256": sha256(gp)},
-            }
-            audit = {"sha256": sha256(gp), "localGpPath": entry["localGpPath"]}
-            before = [path.read_bytes() for path in (gp, audio, events)]
-            prepared = prepare_entry(entry, audit, None, paths)
-            self.assertEqual(prepared["provenance"]["eventSha256"], sha256(events))
-            self.assertEqual([path.read_bytes() for path in (gp, audio, events)], before)
-            with self.assertRaisesRegex(CanonicalLabelError, "stale owner tie policy"):
-                prepare_entry(entry, audit, None, paths, {**OWNER_CONVENTIONS, "playback": {"silenceRepeatedEntryTies": True}})
-            entry["rangeSeconds"] = [0, 1]
-            with self.assertRaisesRegex(CanonicalLabelError, "bounds"):
-                prepare_entry(entry, audit, None, paths)
-            entry["rangeSeconds"] = None
-            audio.write_bytes(b"changed")
-            with self.assertRaisesRegex(CanonicalLabelError, "checksum"):
-                prepare_entry(entry, audit, None, paths)
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -46,39 +46,6 @@ def number(prop, name):
         raise GpInspectionError(f"Noninteger {name}: {text}") from error
 
 
-def pitch_to_midi(value):
-    match = re.fullmatch(r"([A-G])([#b]?)(-?\d+)", value)
-    if not match:
-        raise GpInspectionError(f"Invalid scientific pitch: {value}")
-    pitch, accidental, octave = match.groups()
-    return (int(octave) + 1) * 12 + {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}[pitch] + {"": 0, "#": 1, "b": -1}[accidental]
-
-
-def compare_tuning(entry, inspection):
-    selected = entry["selectedTuningIndex"]
-    if selected is None:
-        return "catalog_tuning_not_selected"
-    expected = [pitch_to_midi(pitch) for pitch in entry["tunings"][selected]["strings"]]
-    staves = [staff for track in inspection["tracks"] if track["instrument"] != "drumKit" for staff in track["staves"]]
-    if not staves or any(staff["openStringMidi"] != expected for staff in staves):
-        return "catalog_gp_tuning_mismatch"
-    return None
-
-
-def apply_owner_confirmation(result, rules):
-    confirmation = rules.get("ownerConfirmations", {}).get(result["catalogId"])
-    if confirmation is None:
-        return
-    if confirmation["gpSha256"] != result["sha256"]:
-        result["issues"].append("owner_confirmation_revision_mismatch")
-        return
-    if confirmation["capoType"] != "full":
-        raise GpInspectionError("Unsupported owner capo confirmation.")
-    result["ownerConfirmation"] = dict(confirmation)
-    result["resolvedInspectionIssues"] = [issue for issue in result["inspection"]["warnings"] if issue == "inconsistent_partial_capo_metadata"]
-    result["issues"] = [issue for issue in result["issues"] if issue not in result["resolvedInspectionIssues"]]
-
-
 def notes_per_track(root, tracks):
     bars = {item.get("id"): item for item in root.findall("./Bars/Bar")}
     voices = {item.get("id"): item for item in root.findall("./Voices/Voice")}

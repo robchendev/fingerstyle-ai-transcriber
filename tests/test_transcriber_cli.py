@@ -11,21 +11,33 @@ import soundfile as sf
 import torch
 
 from scripts import transcriber
-from scripts.catalogs import ROOT, read_json, write_json
+from scripts.dataset_io import ROOT, read_json, publish_json
 from scripts.transcriber_audio import FeatureConfig, HarnessError
 
 
 class HarnessCommandTests(unittest.TestCase):
+    def test_default_manifest_and_explicit_overrides_always_use_training_loader(self):
+        config, features, model, _ = transcriber.load_config()
+        self.assertEqual(config["data"]["manifest"], "data\\releases\\pilot-v1\\manifest.json")
+        for root, override, expected in (
+            (ROOT, None, ROOT / "data" / "releases" / "pilot-v1" / "manifest.json"),
+            (ROOT / "private-workspace", "releases\\v2\\manifest.json", ROOT / "private-workspace" / "releases" / "v2" / "manifest.json"),
+            (ROOT, ROOT / "custom" / "manifest.json", ROOT / "custom" / "manifest.json"),
+        ):
+            with self.subTest(root=root, override=override), patch.object(transcriber, "TrainingDataset") as loader, patch.object(transcriber, "read_json", side_effect=AssertionError("No format dispatch")):
+                transcriber.make_dataset(config, features, model, "train", root, override)
+                loader.assert_called_once_with(expected, "train", features, model, root=root, cache_dir=root / "cache" / "transcriber")
+
     def test_config_path_roundtrip_and_worker_contract(self):
-        with TemporaryDirectory() as directory:
+        with TemporaryDirectory(dir=ROOT) as directory:
             path = Path(directory) / "config.json"
             config = transcriber.default_config()
-            write_json(path, config)
+            publish_json(path, config)
             loaded, features, model, training = transcriber.load_config(str(path))
             self.assertEqual(loaded, config)
             self.assertEqual(features.n_mels, model.n_mels)
             config["data"]["num_workers"] = 1
-            write_json(path, config)
+            publish_json(path, config)
             with self.assertRaisesRegex(HarnessError, "num_workers"):
                 transcriber.load_config(str(path))
 
@@ -33,7 +45,7 @@ class HarnessCommandTests(unittest.TestCase):
         return {"openStringMidi": [40, 45, 50, 55, 59, 64], "capoFret": 0, "tempo": {"bpm": 100, "beatUnit": [1, 4]}, "timeSignature": [4, 4]}
 
     def test_train_and_resume_require_no_acknowledgement_flag(self):
-        with TemporaryDirectory() as directory:
+        with TemporaryDirectory(dir=ROOT) as directory:
             root = Path(directory).resolve()
             config = transcriber.load_config()
             dataset = SimpleNamespace(manifest_sha256="synthetic-manifest")
@@ -61,7 +73,7 @@ class HarnessCommandTests(unittest.TestCase):
                 transcriber.inference_metadata({**value, **change})
 
     def test_output_must_remain_in_private_runtime_directories(self):
-        with TemporaryDirectory() as directory:
+        with TemporaryDirectory(dir=ROOT) as directory:
             root = Path(directory).resolve()
             self.assertEqual(transcriber.private_output("runs/result.json", root), root / "runs" / "result.json")
             for path in ("data/output.json", "docs/output.json", "..\\public.json"):
@@ -80,7 +92,7 @@ class HarnessCommandTests(unittest.TestCase):
             audio = root / "synthetic.wav"
             sf.write(audio, samples, rate)
             metadata = root / "metadata.json"
-            write_json(metadata, self.metadata())
+            publish_json(metadata, self.metadata())
             checkpoint_path = root / "synthetic.pt"
             checkpoint_path.write_bytes(b"synthetic checkpoint identity")
             feature_config = FeatureConfig(sample_rate=rate, n_fft=512, hop_length=160, n_mels=16, f_max=3000.)

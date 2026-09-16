@@ -1,9 +1,12 @@
 from copy import deepcopy
 from fractions import Fraction
 import math
+from types import SimpleNamespace
 import unittest
 
-from scripts.score_alignment import AlignmentInputError, ScoreClock, matching_events
+import numpy as np
+
+from scripts.score_alignment import AlignmentInputError, ScoreClock, candidate_mapping, matching_events
 
 
 def clock_fixture():
@@ -24,6 +27,48 @@ def clock_fixture():
 
 
 class ScoreAlignmentTests(unittest.TestCase):
+    def test_partial_path_mapping_preserves_coverage_and_averages_repeated_frames(self):
+        clock = ScoreClock(*clock_fixture())
+        reference = SimpleNamespace(times=np.arange(7, dtype=float))
+        audio = SimpleNamespace(times=np.arange(4, dtype=float))
+        result = {"reference_indices": np.array([2, 3, 3, 4, 5]), "audio_indices": np.array([0, 1, 2, 2, 3]), "local_costs": np.full(5, .2)}
+        mapping = candidate_mapping(reference, audio, result, clock)
+        np.testing.assert_array_equal(mapping["referenceSeconds"], [2, 3, 4, 5])
+        np.testing.assert_array_equal(mapping["clipSeconds"], [0, 1.5, 2, 3])
+        np.testing.assert_array_equal(mapping["scoreQuarter"], [2, 3, 4, 5])
+
+    def test_candidate_rejects_nonmonotonic_skipped_and_nonfinite_frames(self):
+        features = SimpleNamespace(times=np.arange(3, dtype=float))
+        clock = ScoreClock(*clock_fixture())
+        for a, r in (([0, 2], [0, 1]), ([0, 1, 2], [0, 2, 1]), ([0, 1, 2], [0, 0, 0]), ([0, 1, 2], [0., 1., 2.])):
+            with self.subTest(audio=a, reference=r), self.assertRaises(AlignmentInputError):
+                candidate_mapping(features, features, {"audio_indices": np.array(a), "reference_indices": np.array(r), "local_costs": np.zeros(len(a))}, clock)
+        for times in ([0., float("nan"), 2.], [0., 2., 1.], [-1., 0., 1.], [0., 0., 1.]):
+            with self.subTest(times=times), self.assertRaises(AlignmentInputError):
+                candidate_mapping(features, SimpleNamespace(times=np.array(times)), {"audio_indices": np.arange(3), "reference_indices": np.arange(3), "local_costs": np.zeros(3)}, clock)
+
+    def test_long_stalls_are_exposed_without_modifying_interpolation(self):
+        clock = ScoreClock(*clock_fixture())
+        reference = SimpleNamespace(times=np.arange(6, dtype=float))
+        audio = SimpleNamespace(times=np.arange(9, dtype=float))
+        result = {"reference_indices": np.array([0, 1, 1, 1, 1, 2, 3, 4, 5]), "audio_indices": np.arange(9), "local_costs": np.full(9, .1)}
+        mapping = candidate_mapping(reference, audio, result, clock)
+        self.assertEqual(mapping["warpRegions"], [{
+            "kind": "long_score_position_stall", "durationSeconds": 3.,
+            "scoreQuarterStart": 1., "scoreQuarterEnd": 1., "clipSecondsStart": 1., "clipSecondsEnd": 4.,
+        }])
+        np.testing.assert_array_equal(mapping["clipSeconds"], [0., 2.5, 5., 6., 7., 8.])
+
+    def test_first_attack_prefix_and_fixed_frame_anchor_remain_exact(self):
+        reference = SimpleNamespace(times=np.arange(3, dtype=float))
+        audio = SimpleNamespace(times=np.arange(6, dtype=float))
+        result = {"reference_indices": np.array([0, 0, 1, 2]), "audio_indices": np.array([2, 3, 4, 5]), "local_costs": np.zeros(4), "fixedFrameAnchors": [(0, 2)]}
+        clock = ScoreClock(*clock_fixture())
+        with self.assertRaises(AlignmentInputError):
+            candidate_mapping(reference, audio, result, clock)
+        mapping = candidate_mapping(reference, audio, result, clock, allow_audio_prefix=True)
+        np.testing.assert_array_equal(mapping["clipSeconds"], [2., 4., 5.])
+
     def test_dotted_unit_and_short_measures_use_score_coordinates(self):
         labels, report = clock_fixture()
         clock = ScoreClock(labels, report)

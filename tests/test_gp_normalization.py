@@ -1,20 +1,18 @@
 from copy import deepcopy
 from fractions import Fraction
 import hashlib
-from io import BytesIO, StringIO
+from io import BytesIO
 import unittest
-from unittest.mock import patch, PropertyMock
+from unittest.mock import patch
 import xml.etree.ElementTree as ET
 from zipfile import ZipFile, ZipInfo, ZIP_DEFLATED
 
 from scripts.canonical_events import canonicalize
 from scripts.gp_events import catalog_timing, decode_score, note_event, performance_events, playback_order
-from scripts.catalogs import PerformerPaths
 from scripts.gp_normalization import (
     GPIF_ENTRY, NormalizationError, ghost_dead_note, normalize_gp_bytes,
     select_free_string, semantic_node, native_pitch_profile, notated_uncertainty_intervals,
 )
-from scripts.normalize_gp import main, normalized_output_paths, validate_training_policy
 from scripts import settings
 from tests.test_gp_events import TUNING, musical_score, note_xml
 
@@ -23,19 +21,6 @@ CONVENTIONS = {
     "schemaVersion": 1, "uppercaseOIsWristThump": True,
     "simultaneousTextPriority": "lowest-voice-index",
 }
-
-TRAINING_POLICY = {
-    "schemaVersion": 1,
-    "trainingScoreSource": "guitar-perf-gp-normalized", "rawScoreSource": "guitar-perf-gp",
-    "genericPercussionClass": "percussive_hit", "trainingExecution": "human-owner-only",
-    "genericNotation": {
-        "deadNote": True, "ghostNote": True, "textLabel": None,
-        "stringPlacement": "free-under-notated-sustain", "noFreeString": "text-fallback-without-shortening-notes",
-        "fallbackText": "(X)", "fallbackConditions": ["no_free_notated_string", "no_safe_voice_beat", "unknown_score_onset"],
-    },
-    "preserve": ["thumb_slap", "wrist_thump", "pitched_notes", "harmonic_pitches", "voices", "notated_durations", "nonmusical_gp_settings"],
-}
-
 
 def template_score():
     root = musical_score()
@@ -747,66 +732,6 @@ class GpNormalizationTests(unittest.TestCase):
         root.find("./MasterTrack/Automations/Automation/Linear").text = "true"
         with self.assertRaisesRegex(NormalizationError, "Tempo ramps"):
             normalize_gp_bytes(*prepared(root))
-
-    def test_bounded_cli_rejects_implicit_scope(self):
-        with patch("sys.stderr", new=StringIO()):
-            for args in ([],):
-                with self.subTest(args=args), self.assertRaises(SystemExit) as raised:
-                    main(args)
-                self.assertEqual(raised.exception.code, 2)
-
-    def test_performer_output_paths_are_separate_from_raw_and_reject_escaped_ids(self):
-        for performer in ("dataset-a", "dataset-b"):
-            paths = PerformerPaths(performer)
-            gp, canonical = normalized_output_paths(paths, "example")
-            self.assertEqual(gp.parent, paths.normalized_gp)
-            self.assertEqual(canonical.parent, paths.normalized_gp / "canonical")
-            self.assertFalse(gp.is_relative_to(paths.gp))
-            with self.assertRaisesRegex(NormalizationError, "escaped"):
-                normalized_output_paths(paths, "..\\..\\outside")
-
-    def test_normalized_directory_cannot_alias_another_performers_raw_assets(self):
-        paths = PerformerPaths("dataset-a")
-        other = PerformerPaths("dataset-b")
-        for target in (other.gp, other.audio):
-            with self.subTest(target=target), patch.object(PerformerPaths, "normalized_gp", new_callable=PropertyMock, return_value=target):
-                with self.assertRaises(NormalizationError):
-                    normalized_output_paths(paths, "example")
-
-    def test_training_notation_policy_requires_normalized_only_and_native_safe_ghosts(self):
-        validate_training_policy(TRAINING_POLICY)
-        changes = [
-            ("schemaVersion", 2), ("schemaVersion", True),
-            ("trainingScoreSource", "guitar-perf-gp"), ("rawScoreSource", "other"),
-            ("genericPercussionClass", "body_tap"), ("trainingExecution", "assistant"),
-            ("genericNotation", None),
-        ]
-        for field, value in changes:
-            with self.subTest(field=field, value=value), self.assertRaises(NormalizationError):
-                policy = deepcopy(TRAINING_POLICY)
-                policy[field] = value
-                validate_training_policy(policy)
-        for field in TRAINING_POLICY["genericNotation"]:
-            with self.subTest(missing=field), self.assertRaises(NormalizationError):
-                policy = deepcopy(TRAINING_POLICY)
-                del policy["genericNotation"][field]
-                validate_training_policy(policy)
-        for field, value in (
-            ("deadNote", False), ("ghostNote", 1), ("textLabel", "(X)"),
-            ("stringPlacement", "any-string"), ("noFreeString", "shorten-held-notes"),
-        ):
-            with self.subTest(field=field), self.assertRaises(NormalizationError):
-                policy = deepcopy(TRAINING_POLICY)
-                policy["genericNotation"][field] = value
-                validate_training_policy(policy)
-
-    def test_training_policy_must_preserve_harmonics_musical_notes_and_settings(self):
-        for field in TRAINING_POLICY["preserve"]:
-            with self.subTest(missing=field), self.assertRaises(NormalizationError):
-                policy = deepcopy(TRAINING_POLICY)
-                policy["preserve"].remove(field)
-                validate_training_policy(policy)
-
 
 if __name__ == "__main__":
     unittest.main()

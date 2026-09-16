@@ -3,7 +3,8 @@ import tempfile
 import unittest
 from zipfile import ZipFile
 
-from scripts.inspect_gp_files import apply_owner_confirmation, compare_tuning, inspect_gp
+from scripts.dataset_io import ROOT
+from scripts.inspect_gp_files import inspect_gp
 
 
 def score(track_count=1, partial_fret=0, flags="000000", annotation=""):
@@ -26,7 +27,7 @@ def score(track_count=1, partial_fret=0, flags="000000", annotation=""):
 
 class GpInspectionTests(unittest.TestCase):
     def inspect(self, xml):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
             path = Path(directory) / "score.gp"
             with ZipFile(path, "w") as archive:
                 archive.writestr("Content/score.gpif", xml)
@@ -59,29 +60,8 @@ class GpInspectionTests(unittest.TestCase):
         self.assertIn("partial_capo_in_text", textual["warnings"])
         self.assertNotIn("partial_capo_active", textual["warnings"])
 
-    def test_catalog_tuning_uses_exact_open_string_pitches(self):
-        entry = {"selectedTuningIndex": 0, "tunings": [{"strings": ["E2", "A2", "D3", "G3", "B3", "E4"]}]}
-        self.assertIsNone(compare_tuning(entry, self.inspect(score())))
-        entry["tunings"][0]["strings"][0] = "D2"
-        self.assertEqual(compare_tuning(entry, self.inspect(score())), "catalog_gp_tuning_mismatch")
-
-    def test_owner_confirmation_resolves_only_stale_metadata_on_the_confirmed_revision(self):
-        inspection = self.inspect(score(partial_fret=4))
-        result = {"catalogId": "set-a-item-0218", "sha256": "a" * 64, "inspection": inspection, "issues": [*inspection["warnings"], "catalog_gp_tuning_mismatch"]}
-        rules = {"ownerConfirmations": {"set-a-item-0218": {"gpSha256": "a" * 64, "capoType": "full", "note": "Owner confirmed normal capo."}}}
-        apply_owner_confirmation(result, rules)
-        self.assertEqual(result["issues"], ["catalog_gp_tuning_mismatch"])
-        self.assertIn("inconsistent_partial_capo_metadata", inspection["warnings"])
-        apply_owner_confirmation(result, rules)
-        self.assertEqual(result["resolvedInspectionIssues"], ["inconsistent_partial_capo_metadata"])
-        other = {"catalogId": "set-a-item-0218", "sha256": "b" * 64, "issues": ["inconsistent_partial_capo_metadata"]}
-        apply_owner_confirmation(other, rules)
-        self.assertIn("inconsistent_partial_capo_metadata", other["issues"])
-        self.assertIn("owner_confirmation_revision_mismatch", other["issues"])
-        self.assertNotIn("ownerConfirmation", other)
-
     def test_inspection_leaves_style_resources_untouched(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
             for index in (1, 2):
                 path = Path(directory) / f"styled-{index}.gp"
                 xml = score().replace("<Score>", f"<Score><FirstPageHeader>Custom font size {index}</FirstPageHeader>")

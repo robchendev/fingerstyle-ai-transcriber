@@ -1,0 +1,594 @@
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
+import json
+from pathlib import Path
+import shutil
+import subprocess
+import unittest
+from unittest.mock import patch
+from uuid import uuid4
+import xml.etree.ElementTree as ET
+
+import numpy as np
+import soundfile as sf
+
+from scripts import transcriber
+from scripts.dataset_io import read_json, sha256
+from scripts.audio_tools import AcquisitionError, executable
+from scripts.dataset_release import candidate_digest, validate_release
+from scripts.prepare_training_data import ARTIFACTS, automatic_candidate, extract_score, main, parser, rules_template, source_paths, workspace_path
+from scripts.score_alignment import ScoreClock
+from tests.test_gp_events import musical_score, note_xml
+from tests.test_gp_normalization import archive_bytes
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def fresh_score(title, shift=0, *, pickup=False, unknown=False, legend=False):
+    root = musical_score()
+    root.find("./Score/Title").text = title
+    root.find("./MasterTrack/Automations/Automation/Value").text = "60 2"
+    if pickup:
+        ET.SubElement(root.find("MasterTrack"), "Anacrusis")
+    for name in ("MasterBars", "Bars", "Voices", "Beats", "Notes", "Rhythms"):
+        root.find(name).clear()
+    root.find("Rhythms").append(ET.fromstring('<Rhythm id="0"><NoteValue>Quarter</NoteValue></Rhythm>'))
+    for measure in range(4 + int(legend)):
+        master = ET.SubElement(root.find("MasterBars"), "MasterBar")
+        ET.SubElement(master, "Time").text = "4/4"
+        ET.SubElement(master, "Bars").text = str(measure)
+        if measure == 4:
+            ET.SubElement(ET.SubElement(master, "Section"), "Text").text = "Instructions"
+        bar = ET.SubElement(root.find("Bars"), "Bar", id=str(measure))
+        ET.SubElement(bar, "Voices").text = f"{measure} -1 -1 -1"
+        voice = ET.SubElement(root.find("Voices"), "Voice", id=str(measure))
+        ET.SubElement(voice, "Beats").text = " ".join(str(measure * 4 + offset) for offset in range(4))
+        for offset in range(4):
+            identifier = str(measure * 4 + offset)
+            beat = ET.SubElement(root.find("Beats"), "Beat", id=identifier)
+            ET.SubElement(beat, "Rhythm", ref="0")
+            if measure < 4:
+                ET.SubElement(beat, "Notes").text = identifier
+                root.find("Notes").append(note_xml(identifier, fret=(measure * 4 + offset + shift) % 8))
+            if unknown and identifier == "3":
+                ET.SubElement(beat, "FreeText").text = "???"
+            if legend and identifier in ("0", "16"):
+                ET.SubElement(beat, "FreeText").text = "*" if identifier == "0" else "Tap side of guitar *"
+    return root
+
+
+def fresh_audio(path, shift=0, *, rate=8000):
+    samples = np.zeros((17 * rate, 2), dtype=np.float64)
+    for index in range(16):
+        start = round((.4 + index) * rate)
+        local = np.arange(round(.8 * rate)) / rate
+        frequency = 440 * 2 ** ((42 + (index + shift) % 8 - 69) / 12)
+        tone = .35 * np.sin(2 * np.pi * frequency * local) * np.exp(-4 * local)
+        samples[start:start + len(tone), 0] += tone
+        samples[start:start + len(tone), 1] -= tone
+    sf.write(path, samples, rate, subtype="PCM_24")
+    return samples
+
+
+class TrainingPreparationTests(unittest.TestCase):
+    def setUp(self):
+        self.root = ROOT / f".training-preparation-tests-{uuid4().hex}"
+        self.root.mkdir()
+        self.addCleanup(shutil.rmtree, self.root)
+        (self.root / ".gitignore").write_text("*\n", encoding="ascii")
+        self.workspace = self.root / "workspace"
+        self.inputs = self.root / "inputs"
+        self.inputs.mkdir()
+        self.run_cli("init")
+
+    def run_cli(self, *arguments, error=None, authorize_release=True):
+        if arguments[0] == "release" and authorize_release:
+            arguments = (*arguments, "--reviewer", "synthetic-release-owner", "--authorize-release")
+        output, errors = StringIO(), StringIO()
+        with redirect_stdout(output), redirect_stderr(errors):
+            code = main(["--workspace", str(self.workspace), *arguments])
+        if error is not None:
+            self.assertEqual(code, 2, output.getvalue())
+            self.assertIn(error, errors.getvalue())
+            return errors.getvalue()
+        self.assertEqual(code, 0, errors.getvalue())
+        return json.loads(output.getvalue())
+
+    def add(self, identifier, shift=0, *, group=None, pickup=False, unknown=False, legend=False, rate=8000, title=None):
+        gp, audio = self.inputs / f"{identifier}.gp", self.inputs / f"{identifier}.wav"
+        gp.write_bytes(archive_bytes(fresh_score(identifier, shift, pickup=pickup, unknown=unknown, legend=legend)))
+        fresh_audio(audio, shift, rate=rate)
+        self.run_cli("add", "--id", identifier, "--group", group or f"group-{identifier}", "--performer", f"independent artist {shift}", "--gp", str(gp), "--audio", str(audio), *(["--title", title] if title is not None else []))
+        return gp, audio
+
+    def prepare_two(self, *, unknown=False):
+        self.add("pair-A", pickup=True, unknown=unknown)
+        self.add("pair-B", 2)
+        return self.run_cli("prepare", "--accept-owner-conventions")
+
+    def approve(self, identifier, *, exclude=False, end="16.4", split=None):
+        args = [
+            "review", "--id", identifier, "--reviewer", "synthetic-human",
+            "--anchor", "1=0.4", "--anchor", "2=4.4", "--anchor", "3=8.4",
+            "--anchor", "4=12.4", "--anchor", f"end={end}",
+            "--approve-range", f"0.4:{end}", "--split", split or ("validation" if identifier == "pair-B" else "train"),
+            "--authorize-use", "--confirm-pitch", "--confirm-notation", "--confirm-grouping",
+            "--approve-experimental-ranges", "--acknowledge-uncertainty",
+        ]
+        if exclude:
+            args += ["--exclude-range", "7:7.5"]
+        return self.run_cli(*args)
+
+    def release(self, version="v1"):
+        return self.run_cli("release", "--version", version, "--validation-group", "group-pair-B")
+
+    def test_optional_title_is_retained_in_registry_binding_status_and_review(self):
+        title = "A Human-Readable Song (Fingerstyle)"
+        self.add("sample-0123", title=title)
+        self.add("sample-0123", 2)
+        pairs = read_json(self.workspace / "pairs.json")["pairs"]
+        self.assertEqual(pairs[0]["title"], title)
+        self.assertNotIn("title", pairs[1])
+        blocked = self.run_cli("status")["pairs"]
+        self.assertEqual((blocked[0]["id"], blocked[0]["title"], blocked[0]["status"]), ("sample-0123", title, "blocked"))
+        self.assertNotIn("title", blocked[1])
+        self.run_cli("prepare", "--accept-owner-conventions")
+        directory = self.workspace / "pairs" / "sample-0123"
+        self.assertEqual(read_json(directory / "preparation.json")["inputs"]["pair"], pairs[0])
+        self.assertEqual(self.run_cli("status")["pairs"][0]["title"], title)
+        review = self.run_cli("review", "--id", "sample-0123")
+        self.assertEqual((review["id"], review["title"]), ("sample-0123", title))
+        self.assertEqual(read_json(directory / "review-report.json")["title"], title)
+        self.assertNotIn("title", self.run_cli("review", "--id", "sample-0123"))
+        self.approve("sample-0123")
+        reviewed = self.run_cli("status")["pairs"][0]
+        self.assertEqual((reviewed["title"], reviewed["status"]), (title, "reviewed"))
+
+    def test_supplied_titles_must_be_nonempty_strings(self):
+        gp, audio = self.add("pair-A")
+        self.run_cli("add", "--id", "pair-B", "--group", "group-B", "--gp", str(gp), "--audio", str(audio), "--title", " ", error="title must be a nonempty string")
+        self.assertFalse((self.workspace / "pairs" / "pair-B").exists())
+        registry = self.workspace / "pairs.json"
+        document = read_json(registry)
+        for title in ("", " ", None, 12, []):
+            with self.subTest(title=title):
+                document["pairs"][0]["title"] = title
+                registry.write_text(json.dumps(document), encoding="utf-8")
+                self.run_cli("status", error="title must be a nonempty string")
+
+    def test_optional_preparation_provenance_is_opaque_and_does_not_rerun_dsp(self):
+        self.add("pair-A")
+        self.run_cli("prepare", "--accept-owner-conventions")
+        directory = self.workspace / "pairs" / "pair-A"
+        path = directory / "preparation.json"
+        state = read_json(path)
+        inputs, artifacts = state["inputs"], state["artifacts"]
+        state["provenance"] = {"archivedEvidencePath": "unavailable\\historical-evidence.zip", "originalSourceFirstSample": 12345}
+        path.write_text(json.dumps(state), encoding="utf-8")
+        with patch("scripts.prepare_training_data.automatic_candidate", side_effect=AssertionError("Existing preparations must not rerun DSP")):
+            self.assertEqual(self.run_cli("prepare")[0]["status"], "reused")
+            self.approve("pair-A")
+            self.assertEqual(self.run_cli("status")["pairs"][0]["status"], "reviewed")
+        self.assertEqual(read_json(path)["inputs"], inputs)
+        self.assertEqual({name: sha256(directory / name) for name in ARTIFACTS}, artifacts)
+        self.assertEqual(read_json(directory / "review.json")["preparationSha256"], candidate_digest(state))
+
+    def test_default_workspace_and_nonempty_directory_guard(self):
+        self.assertEqual(parser().parse_args(["init"]).workspace, ROOT / "data")
+        with patch("scripts.prepare_training_data.ROOT", self.root):
+            self.assertEqual(workspace_path(self.root / "data"), self.root / "data")
+            self.assertEqual(workspace_path(self.root / "datasets" / "custom"), self.root / "datasets" / "custom")
+            for name in ("pairs", "releases", "archive"):
+                with self.assertRaises(ValueError):
+                    workspace_path(self.root / "data" / name / "nested")
+        nonempty = self.root / "nonempty"
+        nonempty.mkdir()
+        asset = nonempty / "do-not-adopt.gp"
+        asset.write_bytes(b"owner material")
+        with redirect_stderr(StringIO()), redirect_stdout(StringIO()):
+            self.assertEqual(main(["--workspace", str(nonempty), "init"]), 2)
+        self.assertEqual(asset.read_bytes(), b"owner material")
+        self.assertFalse((nonempty / "pairs.json").exists())
+
+    def test_owned_imports_are_independent_and_flac_is_not_duplicated(self):
+        gp = self.inputs / "original.gp"
+        audio = self.inputs / "original.flac"
+        gp.write_bytes(archive_bytes(fresh_score("owned raw score")))
+        fresh_audio(audio)
+        pair = self.run_cli("add", "--id", "pair-A", "--group", "group-A", "--gp", str(gp), "--audio", str(audio))
+        self.assertEqual(pair["gpPath"], "pairs\\pair-A\\score.gp")
+        self.assertEqual(pair["audioPath"], "pairs\\pair-A\\audio.flac")
+        owned_gp, owned_audio = source_paths(self.workspace, pair)
+        before = {path: (sha256(path), path.stat().st_mtime_ns) for path in (owned_gp, owned_audio)}
+        self.assertEqual(sha256(gp), sha256(owned_gp))
+        self.assertEqual(sha256(audio), sha256(owned_audio))
+        self.run_cli("prepare", "--accept-owner-conventions")
+        self.approve("pair-A")
+        review = sha256(owned_gp.parent / "review.json")
+        gp.write_bytes(b"external source has changed")
+        audio.write_bytes(b"external audio has changed")
+        self.assertEqual(self.run_cli("prepare")[0]["status"], "reused")
+        self.assertEqual(sha256(owned_gp.parent / "review.json"), review)
+        self.assertEqual(before, {path: (sha256(path), path.stat().st_mtime_ns) for path in before})
+        self.assertEqual(list(owned_gp.parent.glob("*.flac")), [owned_audio])
+        self.assertFalse(list(owned_gp.parent.glob("source.*")))
+        for field, relative in (
+            ("gpPath", "pairs\\pair-A\\normalized.gp"),
+            ("gpPath", "pairs\\other\\score.gp"),
+            ("audioPath", "pairs\\other\\audio.flac"),
+            ("gpPath", str(gp)),
+        ):
+            with self.subTest(field=field, relative=relative), self.assertRaises(ValueError):
+                source_paths(self.workspace, {**pair, field: relative})
+        self.run_cli("add", "--id", "another", "--group", "group-B", "--gp", str(owned_gp), "--audio", str(owned_audio), error="another pair")
+
+    def test_fine_override_uses_last_musical_bar_and_binds_the_rule(self):
+        self.add("pair-A", legend=True)
+        directory = self.workspace / "pairs" / "pair-A"
+        score = fresh_score("explicitly reviewed Fine", legend=True)
+        bars = score.find("MasterBars")
+        ET.SubElement(ET.SubElement(bars[0], "Directions"), "Target").text = "Segno"
+        ET.SubElement(ET.SubElement(bars[3], "Directions"), "Jump").text = "DaSegnoAlFine"
+        gp = directory / "score.gp"
+        gp.write_bytes(archive_bytes(score))
+        original = (sha256(gp), gp.stat().st_mtime_ns)
+        self.run_cli("prepare", "--accept-owner-conventions", error="Fine")
+        rules_path = directory / "rules.json"
+        rules = read_json(rules_path)
+        rules["fineTarget"] = "last-musical-measure"
+        rules_path.write_text(json.dumps(rules), encoding="utf-8")
+        self.run_cli("prepare")
+        events = read_json(directory / "events.json")
+        self.assertEqual([visit["measureIndex"] for visit in events["playback"]["measureVisits"]], [0, 1, 2, 3, 0, 1, 2, 3])
+        self.assertEqual(read_json(directory / "normalization.json")["linearMeasureCount"], 8)
+        self.assertEqual(read_json(directory / "preparation.json")["inputs"]["rulesSha256"], candidate_digest(rules))
+        self.assertEqual((sha256(gp), gp.stat().st_mtime_ns), original)
+        rules["fineTarget"] = None
+        rules_path.write_text(json.dumps(rules), encoding="utf-8")
+        self.run_cli("prepare", error="invalidate with a reason")
+
+    def test_linked_sources_and_changed_imports_never_register_a_pair(self):
+        gp, audio = self.inputs / "raw.gp", self.inputs / "raw.flac"
+        gp.write_bytes(archive_bytes(fresh_score("immutable import")))
+        fresh_audio(audio)
+        alias = self.inputs / "alias.gp"
+        alias.hardlink_to(gp)
+        self.run_cli("add", "--id", "pair-A", "--group", "group-A", "--gp", str(alias), "--audio", str(audio), error="aliases")
+        alias.unlink()
+        copyfile = shutil.copyfile
+
+        def changed_source(source, destination):
+            result = copyfile(source, destination)
+            if source == gp:
+                gp.write_bytes(b"concurrent source revision")
+            return result
+
+        with patch("scripts.prepare_training_data.shutil.copyfile", side_effect=changed_source):
+            self.run_cli("add", "--id", "pair-A", "--group", "group-A", "--gp", str(gp), "--audio", str(audio), error="changed during import")
+        self.assertEqual(read_json(self.workspace / "pairs.json")["pairs"], [])
+        self.assertEqual(list((self.workspace / "pairs").iterdir()), [])
+
+    def test_fixed_text_confirmation_never_bypasses_partial_capo_or_retuning(self):
+        score = fresh_score("fixed full capo")
+        ET.SubElement(score.find("./Beats/Beat"), "FreeText").text = "Fixed tuning and full capo"
+        gp = self.inputs / "text.gp"
+        gp.write_bytes(archive_bytes(score))
+        rules = rules_template()
+        with self.assertRaisesRegex(ValueError, "capo_or_tuning_text"):
+            extract_score(gp, {"id": "text"}, rules)
+        rules["confirmFixedTuningCapoText"] = True
+        self.assertEqual(extract_score(gp, {"id": "text"}, rules)[0]["instrument"]["capoFret"], 2)
+        score.find(".//Staff/Properties/Property[@name='PartialCapoFret']/Fret").text = "2"
+        score.find(".//Staff/Properties/Property[@name='PartialCapoStringFlags']/Bitset").text = "001111"
+        gp.write_bytes(archive_bytes(score))
+        with self.assertRaisesRegex(ValueError, "partial_capo_active"):
+            extract_score(gp, {"id": "text"}, rules)
+        score.find(".//Staff/Properties/Property[@name='PartialCapoFret']/Fret").text = "0"
+        score.find(".//Staff/Properties/Property[@name='PartialCapoStringFlags']/Bitset").text = "000000"
+        ET.SubElement(ET.SubElement(score.find("./MasterTrack/Automations"), "Automation"), "Type").text = "Tuning"
+        gp.write_bytes(archive_bytes(score))
+        with self.assertRaisesRegex(ValueError, "tuning_or_capo_automation"):
+            extract_score(gp, {"id": "text"}, rules)
+
+    def test_automatic_plateau_is_reviewable_and_requires_source_bound_acceptance(self):
+        from types import SimpleNamespace
+
+        self.prepare_two()
+        directory = self.workspace / "pairs" / "pair-A"
+        labels, normalization = read_json(directory / "canonical.json"), read_json(directory / "normalization.json")
+        result = {"reference_indices": np.arange(4), "audio_indices": np.array([0, 1, 1, 2]), "local_costs": np.zeros(4), "diagnostics": {}}
+        with patch("scripts.prepare_training_data.audio_features", return_value=SimpleNamespace(times=np.arange(3, dtype=float))), patch("scripts.prepare_training_data.reference_features", return_value=SimpleNamespace(times=np.arange(4, dtype=float))), patch("scripts.prepare_training_data.align_first_attack", return_value=result):
+            candidate = automatic_candidate(labels, normalization, directory / "audio.flac")
+        self.assertEqual(candidate["method"], "first-attack-dtw")
+        self.assertEqual([point["clipSeconds"] for point in candidate["denseMapping"]], [0., 1., 1., 2.])
+        self.assertEqual(candidate["timingRisks"], [{"kind": "score-time-plateau", "clipSeconds": 1., "referenceSecondsStart": 1., "referenceSecondsEnd": 2.}])
+        self.run_cli("invalidate", "--id", "pair-A", "--reason", "synthetic plateau candidate")
+        with patch("scripts.prepare_training_data.automatic_candidate", return_value=candidate):
+            self.run_cli("prepare", "--ids", "pair-A")
+        self.approve("pair-B")
+        args = ("review", "--id", "pair-A", "--reviewer", "synthetic-human", "--approve-range", "0:2", "--authorize-use", "--confirm-pitch", "--confirm-notation", "--confirm-grouping", "--approve-experimental-ranges")
+        report = self.run_cli(*args)
+        self.assertEqual(report["timingRisks"], candidate["timingRisks"])
+        self.run_cli("release", "--version", "plateau", "--validation-group", "group-pair-B", error="acknowledge-uncertainty")
+        self.run_cli("review", "--id", "pair-A", "--reviewer", "synthetic-human", "--acknowledge-uncertainty")
+        _, records, _ = validate_release(self.release("plateau")["manifestPath"])
+        self.assertEqual(records[0][1]["candidate"]["denseMapping"], candidate["denseMapping"])
+        (directory / "score.gp").write_bytes(archive_bytes(fresh_score("changed owned source")))
+        self.run_cli("review", "--id", "pair-A", error="invalidate with a reason")
+
+    def test_fresh_pairs_real_normalization_alignment_review_and_portable_release(self):
+        prepared = self.prepare_two(unknown=True)
+        self.assertTrue(all(item["status"] == "prepared" for item in prepared))
+        # The ordinary, informative one-track fixture actually exercises the DSP matcher.
+        self.assertTrue(any(item["alignment"] == "first-attack-dtw" for item in prepared), prepared)
+        original_hashes = {path: sha256(path) for path in self.inputs.iterdir()}
+        for identifier in ("pair-A", "pair-B"):
+            directory = self.workspace / "pairs" / identifier
+            source, source_rate = sf.read(self.inputs / f"{identifier}.wav", dtype="int32", always_2d=True)
+            copy, copy_rate = sf.read(directory / "audio.flac", dtype="int32", always_2d=True)
+            self.assertEqual(source_rate, copy_rate)
+            np.testing.assert_array_equal(source, copy)
+            self.assertEqual(copy.shape[1], 2)
+            self.assertLessEqual(np.max(np.abs(copy[:, 0] + copy[:, 1])), 256)
+            self.assertEqual(sha256(directory / "score.gp"), sha256(self.inputs / f"{identifier}.gp"))
+            normalization = read_json(directory / "normalization.json")
+            self.assertEqual(normalization["linearMeasureCount"], 4)
+            self.assertTrue(normalization["normalizedTempoEvents"])
+        self.approve("pair-A", exclude=True)
+        self.approve("pair-B")
+        report = self.run_cli("review", "--id", "pair-A", "--cue", "1", "--cue", "first-attack")
+        self.assertEqual(report["barsAndFirstAttack"][0]["ordinal"], 1)
+        self.assertEqual(report["barsAndFirstAttack"][0]["displayedBar"], 0)
+        self.assertEqual(report["approvedClipRanges"], [[.4, 6.5], [8., 16.4]])
+        self.assertEqual(len(report["cues"]), 2)
+        excerpt = report["cues"][0]
+        plain, rate = sf.read(excerpt["plainPath"], dtype="int32", always_2d=True)
+        original, _ = sf.read(self.workspace / "pairs" / "pair-A" / "audio.flac", dtype="int32", always_2d=True)
+        start = round(excerpt["excerptStartSeconds"] * rate)
+        np.testing.assert_array_equal(plain, original[start:start + len(plain)])
+        released = self.release()
+        manifest_path = Path(released["manifestPath"])
+        manifest, records, _ = validate_release(manifest_path)
+        self.assertTrue(manifest["trainingReady"])
+        self.assertTrue(all(manifest["counts"]["windowsBySplit"].values()))
+        self.assertEqual({path: sha256(path) for path in original_hashes}, original_hashes)
+        unresolved = records[0][1]["canonical"]["review"]["unresolvedGestures"]
+        self.assertTrue(unresolved)
+        self.assertTrue(all(item["labelMask"]["gesture"] is False for item in unresolved))
+        self.assertFalse(records[0][1]["canonical"]["targets"]["gestures"])
+        for entry, payload in records:
+            directory = self.workspace / "pairs" / entry["id"]
+            self.assertEqual(payload["canonical"], read_json(directory / "canonical.json"))
+            self.assertEqual(payload["normalization"], read_json(directory / "normalization.json"))
+            self.assertEqual(payload["approval"]["sourceGpSha256"], sha256(self.inputs / f"{entry['id']}.gp"))
+            self.assertFalse(payload["windows"][0]["targets"]["negativePercussionSupervision"])
+            for window in payload["windows"]:
+                a, b = window["startSample"] / entry["sampleRate"], window["stopSampleExclusive"] / entry["sampleRate"]
+                self.assertTrue(any(left <= a < b <= right for left, right in payload["approval"]["approvedClipRanges"]))
+        moved = self.root / "moved-release"
+        shutil.copytree(manifest_path.parent, moved)
+        shutil.rmtree(self.workspace)
+        shutil.rmtree(self.inputs)
+        validate_release(moved / "manifest.json")
+        with redirect_stdout(StringIO()):
+            self.assertEqual(transcriber.main(["preflight", "--data-root", str(moved), "--manifest", "manifest.json"]), 0)
+        preflight = read_json(moved / "runs" / "preflight.json")
+        self.assertFalse(preflight["trainingRun"])
+
+    def test_rerun_revision_invalidates_approval_without_changing_frozen_release(self):
+        self.prepare_two()
+        self.approve("pair-A")
+        self.approve("pair-B")
+        first = Path(self.release()["manifestPath"]).parent
+        frozen = {str(path.relative_to(first)): sha256(path) for path in first.rglob("*") if path.is_file()}
+        original = {path: (sha256(path), path.stat().st_mtime_ns) for identifier in ("pair-A", "pair-B") for name in ARTIFACTS for path in [self.workspace / "pairs" / identifier / name]}
+        rerun = self.run_cli("prepare")
+        self.assertTrue(all(item["status"] == "reused" for item in rerun))
+        self.assertEqual(original, {path: (sha256(path), path.stat().st_mtime_ns) for path in original})
+        self.release()
+        gp = self.workspace / "pairs" / "pair-A" / "score.gp"
+        gp.write_bytes(archive_bytes(fresh_score("deliberate new revision", pickup=True)))
+        self.run_cli("prepare", "--ids", "pair-A", error="invalidate with a reason")
+        self.run_cli("review", "--id", "pair-A", error="invalidate with a reason")
+        self.run_cli("release", "--version", "v2", "--validation-group", "group-pair-B", error="invalidate with a reason")
+        self.run_cli("invalidate", "--id", "pair-A", "--reason", "synthetic owner-selected new GP revision")
+        self.run_cli("prepare", "--ids", "pair-A")
+        self.assertFalse((self.workspace / "pairs" / "pair-A" / "review.json").exists())
+        self.run_cli("release", "--version", "v2", "--validation-group", "group-pair-B", error="missing human")
+        self.approve("pair-A")
+        self.run_cli("release", "--version", "v1", "--validation-group", "group-pair-B", error="NEW version")
+        self.release("v2")
+        self.assertEqual(frozen, {str(path.relative_to(first)): sha256(path) for path in first.rglob("*") if path.is_file()})
+        validate_release(first / "manifest.json")
+        self.assertEqual(len(read_json(self.workspace / "pairs" / "pair-A" / "history.json")), 1)
+        self.assertFalse(any(path.name.startswith(".preparing-") or path.name.endswith(".building") for path in self.workspace.rglob("*")))
+
+    def test_sparse_anchor_confirmation_is_not_range_or_split_approval(self):
+        self.prepare_two()
+        self.run_cli("review", "--id", "pair-A", "--reviewer", "synthetic-human", "--anchor", "1=0.4", "--anchor", "end=16.4", "--confirm-notation")
+        self.approve("pair-B")
+        self.run_cli("release", "--version", "v1", "--validation-group", "group-pair-B", error="missing human")
+        self.run_cli("review", "--id", "pair-A", "--reviewer", "synthetic-human", "--approve-experimental-ranges", error="requires explicit")
+        self.approve("pair-A")
+        self.run_cli("review", "--id", "pair-A", "--reviewer", "synthetic-human", "--anchor", "2=4.6")
+        self.run_cli("release", "--version", "v1", "--validation-group", "group-pair-B", error="missing human")
+        self.run_cli("review", "--id", "pair-A", "--reviewer", "synthetic-human", "--anchor", "3=2.0", error="strictly")
+
+    def test_failed_automatic_alignment_can_be_completed_with_human_anchors(self):
+        self.add("pair-A", rate=96000)
+        self.add("pair-B", 2)
+        prepared = self.run_cli("prepare", "--accept-owner-conventions")
+        self.assertEqual(prepared[0]["alignment"], "needs-human-anchors")
+        self.assertIn("48000", prepared[0]["alignmentError"])
+        self.run_cli("review", "--id", "pair-A", "--reviewer", "synthetic-human", "--approve-range", ".4:16.4", error="at least two")
+        self.approve("pair-A")
+        self.approve("pair-B")
+        _, records, _ = validate_release(self.release()["manifestPath"])
+        self.assertEqual(records[0][0]["sampleRate"], 96000)
+        self.assertEqual(records[0][1]["candidate"]["method"], "human-anchors-linear-nominal-time")
+
+    def test_source_specific_rules_need_no_internal_hash_authoring(self):
+        self.add("pair-A", legend=True)
+        self.run_cli("prepare", "--ids", "pair-A", error="accept-owner-conventions")
+        rules_path = self.workspace / "pairs" / "pair-A" / "rules.json"
+        rules = read_json(rules_path)
+        rules["rules"] = [{
+            "id": "source-side-tap", "technique": "body_tap", "attributes": {"location": "side"},
+            "evidenceBeatIds": ["m4:v0:b0"], "match": {"tokens": ["*"]},
+            "consumedTokens": ["*"], "consumesDeadNotes": False,
+        }]
+        rules_path.write_text(json.dumps(rules), encoding="utf-8")
+        self.run_cli("prepare", "--ids", "pair-A", "--accept-owner-conventions")
+        labels = read_json(self.workspace / "pairs" / "pair-A" / "canonical.json")
+        self.assertEqual(labels["targets"]["gestures"][0]["technique"], "percussive_hit")
+        self.assertEqual(len(labels["measureVisits"]), 4)
+        self.assertTrue(any(beat["referenceOnly"] for beat in read_json(self.workspace / "pairs" / "pair-A" / "notation.json")["beats"]))
+
+    def test_full_capo_confirmation_handles_only_inactive_stale_metadata(self):
+        self.add("pair-A")
+        directory = self.workspace / "pairs" / "pair-A"
+        gp = directory / "score.gp"
+        root = fresh_score("reviewed full capo")
+        properties = root.find("./Tracks/Track/Staves/Staff/Properties")
+        for name, child, text in (("PartialCapoFret", "Fret", "4"), ("PartialCapoStringFlags", "Bitset", "000000")):
+            prop = properties.find(f"Property[@name='{name}']")
+            if prop is None:
+                prop = ET.SubElement(properties, "Property", name=name)
+                ET.SubElement(prop, child)
+            prop.find(child).text = text
+        gp.write_bytes(archive_bytes(root))
+        original = sha256(gp)
+        self.run_cli("prepare", "--accept-owner-conventions", error="inconsistent_partial_capo_metadata")
+        rules_path = directory / "rules.json"
+        rules = read_json(rules_path)
+        rules["confirmFullCapoMetadata"] = True
+        rules_path.write_text(json.dumps(rules), encoding="utf-8")
+        self.run_cli("prepare")
+        self.assertEqual(sha256(gp), original)
+        self.run_cli("invalidate", "--id", "pair-A", "--reason", "synthetic active partial capo")
+        properties.find("Property[@name='PartialCapoStringFlags']/Bitset").text = "001111"
+        gp.write_bytes(archive_bytes(root))
+        self.run_cli("prepare", error="partial_capo_active")
+
+    def test_missing_tempo_and_unsafe_identity_never_get_musical_defaults(self):
+        gp, audio = self.add("pair-A")
+        score = fresh_score("no initial tempo")
+        score.find("./MasterTrack/Automations").clear()
+        (self.workspace / "pairs" / "pair-A" / "score.gp").write_bytes(archive_bytes(score))
+        self.run_cli("prepare", "--accept-owner-conventions", error="tempo")
+        self.assertFalse((self.workspace / "pairs" / "pair-A" / "preparation.json").exists())
+        self.run_cli("add", "--id", "CON", "--group", "new", "--gp", str(gp), "--audio", str(audio), error="device")
+        self.run_cli("add", "--id", "PAIR-a", "--group", "new", "--gp", str(gp), "--audio", str(audio), error="already exists")
+
+    def test_group_or_duplicate_recording_cannot_cross_splits(self):
+        self.prepare_two()
+        self.approve("pair-A", split="validation")
+        self.approve("pair-B")
+        self.run_cli("release", "--version", "v1", "--validation-group", "group-pair-B", error="reviewed split differs")
+        self.approve("pair-A")
+        self.run_cli("invalidate", "--id", "pair-B", "--reason", "duplicate recording synthetic check")
+        shutil.copyfile(self.workspace / "pairs" / "pair-A" / "source.wav", self.workspace / "pairs" / "pair-B" / "source.wav")
+        self.run_cli("prepare", "--ids", "pair-B")
+        self.approve("pair-B")
+        self.run_cli("release", "--version", "v1", "--validation-group", "group-pair-B", error="Identical audio")
+        self.assertFalse((self.workspace / "releases" / "v1").exists())
+
+    def test_compressed_audio_preserves_decoded_pcm_and_existing_flac_bytes(self):
+        try:
+            ffmpeg = executable("ffmpeg")
+            executable("ffprobe")
+        except AcquisitionError as error:
+            self.skipTest(str(error))
+        gp, wave = self.inputs / "pair-A.gp", self.inputs / "pair-A.wav"
+        gp.write_bytes(archive_bytes(fresh_score("pair-A")))
+        fresh_audio(wave, rate=32000)
+        other_gp, other = self.inputs / "pair-B.gp", self.inputs / "pair-B.wav"
+        other_gp.write_bytes(archive_bytes(fresh_score("pair-B", 2)))
+        fresh_audio(other, 2)
+        mp3, flac = wave.with_suffix(".mp3"), other.with_suffix(".flac")
+        subprocess.run([ffmpeg, "-v", "error", "-nostdin", "-n", "-i", str(wave), "-c:a", "libmp3lame", "-b:a", "128k", str(mp3)], check=True, capture_output=True)
+        samples, rate = sf.read(other, dtype="int32", always_2d=True)
+        sf.write(flac, samples, rate, subtype="PCM_24")
+        for identifier, score, audio in (("pair-A", gp, mp3), ("pair-B", other_gp, flac)):
+            self.run_cli("add", "--id", identifier, "--group", f"group-{identifier}", "--gp", str(score), "--audio", str(audio))
+        original = {path: sha256(path) for path in (mp3, flac, wave, other)}
+        self.run_cli("prepare", "--accept-owner-conventions")
+        converted = self.workspace / "pairs" / "pair-A" / "audio.flac"
+
+        def pcm(path):
+            return subprocess.run([ffmpeg, "-v", "error", "-nostdin", "-i", str(path), "-map", "0:a:0", "-f", "s24le", "-c:a", "pcm_s24le", "pipe:1"], capture_output=True, check=True).stdout
+
+        self.assertEqual(pcm(mp3), pcm(converted))
+        self.assertEqual(sha256(flac), sha256(self.workspace / "pairs" / "pair-B" / "audio.flac"))
+        info = sf.info(converted)
+        self.assertEqual((info.samplerate, info.channels, info.frames), (32000, 2, 17 * 32000))
+        self.assertEqual(original, {path: sha256(path) for path in original})
+
+    def test_float_pcm_is_not_silently_quantized(self):
+        self.add("pair-A")
+        audio = self.workspace / "pairs" / "pair-A" / "source.wav"
+        sf.write(audio, np.ones((8000, 2)) * .1, 8000, subtype="FLOAT")
+        self.run_cli("prepare", "--accept-owner-conventions", error="silent quantization")
+        self.assertFalse((self.workspace / "pairs" / "pair-A" / "preparation.json").exists())
+
+    def test_release_preserves_complete_tempo_ramp_clock_and_half_open_targets(self):
+        self.add("pair-A")
+        gp = self.workspace / "pairs" / "pair-A" / "score.gp"
+        self.add("pair-B", 2)
+        root = fresh_score("tempo ramp source")
+        root.find("./MasterTrack/Automations/Automation/Linear").text = "true"
+        root.find("./MasterTrack/Automations").append(ET.fromstring(
+            "<Automation><Type>Tempo</Type><Bar>1</Bar><Position>0</Position>"
+            "<Value>90 2</Value><Linear>false</Linear></Automation>"
+        ))
+        gp.write_bytes(archive_bytes(root))
+        self.run_cli("prepare", "--accept-owner-conventions")
+        self.approve("pair-A")
+        self.approve("pair-B")
+        _, records, _ = validate_release(self.release()["manifestPath"])
+        payload = records[0][1]
+        normalization = payload["normalization"]
+        self.assertEqual(normalization["durationQuarter"], [16, 1])
+        self.assertEqual(len(normalization["normalizedTempoEvents"]), 2)
+        for event in normalization["normalizedTempoEvents"]:
+            self.assertTrue({"positionRatio", "offsetQuarter", "quarterBpm", "bpm", "beatUnit", "linear"} <= event.keys())
+        clock = ScoreClock(payload["canonical"], normalization)
+        mapping = payload["candidate"]["denseMapping"]
+        for point in mapping:
+            self.assertEqual(point["scoreQuarter"], clock.quarter_at(point["referenceSeconds"]))
+        for a, b in zip(mapping, mapping[1:]):
+            self.assertLess(a["clipSeconds"], b["clipSeconds"])
+            self.assertLess(a["referenceSeconds"], b["referenceSeconds"])
+        first_window = payload["windows"][0]
+        stop = first_window["stopSampleExclusive"] / records[0][0]["sampleRate"]
+        self.assertTrue(all(note["proposedOnsetClipSeconds"] < stop for note in first_window["targets"]["notes"]))
+        self.assertNotIn(8.4, [note["proposedOnsetClipSeconds"] for note in first_window["targets"]["notes"]])
+
+    def test_release_authorizes_complete_scope_and_finalizes_split_neutral_reviews(self):
+        self.prepare_two()
+        for identifier in ("pair-A", "pair-B"):
+            self.run_cli(
+                "review", "--id", identifier, "--reviewer", "synthetic-source-reviewer",
+                "--anchor", "1=0.4", "--anchor", "end=16.4", "--approve-range", "0.4:16.4",
+                "--authorize-use", "--confirm-pitch", "--confirm-notation", "--confirm-grouping",
+                "--approve-experimental-ranges", "--acknowledge-uncertainty",
+            )
+            source_review = read_json(self.workspace / "pairs" / identifier / "review.json")
+            self.assertNotIn("split", source_review["approval"])
+        self.run_cli("release", "--version", "v1", "--validation-group", "group-pair-B", authorize_release=False, error="--authorize-release")
+        manifest, records, _ = validate_release(self.release()["manifestPath"])
+        authorization = manifest["releaseAuthorization"]
+        self.assertEqual(authorization["validationGroup"], "group-pair-B")
+        self.assertEqual([(item["id"], item["split"]) for item in authorization["selectedScope"]], [("pair-A", "train"), ("pair-B", "validation")])
+        self.assertEqual(authorization["sha256"], candidate_digest({key: value for key, value in authorization.items() if key != "sha256"}))
+        for entry, payload in records:
+            self.assertEqual(payload["approval"]["groupId"], entry["groupId"])
+            self.assertEqual(payload["approval"]["split"], entry["split"])
+            self.assertEqual(payload["approval"]["releaseAuthorizationSha256"], authorization["sha256"])
+            self.assertEqual(payload["approval"]["releaseReviewer"], "synthetic-release-owner")
+            self.assertNotIn("split", read_json(self.workspace / "pairs" / entry["id"] / "review.json")["approval"])
+
+
+if __name__ == "__main__":
+    unittest.main()
