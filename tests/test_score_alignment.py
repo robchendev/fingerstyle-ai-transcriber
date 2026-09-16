@@ -43,6 +43,13 @@ class ScoreAlignmentTests(unittest.TestCase):
         for quarter in (0, .5, 2.9, 3, 4.5, 6):
             self.assertAlmostEqual(clock.quarter_at(clock.seconds(quarter)), quarter)
 
+    def test_exact_score_end_uses_the_same_boundary_as_reference_duration(self):
+        labels, report = clock_fixture()
+        report["normalizedTempoEvents"].append({"measureIndex": 1, "positionRatio": [3, 5], "offsetQuarter": [9, 5], "bpm": 90, "beatUnit": [1, 4], "quarterBpm": [90, 1], "linear": False})
+        clock = ScoreClock(labels, report)
+        self.assertEqual(clock.seconds(clock.total_quarter), clock.duration_seconds)
+        self.assertLess(clock.seconds(Fraction(599, 100)), clock.duration_seconds)
+
     def test_nominal_ramp_integrates_and_inverts_in_score_position(self):
         labels, report = clock_fixture()
         report["normalizedTempoEvents"][0]["linear"] = True

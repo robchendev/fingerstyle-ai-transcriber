@@ -155,6 +155,8 @@ class ScoreClock:
         value = float(quarter)
         if not math.isfinite(value) or not 0 <= value <= float(self.total_quarter):
             raise AlignmentInputError("Score position is outside the nominal clock.")
+        if value == float(self.total_quarter):
+            return self.duration_seconds
         segment = self.segments[min(bisect_right(self._quarter_starts, value) - 1, len(self.segments) - 1)]
         return segment["seconds"] + self._integrate(value - segment["start"], segment["bpm"], segment["slope"])
 
