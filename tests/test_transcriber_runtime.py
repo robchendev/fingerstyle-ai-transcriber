@@ -136,14 +136,14 @@ class UnsupportedCheckpointObject:
     pass
 
 
-def loaders(dataset=None):
+def loaders(dataset=None, *, batch_size=2):
     dataset = ToyDataset() if dataset is None else dataset
     train = DataLoader(
-        dataset, batch_size=2, sampler=EpochSampler(dataset),
+        dataset, batch_size=batch_size, sampler=EpochSampler(dataset),
         generator=torch.Generator().manual_seed(101), num_workers=0,
     )
     validation = DataLoader(
-        dataset, batch_size=2, shuffle=False,
+        dataset, batch_size=batch_size, shuffle=False,
         generator=torch.Generator().manual_seed(202), num_workers=0,
     )
     return train, validation
@@ -168,12 +168,12 @@ class RuntimeTests(unittest.TestCase):
         self.addCleanup(runtime._restore_rng, self.original_rng)
         self.config = runtime.TrainingConfig(epochs=2, max_steps=2, device="cpu")
 
-    def train(self, name="run", *, config=None, model=None, resume=None, pair=None):
+    def train(self, name="run", *, config=None, model=None, resume=None, pair=None, progress=None):
         train, validation = loaders() if pair is None else pair
         model = toy_model() if model is None else model
         summary = runtime.run_training(
             model, train, validation, self.config if config is None else config,
-            self.root / name, IDENTITY, resume=resume,
+            self.root / name, IDENTITY, resume=resume, progress=progress,
         )
         return summary, model
 
@@ -258,6 +258,34 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(resumed["global_step"], 6)
         self.assertEqual(resumed["epoch"], 2)
         self.assertEqual(resumed["next_batch_index"], 0)
+        self.assertEqual(resumed["training_steps_processed"], 4)
+        self.assertEqual(resumed["training_windows_processed"], 8)
+        self.assertEqual(resumed["validation_windows_processed"], 18)
+
+    def test_progress_and_summary_preserve_updates_and_count_short_batches(self):
+        config = replace(self.config, epochs=1, max_steps=None)
+        silent, _ = self.train("silent", config=config, pair=loaders(batch_size=4))
+        messages = []
+        logged, _ = self.train("logged", config=config, pair=loaders(batch_size=4), progress=messages.append)
+        left, right = runtime.load_checkpoint(silent["latest_checkpoint"]), runtime.load_checkpoint(logged["latest_checkpoint"])
+        for key in ("model_state", "optimizer_state", "cursor", "rng", "loader_state", "history"):
+            self.assert_tree_equal(left[key], right[key])
+        self.assertEqual(logged["dataset_windows"], {"train": 6, "validation": 6})
+        self.assertEqual(logged["training_windows_processed"], 6)
+        self.assertEqual(logged["validation_windows_processed"], 12)
+        self.assertEqual(logged["training_steps_processed"], 2)
+        self.assertEqual(logged["epochs_completed_this_run"], 1)
+        self.assertGreaterEqual(logged["elapsed_seconds"], 0.)
+        for expected in ("Initial validation: batch 1/2", "Epoch 1/1 | batch 1/2", "Epoch 1/1 | batch 2/2", "batch loss", "epoch training ETA", "Epoch 1 validation: finished", "Saving checkpoint", "Saved latest.pt", "Epoch 1/1: complete"):
+            self.assertTrue(any(expected in message for message in messages), expected)
+        self.assertEqual(runtime.format_duration(3661.9), "01:01:01")
+
+    def test_progress_interval_has_first_last_batch_and_time_limits(self):
+        self.assertTrue(runtime._progress_due(1, 40, 1., 0.))
+        self.assertTrue(runtime._progress_due(40, 40, 1., 0.))
+        self.assertTrue(runtime._progress_due(10, 40, 1., 0.))
+        self.assertTrue(runtime._progress_due(2, 40, 5., 0.))
+        self.assertFalse(runtime._progress_due(2, 40, 4., 0.))
 
     def test_epoch_boundary_resume_and_total_step_ceiling(self):
         partial, _ = self.train(config=replace(self.config, epochs=1, max_steps=None))
@@ -274,6 +302,9 @@ class RuntimeTests(unittest.TestCase):
                 config=replace(self.config, epochs=2, max_steps=4), resume=resumed["latest_checkpoint"],
             )
         self.assertEqual(no_op["global_step"], 4)
+        self.assertEqual(no_op["training_steps_processed"], 0)
+        self.assertEqual(no_op["training_windows_processed"], 0)
+        self.assertEqual(no_op["validation_windows_processed"], 6)
         self.assertEqual(before, (self.root / "run" / "latest.pt").read_bytes())
         for config in (replace(self.config, max_steps=3), replace(self.config, epochs=1, max_steps=5)):
             with self.assertRaises(ValueError):

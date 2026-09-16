@@ -8,8 +8,9 @@ import os
 import random
 import re
 import stat
+import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sized
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 
@@ -657,7 +658,22 @@ def _metrics(counts):
     return result
 
 
-def evaluate_model(model, loader, device, *, sparsity_weight=0.02):
+def format_duration(seconds):
+    minutes, seconds = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def _emit(progress, message):
+    if progress is not None:
+        progress(message)
+
+
+def _progress_due(completed, total, now, last_log):
+    return completed == 1 or completed == total or completed % 10 == 0 or now - last_log >= 5
+
+
+def evaluate_model(model, loader, device, *, sparsity_weight=0.02, progress=None, phase="Validation"):
     """Frame-level, mask-aware metrics; not event or complete-score accuracy."""
     _finite(sparsity_weight, "sparsity_weight")
     device = resolve_device(str(device))
@@ -671,7 +687,10 @@ def evaluate_model(model, loader, device, *, sparsity_weight=0.02):
         name: {"count": 0, "sum": 0.0, "correct": 0, "tp": 0, "fp": 0, "fn": 0, "emitted": 0, "positions": 0}
         for name in ("note_onset", "fret", "pitch", "voice", "duration", "harmonic_presence", "percussion")
     }
-    batches = frames = 0
+    batches = frames = windows = 0
+    started = last_log = time.perf_counter()
+    total_batches = len(loader) if progress is not None and isinstance(loader, Sized) else None
+    _emit(progress, f"{phase}: starting.")
     try:
         model.eval()
         with torch.no_grad():
@@ -686,6 +705,12 @@ def evaluate_model(model, loader, device, *, sparsity_weight=0.02):
                 _metric_counts(outputs, batch, counts)
                 batches += 1
                 frames += int(batch["valid_frames"].sum().item())
+                windows += batch["features"].shape[0]
+                now = time.perf_counter()
+                if progress is not None and _progress_due(batches, total_batches, now, last_log):
+                    total = f"/{total_batches}" if total_batches is not None else ""
+                    _emit(progress, f"{phase}: batch {batches}{total} | windows {windows} | elapsed {format_duration(now - started)}")
+                    last_log = now
     finally:
         for module, mode in modes:
             module.training = mode
@@ -694,8 +719,10 @@ def evaluate_model(model, loader, device, *, sparsity_weight=0.02):
             generator.set_state(generator_state)
     totals = _stats(totals, weights)
     loss = _objective(totals, weights, sparsity_weight)
+    loss_text = f"{loss:.6f}" if loss is not None else "unavailable (no supervised labels)"
+    _emit(progress, f"{phase}: finished | loss {loss_text} | {windows} windows | elapsed {format_duration(time.perf_counter() - started)}")
     return _json_copy({
-        "loss": loss, "available": loss is not None, "batches": batches, "valid_frames": frames,
+        "loss": loss, "available": loss is not None, "batches": batches, "valid_frames": frames, "windows": windows,
         "loss_statistics": totals, **_metrics(counts),
     })
 
@@ -737,13 +764,15 @@ def _require_validation(metrics):
         raise ValueError("Validation needs data and a meaningful supervised objective")
 
 
-def run_training(model, train_loader, validation_loader, config, run_dir, identity, *, resume=None):
+def run_training(model, train_loader, validation_loader, config, run_dir, identity, *, resume=None, progress=None):
     """Perform bounded AdamW updates only when explicitly called by the owner.
 
     Epochs and max_steps are total ceilings. Exact resume requires unchanged,
     deterministic map-style loaders with private generators and zero workers.
     The caller must seed model construction separately for reproducible new runs.
     """
+    started = time.perf_counter()
+    training_windows = validation_windows = 0
     if not isinstance(config, TrainingConfig):
         raise ValueError("config must be a TrainingConfig")
     identity = _identity(identity)
@@ -769,12 +798,14 @@ def run_training(model, train_loader, validation_loader, config, run_dir, identi
         if run_dir.exists() and (not run_dir.is_dir() or any(run_dir.iterdir())):
             raise ValueError("A fresh run directory must be absent or empty")
         run_id = uuid.uuid4().hex
+        _emit(progress, f"Starting new run: {run_dir}")
     else:
         if _plain_path(resume) != run_dir / "latest.pt":
             raise ValueError("Resume must use latest.pt from this exact run directory")
         source_stamps = {
             name: _file_stamp(run_dir / name) for name in ("run.json", "latest.pt", "best.pt")
         }
+        _emit(progress, f"Loading resume checkpoint: {resume}")
         checkpoint = load_checkpoint(resume, expected_identity=identity)
         run_id = checkpoint["run_id"]
         manifest = _read_json(run_dir / "run.json")
@@ -845,8 +876,10 @@ def run_training(model, train_loader, validation_loader, config, run_dir, identi
             validation_loader.generator.set_state(checkpoint["loader_state"]["validation"])
             epoch_start = checkpoint["loader_state"]["epoch_start"]
             _restore_rng(checkpoint["rng"])
-        validation = evaluate_model(model, validation_loader, device, sparsity_weight=config.sparsity_weight)
+        initial_epoch, initial_step = epoch, global_step
+        validation = evaluate_model(model, validation_loader, device, sparsity_weight=config.sparsity_weight, progress=progress, phase="Initial validation")
         _require_validation(validation)
+        validation_windows += validation["windows"]
         if checkpoint is None:
             if run_dir.exists():
                 if not run_dir.is_dir() or any(run_dir.iterdir()):
@@ -860,6 +893,11 @@ def run_training(model, train_loader, validation_loader, config, run_dir, identi
             "schema_version": SCHEMA_VERSION, "run_id": run_id, "identity": identity, "config": asdict(config),
         }, replace=checkpoint is not None)
         while epoch < config.epochs and (config.max_steps is None or global_step < config.max_steps):
+            epoch_started = last_log = time.perf_counter()
+            first_batch = next_batch
+            batch_count = runtime["train_loader"]["batches"]
+            batch_limit = batch_count if config.max_steps is None else min(batch_count, next_batch + config.max_steps - global_step)
+            _emit(progress, f"Epoch {epoch + 1}/{config.epochs}: starting at batch {next_batch + 1}/{batch_count} | step {global_step}")
             if callable(getattr(train_loader.sampler, "set_epoch", None)):
                 before = _capture_rng()
                 train_loader.sampler.set_epoch(epoch)
@@ -896,6 +934,13 @@ def run_training(model, train_loader, validation_loader, config, run_dir, identi
                     _tensor(value, f"updated model.{name}")
                 global_step += 1
                 next_batch += 1
+                training_windows += batch["features"].shape[0]
+                now = time.perf_counter()
+                processed = next_batch - first_batch
+                if progress is not None and _progress_due(processed, batch_limit - first_batch, now, last_log):
+                    eta = (now - epoch_started) / processed * (batch_limit - next_batch)
+                    _emit(progress, f"Epoch {epoch + 1}/{config.epochs} | batch {next_batch}/{batch_count} | step {global_step} | batch loss {loss.detach().item():.6f} | elapsed {format_duration(now - started)} | epoch training ETA {format_duration(eta)}")
+                    last_log = now
                 if config.max_steps is not None and global_step >= config.max_steps:
                     break
             epoch_complete = next_batch == runtime["train_loader"]["batches"]
@@ -906,8 +951,9 @@ def run_training(model, train_loader, validation_loader, config, run_dir, identi
                 _require_same_rng(before, _capture_rng())
                 epoch += 1
                 next_batch = 0
-            validation = evaluate_model(model, validation_loader, device, sparsity_weight=config.sparsity_weight)
+            validation = evaluate_model(model, validation_loader, device, sparsity_weight=config.sparsity_weight, progress=progress, phase=f"Epoch {epoch_index + 1} validation")
             _require_validation(validation)
+            validation_windows += validation["windows"]
             history.append({
                 "epoch": epoch_index, "global_step": global_step,
                 "epoch_complete": epoch_complete, "validation": validation,
@@ -928,15 +974,25 @@ def run_training(model, train_loader, validation_loader, config, run_dir, identi
                 "history": history,
             }
             _validate_checkpoint(payload)
+            _emit(progress, "Saving checkpoint and metrics...")
             if improved:
                 _atomic_write(run_dir / "best.pt", lambda stream: torch.save(payload, stream))
             _atomic_write(run_dir / "latest.pt", lambda stream: torch.save(payload, stream))
             _write_json(run_dir / "metrics.json", history)
+            saved = "latest.pt, best.pt and metrics.json" if improved else "latest.pt and metrics.json"
+            _emit(progress, f"Saved {saved} | best validation loss {best_score:.6f}")
+            state = "complete" if epoch_complete else "paused at step ceiling"
+            _emit(progress, f"Epoch {epoch_index + 1}/{config.epochs}: {state} | elapsed {format_duration(time.perf_counter() - epoch_started)}")
         return _json_copy({
             "run_dir": str(run_dir), "global_step": global_step, "epoch": epoch,
             "next_batch_index": next_batch, "best_score": best_score, "validation": validation,
             "stopped_by": "epochs" if epoch >= config.epochs else "max_steps",
             "latest_checkpoint": str(run_dir / "latest.pt"), "best_checkpoint": str(run_dir / "best.pt"),
+            "elapsed_seconds": time.perf_counter() - started,
+            "epochs_requested": config.epochs, "epochs_completed_this_run": epoch - initial_epoch,
+            "training_steps_processed": global_step - initial_step,
+            "training_windows_processed": training_windows, "validation_windows_processed": validation_windows,
+            "dataset_windows": {"train": runtime["train_loader"]["dataset_size"], "validation": runtime["validation_loader"]["dataset_size"]},
         })
     finally:
         if lock is not None:

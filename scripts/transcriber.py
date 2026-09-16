@@ -3,10 +3,12 @@
 import argparse
 from collections import Counter
 from dataclasses import asdict, fields
+from datetime import datetime
 import math
 from pathlib import Path
 import random
 import sys
+import time
 
 import numpy as np
 import scipy
@@ -137,24 +139,66 @@ def preflight(args):
     return report
 
 
+def log_progress(message):
+    print(f"[{datetime.now():%H:%M:%S}] {message}", flush=True)
+
+
+def print_training_summary(result, summary_path):
+    from .transcriber_runtime import format_duration
+
+    records, windows = result["dataset_recordings"], result["dataset_windows"]
+    lines = [
+        "", "Training summary",
+        f"  Total elapsed: {format_duration(result['elapsed_seconds'])} (setup {format_duration(result['setup_seconds'])}; training/validation {format_duration(result['training_elapsed_seconds'])})",
+        f"  Dataset: {records['train']} training recordings / {windows['train']} windows; {records['validation']} validation recordings / {windows['validation']} windows",
+        f"  Window visits this invocation: {result['training_windows_processed']} training; {result['validation_windows_processed']} validation (includes repeated passes)",
+        f"  Optimizer steps: {result['training_steps_processed']} this invocation; {result['global_step']} total",
+        f"  Completed epochs: {result['epoch']}/{result['epochs_requested']} ({result['epochs_completed_this_run']} this invocation)",
+        f"  Stopped by: {result['stopped_by']}",
+        f"  Validation loss: {result['validation']['loss']:.6f}; best {result['best_score']:.6f}",
+        f"  Latest checkpoint: {result['latest_checkpoint']}",
+        f"  Best checkpoint: {result['best_checkpoint']}",
+        f"  Saved summary: {summary_path}",
+    ]
+    print("\n".join(lines), flush=True)
+
+
 def train(args):
     from .transcriber_model import FingerstyleTranscriber
     from .transcriber_runtime import resolve_device, run_training
+    started = time.perf_counter()
     config, features, model_config, training = load_config(args.config)
     torch.set_num_threads(config["data"]["num_threads"])
     device = resolve_device(training.device)
     seed_everything(training.seed)
+    step_cap = training.max_steps if training.max_steps is not None else "none"
+    log_progress(f"Setup: device {device} | CPU threads {config['data']['num_threads']} | batch size {config['data']['batch_size']} | epochs {training.epochs} | step cap {step_cap}")
+    log_progress("Loading training data...")
     train_data = make_dataset(config, features, model_config, "train", args.data_root, args.manifest)
+    log_progress(f"Loaded {len(train_data)} training windows from {len(train_data.records)} recordings.")
+    log_progress("Loading validation data...")
     validation_data = make_dataset(config, features, model_config, "validation", args.data_root, args.manifest)
+    log_progress(f"Loaded {len(validation_data)} validation windows from {len(validation_data.records)} recordings.")
     if train_data.manifest_sha256 != validation_data.manifest_sha256:
         raise HarnessError("Training and validation reference different releases.")
     model = FingerstyleTranscriber(model_config)
     identity = run_identity(train_data, config, features, model_config, training, device)
+    run_dir = private_output(args.run_dir, args.data_root)
+    train_loader = make_loader(train_data, config, training, shuffle=True)
+    validation_loader = make_loader(validation_data, config, training, shuffle=False)
+    setup_seconds = time.perf_counter() - started
     result = run_training(
-        model, make_loader(train_data, config, training, shuffle=True), make_loader(validation_data, config, training, shuffle=False),
-        training, private_output(args.run_dir, args.data_root), identity, resume=args.resume,
+        model, train_loader, validation_loader,
+        training, run_dir, identity, resume=args.resume, progress=log_progress,
     )
-    print(result)
+    result.update(
+        training_elapsed_seconds=result["elapsed_seconds"], elapsed_seconds=time.perf_counter() - started,
+        setup_seconds=setup_seconds,
+        dataset_recordings={"train": len(train_data.records), "validation": len(validation_data.records)},
+    )
+    summary_path = run_dir / "summary.json"
+    publish_json(summary_path, result)
+    print_training_summary(result, summary_path)
     return result
 
 
