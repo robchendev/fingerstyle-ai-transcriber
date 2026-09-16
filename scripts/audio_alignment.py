@@ -6,6 +6,7 @@ from numbers import Integral, Real
 
 import numpy as np
 from scipy.fft import rfft, rfftfreq
+from scipy.signal import find_peaks
 
 
 class AlignmentError(ValueError):
@@ -285,6 +286,59 @@ def _information(chroma, onset):
     onset_regions = int(np.count_nonzero(active & ~np.concatenate(([False], active[:-1]))))
     changes = int(np.count_nonzero(np.linalg.norm(np.diff(chroma, axis=0), axis=1) >= 0.35))
     return onset_regions, changes
+
+
+def align_first_attack(reference, audio, *, first_reference_seconds, max_cells=60_000_000, warp_penalty=0.08):
+    """Anchor the earliest plausible attack, then match the remaining sequence.
+
+    Spectral-flux peaks, activity and first-event pitch evidence propose an attack;
+    this is not a musical approval or a waveform trim. Quiet/ambiguous openings
+    can require human correction. Unmatched prefixes never become silence labels.
+    """
+    reference_chroma = _validate_features(reference, "reference")
+    audio_chroma = _validate_features(audio, "audio")
+    first_reference_seconds = _number(first_reference_seconds, "first_reference_seconds")
+    if not 0 <= first_reference_seconds <= reference.times[-1]:
+        raise AlignmentError("First notated attack is outside the score reference.")
+    reference_index = int(np.argmin(np.abs(reference.times - first_reference_seconds)))
+    if reference_index >= len(reference.times) - 1 or reference.onset[reference_index] < .1:
+        raise AlignmentError("First notated attack has no usable reference onset cue.")
+    peaks, _ = find_peaks(np.r_[0., audio.onset, 0.], height=.12, prominence=.06, distance=2)
+    peaks = peaks - 1
+    peaks = peaks[(peaks >= 0) & (peaks < len(audio.times) - 1)]
+    present = bool(np.any(reference_chroma[reference_index] > 0))
+    similarity = audio_chroma[peaks] @ reference_chroma[reference_index]
+    eligible = (audio.activity[peaks] >= .025) & (audio.times[peaks] <= 15)
+    if present:
+        eligible &= similarity >= .35
+    matches = peaks[eligible]
+    if not len(matches):
+        raise AlignmentError("No plausible first attack in the first 15 seconds; an explicit reviewed anchor is needed.")
+    audio_index = int(matches[0])
+
+    def suffix(features, start):
+        return Features(features.times[start:] - features.times[start], features.chroma[start:], features.onset[start:], features.activity[start:])
+
+    result = align_features(suffix(reference, reference_index), suffix(audio, audio_index), max_cells=max_cells, warp_penalty=warp_penalty)
+    result["reference_indices"] += reference_index
+    result["audio_indices"] += audio_index
+    result["fixedFrameAnchors"] = [(reference_index, audio_index)]
+    result["diagnostics"].update(
+        algorithm="first_attack_then_full_dtw",
+        mode="first-attack",
+        reference_frame_range=[reference_index, len(reference.times) - 1],
+        audio_frame_range=[audio_index, len(audio.times) - 1],
+        reference_coverage_fraction=(len(reference.times) - reference_index) / len(reference.times),
+        audio_coverage_fraction=(len(audio.times) - audio_index) / len(audio.times),
+        first_attack_reference_seconds=float(reference.times[reference_index]),
+        first_attack_audio_seconds=float(audio.times[audio_index]),
+        first_attack_onset_strength=float(audio.onset[audio_index]),
+        first_attack_pitch_similarity=float(audio_chroma[audio_index] @ reference_chroma[reference_index]) if present else None,
+        first_attack_is_human_approved=False,
+    )
+    if audio_index:
+        result["diagnostics"]["flags"].append("unmatched_audio_lead_in")
+    return result
 
 
 def align_features(reference, audio, *, mode="global", max_cells=60_000_000, warp_penalty=0.08):

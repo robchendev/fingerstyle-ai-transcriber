@@ -171,6 +171,48 @@ class ReferenceFeatureTests(unittest.TestCase):
                 reference_features([event], duration)
 
 
+class FirstAttackTests(unittest.TestCase):
+    def test_lead_in_does_not_advance_score_and_late_music_is_retained(self):
+        from scripts.audio_alignment import align_first_attack
+        reference = feature_sequence([0, 4, 7, 2, 9, 0], onset=[1, 1, 1, 1, 1, 1])
+        audio = feature_sequence([None] * 5 + [0, 4, 7, 2, 9, 0], onset=[0] * 5 + [1, 0, 1, 0, 1, 0])
+        before = audio.times.copy()
+        result = align_first_attack(reference, audio, first_reference_seconds=0)
+        self.assertEqual((result["reference_indices"][0], result["audio_indices"][0]), (0, 5))
+        self.assertEqual((result["reference_indices"][-1], result["audio_indices"][-1]), (5, 10))
+        self.assertEqual(result["fixedFrameAnchors"], [(0, 5)])
+        self.assertEqual(result["diagnostics"]["first_attack_audio_seconds"], .25)
+        self.assertFalse(result["diagnostics"]["first_attack_is_human_approved"])
+        np.testing.assert_array_equal(audio.times, before)
+
+    def test_earliest_compatible_attack_not_loudest_later_attack_or_wrong_pitch_noise(self):
+        from scripts.audio_alignment import align_first_attack
+        reference = feature_sequence([0, 4, 7, 2, 9], onset=[1, 0, 1, 0, 1])
+        audio = feature_sequence([11, None, 0, 4, 7, 2, 9], onset=[1, 0, .25, 0, 1, 0, .8])
+        result = align_first_attack(reference, audio, first_reference_seconds=0)
+        self.assertEqual(result["audio_indices"][0], 2)
+        self.assertEqual(result["diagnostics"]["first_attack_onset_strength"], .25)
+
+    def test_leading_score_rest_is_not_mistaken_for_first_attack_or_deleted(self):
+        from scripts.audio_alignment import align_first_attack
+        reference = feature_sequence([None, None, 0, 4, 7, 2], onset=[0, 0, 1, 0, 1, 0])
+        audio = feature_sequence([None, None, 0, 4, 7, 2], onset=[0, 0, 1, 0, 1, 0])
+        result = align_first_attack(reference, audio, first_reference_seconds=.1)
+        self.assertEqual(result["reference_indices"][0], 2)
+        self.assertEqual(result["audio_indices"][0], 2)
+        self.assertLess(result["diagnostics"]["reference_coverage_fraction"], 1)
+        self.assertEqual(len(reference.times), 6)
+
+    def test_no_attack_does_not_fall_back_to_file_zero(self):
+        from scripts.audio_alignment import align_first_attack
+        reference = feature_sequence([0, 4, 7], onset=[1, 0, 1])
+        audio = feature_sequence([0, 4, 7], onset=[0, 0, 0])
+        with self.assertRaisesRegex(AlignmentError, "No plausible first attack"):
+            align_first_attack(reference, audio, first_reference_seconds=0)
+        with self.assertRaisesRegex(AlignmentError, "reference onset"):
+            align_first_attack(reference, audio, first_reference_seconds=.05)
+
+
 class DtwTests(unittest.TestCase):
     def assert_complete_path(self, result, n, m, mode):
         r, a = result["reference_indices"], result["audio_indices"]
