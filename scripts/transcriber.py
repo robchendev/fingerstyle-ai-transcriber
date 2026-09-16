@@ -37,7 +37,7 @@ def default_config():
     return {
         "schemaVersion": 1, "features": asdict(FeatureConfig()), "model": asdict(ModelConfig()),
         "training": asdict(TrainingConfig()),
-        "data": {"manifest": "data\\releases\\pilot-v1\\manifest.json", "batch_size": 4, "num_workers": 0, "num_threads": 4, "cache": "cache\\transcriber"},
+        "data": {"manifest": "data\\releases\\pilot-v2\\manifest.json", "batch_size": 4, "num_workers": 0, "num_threads": 4, "cache": "cache\\transcriber"},
     }
 
 
@@ -94,7 +94,7 @@ def run_identity(dataset, config, features, model, training, device):
     settings = asdict(training)
     settings.pop("epochs", None)
     settings.pop("max_steps", None)
-    modules = ("transcriber.py", "transcriber_audio.py", "transcriber_data.py", "transcriber_model.py", "transcriber_runtime.py", "dataset_release.py", "training_windows.py", "score_alignment.py", "dataset_io.py", "canonical_events.py", "gp_events.py", "inspect_gp_files.py", "settings.py")
+    modules = ("transcriber.py", "transcriber_audio.py", "transcriber_data.py", "transcriber_model.py", "transcriber_runtime.py", "transcriber_events.py", "dataset_release.py", "training_windows.py", "score_alignment.py", "dataset_io.py", "canonical_events.py", "gp_events.py", "inspect_gp_files.py", "settings.py")
     return {
         "schemaVersion": 1, "manifest_sha256": dataset.manifest_sha256,
         "features": asdict(features), "model": asdict(model), "training": settings,
@@ -160,12 +160,16 @@ def print_training_summary(result, summary_path):
         f"  Best checkpoint: {result['best_checkpoint']}",
         f"  Saved summary: {summary_path}",
     ]
+    if result.get("best_event_checkpoint"):
+        lines.insert(-1, f"  Best decoded-event checkpoint: {result['best_event_checkpoint']} | score {result['best_event_score']:.6f}")
+        lines.insert(4, f"  Additional decoded-event validation window visits: {result['event_validation_windows_processed']}")
     print("\n".join(lines), flush=True)
 
 
 def train(args):
     from .transcriber_model import FingerstyleTranscriber
     from .transcriber_runtime import resolve_device, run_training
+    from .transcriber_events import checkpoint_event_score, evaluate_events
     started = time.perf_counter()
     config, features, model_config, training = load_config(args.config)
     torch.set_num_threads(config["data"]["num_threads"])
@@ -187,9 +191,14 @@ def train(args):
     train_loader = make_loader(train_data, config, training, shuffle=True)
     validation_loader = make_loader(validation_data, config, training, shuffle=False)
     setup_seconds = time.perf_counter() - started
+
+    def event_evaluator(current_model):
+        report = evaluate_events(current_model, validation_data, device, tolerances=(.1,), progress=log_progress)
+        return checkpoint_event_score(report)
+
     result = run_training(
         model, train_loader, validation_loader,
-        training, run_dir, identity, resume=args.resume, progress=log_progress,
+        training, run_dir, identity, resume=args.resume, progress=log_progress, event_evaluator=event_evaluator,
     )
     result.update(
         training_elapsed_seconds=result["elapsed_seconds"], elapsed_seconds=time.perf_counter() - started,
@@ -235,6 +244,49 @@ def evaluate(args):
     return report
 
 
+def evaluate_decoded_events(args):
+    from .transcriber_model import ModelConfig, PERCUSSION_TYPES
+    from .transcriber_events import evaluate_events
+
+    checkpoint_hash = sha256(Path(args.checkpoint))
+    implementation = {path.name: sha256(path) for path in Path(__file__).parent.glob("*.py")}
+    model, checkpoint, device = checkpoint_model(args.checkpoint, args.device)
+    identity = checkpoint["identity"]
+    config = default_config()
+    torch.set_num_threads(config["data"]["num_threads"])
+    dataset = make_dataset(config, FeatureConfig(**identity["features"]), ModelConfig(**identity["model"]), args.split, args.data_root, args.manifest)
+    report = evaluate_events(model, dataset, device, tolerances=args.tolerances, onset_threshold=args.onset_threshold, percussion_threshold=args.percussion_threshold, progress=log_progress)
+    if sha256(Path(args.checkpoint)) != checkpoint_hash:
+        raise HarnessError("Checkpoint changed during event evaluation.")
+    if implementation != {path.name: sha256(path) for path in Path(__file__).parent.glob("*.py")}:
+        raise HarnessError("Implementation changed during event evaluation.")
+    report.update(
+        checkpointSha256=checkpoint_hash, manifestSha256=dataset.manifest_sha256, split=args.split,
+        trainingManifestSha256=identity["manifest_sha256"], sameReleaseAsTraining=dataset.manifest_sha256 == identity["manifest_sha256"],
+        developmentOnly=True,
+        implementationSha256=implementation,
+        runtime={"torch": str(torch.__version__), "numpy": np.__version__, "scipy": scipy.__version__, "soundfile": sf.__version__},
+    )
+    output_path = private_output(args.output, args.data_root)
+    publish_json(output_path, report)
+    print("Decoded-event evaluation (masked coverage)")
+    for tolerance, metrics in report["metricsByToleranceSeconds"].items():
+        joint = metrics["string_fret_pitch_onset"]
+        pitch = metrics["string_pitch_onset"]
+        joint_text = f"{joint['f1']:.3f}" if joint["f1"] is not None else "unavailable"
+        pitch_text = f"{pitch['f1']:.3f}" if pitch["f1"] is not None else "unavailable"
+        print(f"  {float(tolerance) * 1000:g} ms: string/pitch F1 {pitch_text}; string/fret/pitch F1 {joint_text}")
+        percussion = [metrics[name] for name in PERCUSSION_TYPES if metrics[name]["has_negative_coverage"]]
+        if percussion:
+            tp, fp, fn = (sum(item[key] for item in percussion) for key in ("true_positive", "false_positive", "false_negative"))
+            f1 = f"{2 * tp / (2 * tp + fp + fn):.3f}" if 2 * tp + fp + fn else "unavailable"
+            print(f"    Percussion F1 {f1} | matched {tp}, extra {fp}, missed {fn}")
+        else:
+            print("    Percussion precision/F1 unavailable: no confirmed negative coverage.")
+    print(f"Saved event report: {output_path}")
+    return report
+
+
 def inference_metadata(value):
     required = {"openStringMidi", "capoFret", "tempo", "timeSignature"}
     if not isinstance(value, dict) or not required <= set(value) or set(value) - required - {"tempoChanges", "timeSignatureChanges"}:
@@ -261,6 +313,7 @@ def inference_metadata(value):
 
 def infer(args):
     from .transcriber_model import decode_events
+    from .transcriber_events import OutputTimeline
     model, checkpoint, device = checkpoint_model(args.checkpoint, args.device)
     torch.set_num_threads(4)
     metadata = read_json(Path(args.metadata))
@@ -275,7 +328,8 @@ def infer(args):
     if not 0 < duration <= 900 or not 1 <= info.channels <= 8:
         raise HarnessError("Inference audio must be nonempty, at most 15 minutes, and have one to eight channels.")
     total_frames = math.ceil(duration / config.hop_seconds)
-    accumulators, total_weight = {}, torch.zeros(total_frames)
+    frame_times = np.arange(total_frames) * config.hop_seconds
+    timeline = OutputTimeline(frame_times)
     stride_frames = max(1, round(6 / config.hop_seconds))
     window_frames = max(stride_frames, round(8 / config.hop_seconds))
     peak = 0.
@@ -290,24 +344,14 @@ def infer(args):
             conditioning = conditioning_features(metadata["openStringMidi"], metadata["capoFret"], tempos, meters, times)
             outputs = model(features[None].to(device), conditioning[None].to(device), torch.tensor([len(features)], dtype=torch.long))
             count = min(len(features), total_frames - start_frame)
-            weight = torch.hann_window(max(count, 2), periodic=False)[:count].clamp_min(.05)
-            for name, value in outputs.items():
-                value = value[0, :count].detach().cpu()
-                if not torch.isfinite(value).all():
-                    raise HarnessError("Inference produced nonfinite predictions.")
-                if name not in accumulators:
-                    accumulators[name] = torch.zeros((total_frames, *value.shape[1:]), dtype=value.dtype)
-                broadcast = weight.view(count, *([1] * (value.ndim - 1)))
-                accumulators[name][start_frame:start_frame + count] += value * broadcast
-            total_weight[start_frame:start_frame + count] += weight
+            timeline.add({name: value[0, :count] for name, value in outputs.items()}, times[:count], stop_sample / rate)
             if start_frame + count == total_frames:
                 break
     if peak <= 1e-8:
         raise HarnessError("Input audio is silent; no transcription hypotheses were published.")
-    if torch.any(total_weight <= 0) or sha256(audio_path) != audio_hash:
-        raise HarnessError("Inference coverage is incomplete or the audio changed during processing.")
-    outputs = {name: value / total_weight.view(total_frames, *([1] * (value.ndim - 1))) for name, value in accumulators.items()}
-    events = decode_events(outputs, torch.arange(total_frames) * config.hop_seconds, tuning=metadata["openStringMidi"], capo=metadata["capoFret"], onset_threshold=args.onset_threshold, percussion_threshold=args.percussion_threshold)
+    if sha256(audio_path) != audio_hash:
+        raise HarnessError("Audio changed during inference.")
+    events = decode_events(timeline.finish(), torch.tensor(frame_times), tuning=metadata["openStringMidi"], capo=metadata["capoFret"], onset_threshold=args.onset_threshold, percussion_threshold=args.percussion_threshold)
     report = {
         "schemaVersion": 1, "kind": "fingerstyle-transcription-hypotheses", "visibility": "private", "distributionAuthorized": False,
         "audioSha256": audio_hash, "checkpointSha256": sha256(Path(args.checkpoint)),
@@ -325,7 +369,7 @@ def main(argv=None):
     commands = parser.add_subparsers(dest="command", required=True)
     configure = commands.add_parser("config", help="Write a generic local configuration.")
     configure.add_argument("--output", default="runs/config.json")
-    for name in ("preflight", "train", "evaluate"):
+    for name in ("preflight", "train", "evaluate", "evaluate-events"):
         command = commands.add_parser(name)
         command.add_argument("--data-root", default=str(ROOT))
         command.add_argument("--manifest")
@@ -341,7 +385,11 @@ def main(argv=None):
             command.add_argument("--checkpoint", required=True)
             command.add_argument("--split", choices=("train", "validation"), default="validation")
             command.add_argument("--device", default="auto")
-            command.add_argument("--output", default="runs/evaluation.json")
+            command.add_argument("--output", default="runs/event-evaluation.json" if name == "evaluate-events" else "runs/evaluation.json")
+            if name == "evaluate-events":
+                command.add_argument("--tolerances", nargs="+", type=float, default=[.05, .1, .2])
+                command.add_argument("--onset-threshold", type=float, default=.5)
+                command.add_argument("--percussion-threshold", type=float, default=.5)
     inference = commands.add_parser("infer")
     inference.add_argument("--data-root", default=str(ROOT))
     inference.add_argument("--checkpoint", required=True)
@@ -357,7 +405,7 @@ def main(argv=None):
             publish_json(private_output(args.output), default_config())
             print("Generic configuration written under the private runs directory.")
         else:
-            {"preflight": preflight, "train": train, "evaluate": evaluate, "infer": infer}[args.command](args)
+            {"preflight": preflight, "train": train, "evaluate": evaluate, "evaluate-events": evaluate_decoded_events, "infer": infer}[args.command](args)
     except (HarnessError, OSError, ValueError, RuntimeError) as error:
         print(f"Transcriber error: {error}", file=sys.stderr)
         return 1

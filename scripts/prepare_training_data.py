@@ -25,7 +25,8 @@ from .dataset_release import candidate_digest, mapping_risks, release_scope, val
 from .gp_events import catalog_timing, decode_score, performance_events, playback_order
 from .gp_normalization import normalize_gp_bytes
 from .inspect_gp_files import GpInspectionError, inspect_gp, read_gp
-from .training_windows import projected_targets, sample_windows, targets_in_window
+from .percussion_supervision import percussion_annotation_coverage
+from .training_windows import projected_targets, range_sample_bounds, sample_windows, targets_in_window
 from .score_alignment import AlignmentInputError, ScoreClock, candidate_mapping, matching_events
 
 
@@ -42,7 +43,7 @@ ARTIFACTS = (RAW_GP_NAME, TRIMMED_AUDIO_NAME, "normalized.gp", "events.json", "c
 CODE_FILES = (
     "prepare_training_data.py", "inspect_gp_files.py", "gp_events.py", "canonical_events.py",
     "gp_normalization.py", "settings.py", "audio_alignment.py", "score_alignment.py",
-    "training_windows.py", "dataset_release.py", "dataset_io.py", "audio_tools.py",
+    "training_windows.py", "dataset_release.py", "dataset_io.py", "audio_tools.py", "percussion_supervision.py",
 )
 
 
@@ -130,7 +131,8 @@ def selection(workspace, identifiers=None):
     if identifiers is not None:
         if not identifiers or len(identifiers) != len(set(identifiers)) or set(identifiers) - {pair["id"] for pair in pairs}:
             raise ValueError("Requested IDs must be a unique subset of pairs.json.")
-        pairs = [pair for pair in pairs if pair["id"] in identifiers]
+        by_id = {pair["id"]: pair for pair in pairs}
+        pairs = [by_id[identifier] for identifier in identifiers]
     if not pairs:
         raise ValueError("No local pairs selected; use add or edit pairs.json.")
     return pairs
@@ -556,6 +558,8 @@ def review_pair(workspace, pair, args):
     for option, field in CONFIRMATIONS.items():
         if getattr(args, option):
             approval[field] = True
+    if args.confirm_percussion_completeness:
+        approval["percussionAnnotationsComplete"] = True
     if args.acknowledge_uncertainty:
         approval["uncertaintyAcknowledged"] = True
     if approval.get("approveExperimentalRangesAndSplit") and not ranges:
@@ -568,7 +572,7 @@ def review_pair(workspace, pair, args):
         preparationSha256=candidate_digest(state), candidateSha256=candidate_digest(candidate),
         anchors=anchors, candidate=candidate, requestedClipRanges=approved, excludedClipRanges=excluded, approval=approval,
     )
-    editing = bool(args.anchor or args.clear_anchors or args.approve_range is not None or args.clear_ranges or args.exclude_range is not None or args.clear_exclusions or args.split or args.acknowledge_uncertainty or any(getattr(args, option) for option in CONFIRMATIONS))
+    editing = bool(args.anchor or args.clear_anchors or args.approve_range is not None or args.clear_ranges or args.exclude_range is not None or args.clear_exclusions or args.split or args.acknowledge_uncertainty or args.confirm_percussion_completeness or any(getattr(args, option) for option in CONFIRMATIONS))
     if editing:
         if not args.reviewer or not args.reviewer.strip():
             raise ValueError("Recording a decision requires --reviewer with your human reviewer identity.")
@@ -639,11 +643,12 @@ def release_dataset(workspace, version, validation_group, identifiers=None, *, r
         if ranges != approval.get("approvedClipRanges") or approval.get("candidateSha256") != candidate_digest(candidate) or approval.get("sourceGpSha256") != state["inputs"]["sourceGpSha256"] or approval.get("audioSha256") != state["audio"]["sha256"]:
             raise ValueError("Human approval no longer matches this source, candidate or approved ranges.")
         rate = state["audio"]["sampleRate"]
-        spans = [(math.ceil(a * rate), math.floor(b * rate)) for a, b in ranges]
+        spans = range_sample_bounds(ranges, rate)
         notes, gestures = projected_targets(labels, candidate, clock)
+        percussion_coverage = percussion_annotation_coverage(labels, candidate, normalization) if approval.get("percussionAnnotationsComplete") is True else None
         windows = [{
             "windowId": f"{pair['id']}:{start}-{stop}", "startSample": start, "stopSampleExclusive": stop,
-            "targets": targets_in_window(notes, gestures, start, stop, rate),
+            "targets": targets_in_window(notes, gestures, start, stop, rate, percussion_coverage=percussion_coverage),
         } for start, stop in sample_windows(spans, rate)]
         if not windows:
             raise ValueError(f"{pair['id']}: no approved windows of at least two seconds remain.")
@@ -766,6 +771,7 @@ def parser():
     review.add_argument("--split", choices=("train", "validation"))
     for option in CONFIRMATIONS:
         review.add_argument("--" + option.replace("_", "-"), action="store_true")
+    review.add_argument("--confirm-percussion-completeness", action="store_true", help="Confirm exhaustive intended O/X/ghost(X) percussion annotations for this source; negatives remain censored where notation/timing is unresolved. Does not grant other approvals.")
     review.add_argument("--acknowledge-uncertainty", action="store_true")
     review.add_argument("--cue", action="append", help="Generate plain/cued WAV for an ordinal, first-attack or end.")
     review.add_argument("--listen", action="store_true", help="Open requested cue WAVs in the Windows default player.")
@@ -807,4 +813,6 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
     raise SystemExit(main())

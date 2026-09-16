@@ -9,6 +9,7 @@ import re
 import soundfile as sf
 
 from .dataset_io import read_json, sha256
+from .percussion_supervision import percussion_annotation_coverage
 from .training_windows import projected_targets, targets_in_window
 from .score_alignment import ScoreClock
 
@@ -33,6 +34,7 @@ def release_scope(records):
         "candidateSha256": payload["approval"]["candidateSha256"],
         "approvedClipRanges": payload["approval"]["approvedClipRanges"],
         "windowsSha256": candidate_digest(payload["windows"]),
+        **({"percussionAnnotationsComplete": payload["approval"]["percussionAnnotationsComplete"]} if "percussionAnnotationsComplete" in payload["approval"] else {}),
     } for entry, payload in records]
 
 
@@ -120,6 +122,10 @@ def _validate_payload(entry, payload):
     approval = payload["approval"]
     if not isinstance(approval, dict) or any(approval.get(field) is not True for field in _CONFIRMATIONS):
         raise ValueError("Release requires explicit source, notation, range, use and grouping approval.")
+    if "percussionAnnotationsComplete" in approval and type(approval["percussionAnnotationsComplete"]) is not bool:
+        raise ValueError("Percussion completeness approval must be an explicit boolean.")
+    if approval.get("percussionAnnotationsComplete") is True and (not isinstance(approval.get("reviewer"), str) or not approval["reviewer"].strip()):
+        raise ValueError("Percussion completeness requires a source-bound human reviewer.")
     if approval.get("groupId") != entry["groupId"] or approval.get("split") != entry["split"]:
         raise ValueError("Reviewed grouping or split differs from the released recording.")
     _digest(approval["sourceGpSha256"], "Source GP hash")
@@ -149,6 +155,7 @@ def _validate_payload(entry, payload):
             raise ValueError("Approved ranges must be ordered, nonoverlapping and inside the mapping.")
         previous_end = right
     notes, gestures = projected_targets(labels, payload["candidate"], clock)
+    percussion_coverage = percussion_annotation_coverage(labels, payload["candidate"], normalization) if approval.get("percussionAnnotationsComplete") is True else None
     windows = payload["windows"]
     if not isinstance(windows, list) or not windows:
         raise ValueError("Each released recording requires nonempty windows.")
@@ -167,7 +174,7 @@ def _validate_payload(entry, payload):
         left, right = start / entry["sampleRate"], stop / entry["sampleRate"]
         if not any(a <= left < right <= b for a, b in ranges):
             raise ValueError("A released window crosses an unapproved interval.")
-        expected = targets_in_window(notes, gestures, start, stop, entry["sampleRate"])
+        expected = targets_in_window(notes, gestures, start, stop, entry["sampleRate"], percussion_coverage=percussion_coverage)
         if candidate_digest(window["targets"]) != candidate_digest(expected):
             raise ValueError("Released targets or uncertainty masks differ from canonical projection.")
 

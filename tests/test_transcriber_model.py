@@ -116,6 +116,21 @@ class ModelTests(unittest.TestCase):
                     self.assertEqual(torch.count_nonzero(features.grad[row, length:]).item(), 0)
                     self.assertEqual(torch.count_nonzero(conditioning.grad[row, length:]).item(), 0)
 
+    def test_pilot_architecture_keeps_parameter_count_and_strict_state_loading(self):
+        config = ModelConfig()
+        model = FingerstyleTranscriber(config)
+        self.assertEqual(sum(parameter.numel() for parameter in model.parameters()), 891623)
+        self.assertEqual(model.head_shapes["percussion_logits"], (3,))
+        clone = FingerstyleTranscriber(config)
+        clone.load_state_dict(model.state_dict(), strict=True)
+        features, conditioning = torch.zeros(1, 3, 96), torch.zeros(1, 3, 12)
+        model.eval()
+        clone.eval()
+        with torch.no_grad():
+            original, restored = model(features, conditioning), clone(features, conditioning)
+        for name in original:
+            self.assertTrue(torch.equal(original[name], restored[name]), name)
+
     def test_padding_does_not_change_real_frames(self):
         model = FingerstyleTranscriber(ModelConfig(n_mels=9, hidden_size=8, recurrent_layers=1, dropout=0)).eval()
         features = torch.randn(2, 8, 9)
@@ -221,14 +236,109 @@ class MaskedLossTests(unittest.TestCase):
         self.assertAlmostEqual(negative_only.item(), negative, places=6)
         self.assertEqual(stats["note_onset_positive"]["count"], 0)
 
-    def test_positive_only_heads_reject_masked_negatives(self):
-        for name in ("harmonic", "percussion"):
-            outputs = synthetic_outputs()
-            targets, masks, valid = synthetic_targets()
-            targets[name][0, 0, 0] = 0
-            masks[name][0, 0, 0] = True
-            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "positive-only"):
-                masked_loss(outputs, targets, masks, valid)
+    def test_harmonic_still_rejects_masked_negatives(self):
+        outputs = synthetic_outputs()
+        targets, masks, valid = synthetic_targets()
+        targets["harmonic"][0, 0, 0] = 0
+        masks["harmonic"][0, 0, 0] = True
+        with self.assertRaisesRegex(ValueError, "positive-only"):
+            masked_loss(outputs, targets, masks, valid)
+
+    def test_percussion_observed_negatives_train_but_unknowns_and_padding_do_not(self):
+        outputs = synthetic_outputs(1, 4, requires_grad=True)
+        targets, masks, valid = synthetic_targets(1, 4)
+        targets["percussion"][0, :2, 0] = torch.tensor([1., 0.])
+        masks["percussion"][0, :2, 0] = True
+        targets["percussion"][0, 2, 0] = 0
+        masks["percussion"][0, 3] = True
+        valid[0, 3] = False
+        loss, stats = masked_loss(outputs, targets, masks, valid)
+        self.assertAlmostEqual(loss.item(), math.log(2), places=6)
+        for name in ("percussion_positive", "percussion_negative"):
+            self.assertEqual(stats[name]["count"], 1)
+            self.assertAlmostEqual(stats[name]["sum"], math.log(2), places=6)
+        self.assertEqual(stats["percussion_sparsity"]["count"], 0)
+        loss.backward()
+        gradient = outputs["percussion_logits"].grad
+        self.assertAlmostEqual(gradient[0, 0, 0].item(), -5 / 12, places=6)
+        self.assertAlmostEqual(gradient[0, 1, 0].item(), 1 / 12, places=6)
+        self.assertEqual(torch.count_nonzero(gradient).item(), 2)
+
+    def test_constant_all_positive_percussion_has_strong_negative_loss_and_gradient(self):
+        outputs = synthetic_outputs(1, 20)
+        targets, masks, valid = synthetic_targets(1, 20)
+        logit = torch.tensor(8., requires_grad=True)
+        outputs["percussion_logits"] = logit.expand(1, 20, 3)
+        targets["percussion"].zero_()
+        masks["percussion"].fill_(True)
+        targets["percussion"][0, 0, 0] = 1
+        loss, stats = masked_loss(outputs, targets, masks, valid)
+        self.assertEqual(stats["percussion_positive"]["count"], 1)
+        self.assertEqual(stats["percussion_negative"]["count"], 59)
+        self.assertEqual(stats["percussion_sparsity"]["count"], 0)
+        self.assertGreater(loss.item(), 7)
+        expected = (5 * stats["percussion_positive"]["sum"] + stats["percussion_negative"]["sum"]) / (5 + 59)
+        self.assertAlmostEqual(loss.item(), expected, places=6)
+        loss.backward()
+        self.assertGreater(logit.grad.item(), .9)
+
+    def test_negative_only_percussion_batches_update_without_a_sparsity_prior(self):
+        outputs = synthetic_outputs(1, 3, requires_grad=True)
+        targets, masks, valid = synthetic_targets(1, 3)
+        targets["percussion"][0, 1, 2] = 0
+        masks["percussion"][0, 1, 2] = True
+        optimizer = torch.optim.SGD([outputs["percussion_logits"]], lr=.1)
+        loss, stats = masked_loss(outputs, targets, masks, valid)
+        self.assertAlmostEqual(loss.item(), math.log(2), places=6)
+        self.assertEqual(stats["percussion_positive"]["count"], 0)
+        self.assertEqual(stats["percussion_negative"]["count"], 1)
+        self.assertEqual(stats["percussion_sparsity"]["count"], 0)
+        loss.backward()
+        self.assertEqual(outputs["percussion_logits"].grad[0, 1, 2].item(), .5)
+        optimizer.step()
+        self.assertLess(outputs["percussion_logits"][0, 1, 2].item(), 0)
+        self.assertEqual(torch.count_nonzero(outputs["percussion_logits"]).item(), 1)
+
+    def test_positive_only_percussion_retains_exact_original_loss_and_gradient(self):
+        outputs = synthetic_outputs(2, 4, requires_grad=True)
+        outputs["percussion_logits"] = torch.linspace(-2, 3, 24).reshape(2, 4, 3).requires_grad_()
+        targets, masks, valid = synthetic_targets(2, 4)
+        valid[1, 2:] = False
+        for row, frame, axis in ((0, 1, 0), (0, 2, 2), (1, 0, 2)):
+            targets["percussion"][row, frame, axis] = 1
+            masks["percussion"][row, frame, axis] = True
+        prediction = outputs["percussion_logits"]
+        values = torch.nn.functional.binary_cross_entropy_with_logits(
+            prediction[masks["percussion"]], targets["percussion"][masks["percussion"]], reduction="none",
+        )
+        prior_mask = valid[..., None] & torch.tensor([True, False, True])
+        prior = prediction[prior_mask].sigmoid()
+        original_loss = values.sum() / values.numel() + .02 * (prior.sum() / prior.numel())
+        loss, stats = masked_loss(outputs, targets, masks, valid)
+        self.assertTrue(torch.equal(loss, original_loss))
+        self.assertEqual(stats["percussion_negative"], {"sum": 0., "count": 0})
+        original_gradient, = torch.autograd.grad(original_loss, prediction)
+        actual_gradient, = torch.autograd.grad(loss, prediction)
+        self.assertTrue(torch.equal(actual_gradient, original_gradient))
+
+    def test_percussion_prior_excludes_only_classes_with_observed_negatives(self):
+        outputs = synthetic_outputs(1, 4, requires_grad=True)
+        targets, masks, valid = synthetic_targets(1, 4)
+        valid[0, 3] = False
+        for frame, axis, label in ((0, 0, 1), (1, 0, 0), (1, 1, 1), (0, 2, 0), (3, 1, 0)):
+            targets["percussion"][0, frame, axis] = label
+            masks["percussion"][0, frame, axis] = True
+        targets["percussion"][0, 2, 1] = 0
+        with_prior, stats = masked_loss(outputs, targets, masks, valid, sparsity_weight=.2)
+        without_prior, _ = masked_loss(outputs, targets, masks, valid, sparsity_weight=0)
+        self.assertAlmostEqual((with_prior - without_prior).item(), .1, places=6)
+        self.assertEqual(stats["percussion_sparsity"], {"sum": 1.5, "count": 3})
+        with_prior.backward()
+        gradient = outputs["percussion_logits"].grad
+        self.assertGreater(gradient[0, 2, 1].item(), 0)
+        self.assertEqual(gradient[0, 2, 0].item(), 0)
+        self.assertEqual(gradient[0, 2, 2].item(), 0)
+        self.assertEqual(torch.count_nonzero(gradient[0, 3]).item(), 0)
 
     def test_priors_are_separate_and_only_use_evidenced_classes_and_known_attacks(self):
         outputs = synthetic_outputs(1, 4, requires_grad=True)
@@ -301,10 +411,18 @@ class MaskedLossTests(unittest.TestCase):
             masks[name][0, 0, 0] = True
         targets["note_onset"][0, 1, 0] = 0
         masks["note_onset"][0, 1, 0] = True
+        targets["percussion"][0, 1, 0] = 0
+        masks["percussion"][0, 1, 0] = True
         loss, stats = masked_loss(outputs, targets, masks, valid)
         means = {name: stat["sum"] / stat["count"] if stat["count"] else 0 for name, stat in stats.items()}
         reconstructed = LOSS_WEIGHTS["note_onset"] * (means["note_onset_positive"] + means["note_onset_negative"]) / 2
-        reconstructed += sum(weight * means[name] for name, weight in LOSS_WEIGHTS.items() if name != "note_onset")
+        percussion = ("percussion_positive", "percussion_negative")
+        reconstructed += sum(
+            weight * means[name] for name, weight in LOSS_WEIGHTS.items() if name not in ("note_onset", *percussion)
+        )
+        reconstructed += sum(LOSS_WEIGHTS[name] * stats[name]["sum"] for name in percussion) / sum(
+            LOSS_WEIGHTS[name] * stats[name]["count"] for name in percussion
+        )
         reconstructed += .02 * (means["harmonic_sparsity"] + means["percussion_sparsity"])
         self.assertAlmostEqual(loss.item(), reconstructed, places=5)
         for stat in stats.values():
@@ -330,7 +448,9 @@ class MaskedLossTests(unittest.TestCase):
         for name, invalid, error in (("fret", -1, ValueError), ("pitch", 128, ValueError),
                                      ("voice", 4, ValueError), ("harmonic_kind", 4, ValueError),
                                      ("harmonic_node", 6, ValueError), ("duration_log", -1, ValueError),
-                                     ("note_onset", .5, ValueError), ("harmonic", float("inf"), ValueError)):
+                                     ("note_onset", .5, ValueError), ("harmonic", float("inf"), ValueError),
+                                     ("percussion", .5, ValueError), ("percussion", -1, ValueError),
+                                     ("percussion", float("nan"), ValueError)):
             local_targets, local_masks, _ = synthetic_targets()
             local_targets[name][0, 0, 0] = invalid
             local_masks[name][0, 0, 0] = True
@@ -438,6 +558,7 @@ class EventDecoderTests(unittest.TestCase):
         self.assertEqual(decoded["notes"], [])
         self.assertEqual(decoded["percussion"], [])
         self.assertIn("not a confirmed negative", decoded["policy"]["presenceAbsence"])
+        self.assertEqual(PRESENCE_CALIBRATION, "unvalidated-model-scores")
         self.assertEqual(self.decode(event_outputs(3), torch.arange(3.))["notes"], [])
 
     def test_decoder_invalid_inputs_fail_explicitly(self):

@@ -13,6 +13,25 @@ MODEL = SimpleNamespace(max_fret=36, max_voices=4)
 
 
 class TargetEncodingTests(unittest.TestCase):
+    def test_confirmed_percussion_negatives_keep_gaps_boundaries_and_close_positives(self):
+        gestures = [
+            {"sourceGestureId": name, "technique": "wrist_thump", "onsetWindowSeconds": time, "supervisionMask": {"gesture": True, "onset": True}}
+            for name, time in (("a", .8), ("b", .84))
+        ]
+        source = {"targets": {"notes": [], "gestures": [{"id": name, "technique": "wrist_thump"} for name in ("a", "b")]}}
+        window = {"targets": {"notes": [], "gestures": gestures, "negativePercussionSupervision": True, "percussionAnnotationCoverage": [[.5, 1.], [1.2, 1.8]]}}
+        with patch.dict("sys.modules", {"scripts.transcriber_model": VOCABULARY}):
+            targets, masks, _ = encode_targets(window, source, np.arange(100) * .02, MODEL, negative_onsets_allowed=[True] * 6)
+        self.assertTrue(masks["percussion"][35].all())
+        self.assertFalse(targets["percussion"][35].any())
+        self.assertFalse(masks["percussion"][55].any())
+        self.assertFalse(masks["percussion"][5].any())
+        self.assertFalse(masks["percussion"][90].any())
+        self.assertFalse(masks["percussion"][39, 0])
+        self.assertTrue(masks["percussion"][40, 0])
+        self.assertTrue(masks["percussion"][42, 0])
+        self.assertEqual(int(targets["percussion"].sum()), 2)
+
     def source_note(self, identifier="n", **changes):
         return {"id": identifier, "labelMask": {"attack": True, "pitch": True, "fingering": True, "notatedDuration": True}, "sourceSegments": [{"harmonic": {"type": "Natural", "fret": [12, 1]}}], **changes}
 

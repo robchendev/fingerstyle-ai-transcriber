@@ -21,6 +21,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset, Sampler
 
 from scripts import transcriber_runtime as runtime
+from tests.test_transcriber_model import synthetic_outputs, synthetic_targets
 
 
 IDENTITY = {
@@ -33,12 +34,12 @@ IDENTITY = {
 WEIGHTS = {
     "note_onset": 1.0, "fret": 1.0, "pitch": 1.0, "voice": 0.25,
     "duration_log": 0.25, "harmonic_positive": 0.5, "harmonic_kind": 0.25,
-    "harmonic_node": 0.25, "percussion_positive": 1.0,
+    "harmonic_node": 0.25, "percussion_positive": 5.0, "percussion_negative": 1.0,
 }
 STAT_KEYS = (
     "note_onset_positive", "note_onset_negative", "fret", "pitch", "voice", "duration_log",
     "harmonic_positive", "harmonic_kind", "harmonic_node", "percussion_positive",
-    "harmonic_sparsity", "percussion_sparsity",
+    "percussion_negative", "harmonic_sparsity", "percussion_sparsity",
 )
 
 
@@ -87,6 +88,34 @@ class ToyDataset(Dataset):
             "masks": {"note_onset": torch.ones(3, dtype=torch.bool)},
             "valid_frames": torch.arange(3) < length,
             "metadata": "synthetic-not-model-conditioning",
+        }
+
+
+class PercussionDataset(Dataset):
+    def __len__(self):
+        return 3
+
+    def __getitem__(self, index):
+        length = 4 - index
+        targets, masks, _ = synthetic_targets(1, 4)
+        if index == 0:
+            labels = ((0, 0, 1), (1, 1, 1))
+        elif index == 1:
+            labels = ((0, 0, 0), (1, 0, 0), (2, 0, 0), (0, 1, 0), (2, 1, 1))
+        else:
+            labels = ((0, 0, 0), (1, 0, 0), (0, 1, 0), (1, 1, 0))
+        for frame, axis, label in labels:
+            targets["percussion"][0, frame, axis] = label
+            masks["percussion"][0, frame, axis] = True
+        targets["percussion"][0, 0, 2] = 0
+        masks["percussion"][0, length:] = True
+        return {
+            "features": (torch.arange(4, dtype=torch.float32) / 2 + 2 * index - 1)[:, None],
+            "conditioning": torch.zeros(4, 12),
+            "lengths": torch.tensor(length),
+            "valid_frames": torch.arange(4) < length,
+            "targets": {name: value[0] for name, value in targets.items()},
+            "masks": {name: value[0] for name, value in masks.items()},
         }
 
 
@@ -168,12 +197,13 @@ class RuntimeTests(unittest.TestCase):
         self.addCleanup(runtime._restore_rng, self.original_rng)
         self.config = runtime.TrainingConfig(epochs=2, max_steps=2, device="cpu")
 
-    def train(self, name="run", *, config=None, model=None, resume=None, pair=None, progress=None):
+    def train(self, name="run", *, config=None, model=None, resume=None, pair=None, progress=None,
+              event_evaluator=None):
         train, validation = loaders() if pair is None else pair
         model = toy_model() if model is None else model
         summary = runtime.run_training(
             model, train, validation, self.config if config is None else config,
-            self.root / name, IDENTITY, resume=resume, progress=progress,
+            self.root / name, IDENTITY, resume=resume, progress=progress, event_evaluator=event_evaluator,
         )
         return summary, model
 
@@ -238,8 +268,252 @@ class RuntimeTests(unittest.TestCase):
             with (self.root / "run" / filename).open(encoding="utf-8") as stream:
                 json.load(stream)
         self.assertTrue((self.root / "run" / "best.pt").is_file())
+        self.assertIsNone(summary["best_event_checkpoint"])
+        self.assertIsNone(summary["best_event_score"])
+        self.assertEqual(summary["event_validation_windows_processed"], 0)
+        for filename in ("best-events.pt", "event-selection.json"):
+            self.assertFalse((self.root / "run" / filename).exists())
         self.assertEqual(list((self.root / "run").glob("*.pending")), [])
         json.dumps(summary, allow_nan=False)
+
+    def test_event_checkpoint_selection_is_independent_of_loss_and_keeps_earliest_ties(self):
+        losses = iter((.9, .4, .2, .3))
+        evaluate = runtime.evaluate_model
+
+        def controlled_validation(*args, **kwargs):
+            result = evaluate(*args, **kwargs)
+            result["loss"] = next(losses)
+            return result
+
+        results = [
+            {"score": score, "metric": "joint-event-f1@100ms", "windows": windows}
+            for score, windows in ((.8, 7), (.4, 11), (.8, 5))
+        ]
+        callback = mock.Mock(side_effect=results)
+        messages = []
+        with mock.patch.object(runtime, "evaluate_model", side_effect=controlled_validation):
+            summary, _ = self.train(
+                config=replace(self.config, epochs=3, max_steps=None),
+                event_evaluator=callback, progress=messages.append,
+            )
+        latest = runtime.load_checkpoint(summary["latest_checkpoint"])
+        best_loss = runtime.load_checkpoint(summary["best_checkpoint"])
+        best_events = runtime.load_checkpoint(summary["best_event_checkpoint"])
+        self.assertEqual(callback.call_count, 3)
+        self.assertEqual(summary["best_score"], .2)
+        self.assertEqual(summary["best_event_score"], .8)
+        self.assertEqual(best_loss["global_step"], 6)
+        self.assertEqual(best_events["global_step"], 3)
+        self.assertEqual(latest["global_step"], 9)
+        self.assertEqual(set(best_events), set(latest))
+        self.assertEqual(best_events["training_config"], latest["training_config"])
+        self.assertEqual(summary["event_validation_windows_processed"], 23)
+        self.assertEqual(summary["validation_windows_processed"], 24)
+        self.assertEqual([entry["validation"]["decoded_events"] for entry in latest["history"]], results)
+        self.assertEqual(summary["validation"]["decoded_events"], results[-1])
+        selection = runtime._read_json(self.root / "run" / "event-selection.json")
+        self.assertEqual(selection, {
+            "run_id": latest["run_id"], "metric": "joint-event-f1@100ms", "score": .8,
+            "global_step": 3, "checkpoint": "best-events.pt",
+        })
+        for expected in ("Decoded-event joint-event-f1@100ms: 0.800000", "Saving best-events.pt", "Saved best-events.pt"):
+            self.assertTrue(any(expected in message for message in messages), expected)
+
+    def test_event_evaluation_preserves_updates_exact_resume_rng_and_no_op_summary(self):
+        batch = next(iter(loaders()[1]))
+
+        def evaluate_events(model):
+            self.assertFalse(torch.is_grad_enabled())
+            self.assertTrue(all(not module.training for module in model.modules()))
+            outputs = model(batch["features"], batch["conditioning"], batch["lengths"])
+            score = outputs["note_onset_logits"][batch["valid_frames"]].sigmoid().mean().item()
+            return {"score": score, "metric": "synthetic-event-score", "windows": batch["features"].shape[0]}
+
+        full_config = replace(self.config, max_steps=6)
+        baseline, _ = self.train("without-events", config=full_config)
+        full, _ = self.train("with-events", config=full_config, event_evaluator=evaluate_events)
+        partial, _ = self.train("resumed-events", event_evaluator=evaluate_events)
+        random.random()
+        np.random.random(4)
+        torch.rand(8)
+        resumed, _ = self.train(
+            "resumed-events", config=full_config, resume=partial["latest_checkpoint"],
+            model=toy_model(seed=999), event_evaluator=evaluate_events,
+        )
+        baseline_checkpoint = runtime.load_checkpoint(baseline["latest_checkpoint"])
+        full_checkpoint = runtime.load_checkpoint(full["latest_checkpoint"])
+        resumed_checkpoint = runtime.load_checkpoint(resumed["latest_checkpoint"])
+        for key in ("model_state", "optimizer_state", "cursor", "rng", "loader_state", "best_score"):
+            self.assert_tree_equal(baseline_checkpoint[key], full_checkpoint[key])
+            self.assert_tree_equal(full_checkpoint[key], resumed_checkpoint[key])
+        self.assert_tree_equal(full_checkpoint["history"][-1], resumed_checkpoint["history"][-1])
+        self.assertEqual(full["event_validation_windows_processed"], 4)
+        self.assertEqual(partial["event_validation_windows_processed"], 2)
+        self.assertEqual(resumed["event_validation_windows_processed"], 4)
+        expected_score = max(entry["validation"]["decoded_events"]["score"] for entry in resumed_checkpoint["history"])
+        self.assertEqual(resumed["best_event_score"], expected_score)
+        before = Path(resumed["best_event_checkpoint"]).read_bytes()
+        callback = mock.Mock(side_effect=AssertionError("No updates require no event pass"))
+        no_op, _ = self.train(
+            "resumed-events", config=full_config, resume=resumed["latest_checkpoint"], event_evaluator=callback,
+        )
+        callback.assert_not_called()
+        self.assertEqual(no_op["event_validation_windows_processed"], 0)
+        self.assertEqual(no_op["best_event_score"], expected_score)
+        self.assertEqual(no_op["best_event_checkpoint"], resumed["best_event_checkpoint"])
+        self.assertEqual(before, Path(no_op["best_event_checkpoint"]).read_bytes())
+
+    def test_event_resume_preserves_prior_best_then_updates_only_on_improvement(self):
+        def result(score, windows):
+            return lambda model: {"score": score, "metric": "joint-event-f1", "windows": windows}
+
+        first, _ = self.train(event_evaluator=result(.8, 5))
+        event_path = Path(first["best_event_checkpoint"])
+        selection_path = self.root / "run" / "event-selection.json"
+        before = event_path.read_bytes(), selection_path.read_bytes()
+        lower, _ = self.train(
+            config=replace(self.config, max_steps=3), resume=first["latest_checkpoint"],
+            event_evaluator=result(.3, 11),
+        )
+        self.assertEqual(lower["best_event_score"], .8)
+        self.assertEqual(lower["event_validation_windows_processed"], 11)
+        self.assertEqual((event_path.read_bytes(), selection_path.read_bytes()), before)
+        higher, _ = self.train(
+            config=replace(self.config, max_steps=4), resume=lower["latest_checkpoint"],
+            event_evaluator=result(.9, 7),
+        )
+        self.assertEqual(higher["best_event_score"], .9)
+        self.assertEqual(higher["event_validation_windows_processed"], 7)
+        self.assertEqual(runtime.load_checkpoint(event_path)["global_step"], 4)
+        self.assertEqual(runtime._read_json(selection_path)["global_step"], 4)
+        before = event_path.read_bytes(), selection_path.read_bytes()
+        without_callback, _ = self.train(
+            config=replace(self.config, max_steps=5), resume=higher["latest_checkpoint"],
+        )
+        self.assertEqual(without_callback["best_event_score"], .9)
+        self.assertEqual(without_callback["event_validation_windows_processed"], 0)
+        self.assertNotIn("decoded_events", without_callback["validation"])
+        self.assertEqual((event_path.read_bytes(), selection_path.read_bytes()), before)
+
+    def test_invalid_event_callback_results_fail_before_checkpoint_publication(self):
+        result = {"score": .2, "metric": "joint-event-f1", "windows": 2}
+        changes = (
+            {"score": -0.1}, {"score": 1.1}, {"score": math.nan}, {"score": math.inf}, {"score": True},
+            {"metric": ""}, {"metric": " "}, {"metric": 1}, {"windows": -1}, {"windows": True}, {"windows": 1.5},
+        )
+        for index, change in enumerate(changes):
+            callback = mock.Mock(return_value=dict(result, **change))
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.train(
+                    f"invalid-event-{index}", config=replace(self.config, max_steps=1), event_evaluator=callback,
+                )
+            for filename in ("latest.pt", "best.pt", "best-events.pt", "event-selection.json"):
+                self.assertFalse((self.root / f"invalid-event-{index}" / filename).exists())
+        for value in (None, {"score": .2, "metric": "joint-event-f1"}, dict(result, extra=True)):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "decoded-event evaluation schema"):
+                runtime._event_result(value)
+        for score in (0, 1):
+            self.assertEqual(runtime._event_result(dict(result, score=score, windows=0))["score"], score)
+        with self.assertRaisesRegex(ValueError, "callable"):
+            self.train("not-callable", event_evaluator=3)
+        self.assertFalse((self.root / "not-callable").exists())
+
+    def test_changed_event_metric_is_rejected_within_run_and_on_resume(self):
+        callback = mock.Mock(side_effect=[
+            {"score": .5, "metric": "joint-event-f1", "windows": 2},
+            {"score": .1, "metric": "different-event-f1", "windows": 2},
+        ])
+        with self.assertRaisesRegex(ValueError, "metric must stay stable"):
+            self.train(config=replace(self.config, max_steps=6), event_evaluator=callback)
+        latest = self.root / "run" / "latest.pt"
+        self.assertEqual(runtime.load_checkpoint(latest)["global_step"], 3)
+        before = latest.read_bytes()
+        with self.assertRaisesRegex(ValueError, "metric must stay stable"):
+            self.train(
+                config=replace(self.config, max_steps=4), resume=latest,
+                event_evaluator=lambda model: {"score": .9, "metric": "different-event-f1", "windows": 2},
+            )
+        self.assertEqual(latest.read_bytes(), before)
+
+    def test_event_callbacks_cannot_consume_global_rng_and_restore_modes_on_failure(self):
+        consumers = (random.random, lambda: np.random.random(2), lambda: torch.rand(2))
+        for index, consume in enumerate(consumers):
+            before = []
+
+            def callback(model):
+                before.append(runtime._capture_rng())
+                consume()
+                return {"score": .5, "metric": "joint-event-f1", "windows": 2}
+
+            model = toy_model()
+            model.dropout.eval()
+            with self.subTest(index=index), self.assertRaisesRegex(ValueError, "Event evaluation consumed global RNG"):
+                self.train(f"event-rng-{index}", model=model, event_evaluator=callback)
+            self.assert_tree_equal(before[0], runtime._capture_rng())
+            self.assertTrue(model.training)
+            self.assertFalse(model.dropout.training)
+            self.assertFalse((self.root / f"event-rng-{index}" / "latest.pt").exists())
+        callback = mock.Mock(side_effect=RuntimeError("synthetic event evaluation failure"))
+        with self.assertRaisesRegex(RuntimeError, "synthetic event evaluation failure"):
+            self.train("event-failure", event_evaluator=callback)
+        self.assertFalse((self.root / "event-failure" / "best-events.pt").exists())
+
+    def test_resume_verifies_event_selection_history_run_step_and_required_files(self):
+        callback = lambda model: {"score": .5, "metric": "joint-event-f1", "windows": 2}
+        summary, _ = self.train(event_evaluator=callback)
+        paths = {name: self.root / "run" / name for name in ("latest.pt", "best-events.pt", "event-selection.json")}
+        original = {name: path.read_bytes() for name, path in paths.items()}
+        selection = runtime._read_json(paths["event-selection.json"])
+        for changes in (
+            {"run_id": "0" * 32}, {"metric": "other"}, {"score": .7},
+            {"global_step": 1}, {"checkpoint": "latest.pt"},
+        ):
+            runtime._write_json(paths["event-selection.json"], dict(selection, **changes))
+            with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, "consistent run"):
+                self.train(config=replace(self.config, max_steps=3), resume=summary["latest_checkpoint"])
+            paths["event-selection.json"].write_bytes(original["event-selection.json"])
+        short, _ = self.train("short-events", config=replace(self.config, max_steps=1), event_evaluator=callback)
+        wrong_step = runtime.load_checkpoint(short["latest_checkpoint"])
+        wrong_step["run_id"] = selection["run_id"]
+        wrong_run = runtime.load_checkpoint(paths["best-events.pt"])
+        wrong_run["run_id"] = "0" * 32
+        for payload in (wrong_step, wrong_run):
+            torch.save(payload, paths["best-events.pt"])
+            with self.assertRaisesRegex(ValueError, "consistent run"):
+                self.train(config=replace(self.config, max_steps=3), resume=summary["latest_checkpoint"])
+            paths["best-events.pt"].write_bytes(original["best-events.pt"])
+        latest = runtime.load_checkpoint(paths["latest.pt"])
+        latest["history"][-1]["validation"]["decoded_events"]["score"] = .7
+        torch.save(latest, paths["latest.pt"])
+        with self.assertRaisesRegex(ValueError, "consistent run"):
+            self.train(config=replace(self.config, max_steps=3), resume=summary["latest_checkpoint"])
+        paths["latest.pt"].write_bytes(original["latest.pt"])
+        for name in ("best-events.pt", "event-selection.json"):
+            paths[name].unlink()
+            with self.subTest(missing=name), self.assertRaisesRegex(ValueError, "selection files"):
+                self.train(config=replace(self.config, max_steps=3), resume=summary["latest_checkpoint"])
+            paths[name].write_bytes(original[name])
+        self.assertEqual(paths["latest.pt"].read_bytes(), original["latest.pt"])
+
+    def test_resume_rejects_event_selection_replaced_during_preflight(self):
+        summary, _ = self.train(
+            event_evaluator=lambda model: {"score": .5, "metric": "joint-event-f1", "windows": 2},
+        )
+        selection_path = self.root / "run" / "event-selection.json"
+        selection = runtime._read_json(selection_path)
+        evaluate = runtime.evaluate_model
+        before = Path(summary["latest_checkpoint"]).read_bytes()
+
+        def replace_selection(*args, **kwargs):
+            result = evaluate(*args, **kwargs)
+            runtime._write_json(selection_path, selection)
+            return result
+
+        with mock.patch.object(runtime, "evaluate_model", side_effect=replace_selection):
+            with self.assertRaisesRegex(ValueError, "lock was acquired"):
+                self.train(config=replace(self.config, max_steps=3), resume=summary["latest_checkpoint"])
+        self.assertFalse((self.root / "run" / ".training.lock").exists())
+        self.assertEqual(Path(summary["latest_checkpoint"]).read_bytes(), before)
 
     def test_mid_epoch_resume_matches_uninterrupted_dropout_and_optimizer(self):
         full, _ = self.train("full", config=replace(self.config, max_steps=6))
@@ -261,6 +535,54 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(resumed["training_steps_processed"], 4)
         self.assertEqual(resumed["training_windows_processed"], 8)
         self.assertEqual(resumed["validation_windows_processed"], 18)
+
+    def test_negative_aware_synthetic_model_resume_preserves_exact_updates_and_rng(self):
+        from scripts.transcriber_model import FingerstyleTranscriber, ModelConfig
+
+        self.loss_patch.stop()
+        model_config = ModelConfig(n_mels=1, hidden_size=4, recurrent_layers=2, dropout=.35)
+        identity = dict(IDENTITY, model=asdict(model_config))
+
+        def train(name, steps, *, resume=None, seed=43):
+            torch.manual_seed(seed)
+            return runtime.run_training(
+                FingerstyleTranscriber(model_config), *loaders(PercussionDataset(), batch_size=1),
+                replace(self.config, max_steps=steps), self.root / name, identity, resume=resume,
+            )
+
+        full = train("full-negative-aware", 6)
+        partial = train("resumed-negative-aware", 2)
+        random.random()
+        np.random.random(4)
+        torch.rand(8)
+        resumed = train("resumed-negative-aware", 6, resume=partial["latest_checkpoint"], seed=999)
+        left, right = runtime.load_checkpoint(full["latest_checkpoint"]), runtime.load_checkpoint(resumed["latest_checkpoint"])
+        for key in ("model_state", "optimizer_state", "cursor", "rng", "loader_state"):
+            self.assert_tree_equal(left[key], right[key])
+        self.assert_tree_equal(left["history"][-1], right["history"][-1])
+        stats = right["history"][-1]["validation"]["loss_statistics"]
+        self.assertEqual(stats["percussion_positive"]["count"], 3)
+        self.assertEqual(stats["percussion_negative"]["count"], 8)
+        self.assertTrue(right["history"][-1]["validation"]["percussion_frame"]["available"])
+
+    def test_checkpoint_without_new_percussion_report_fields_remains_loadable(self):
+        summary, _ = self.train()
+        checkpoint = runtime.load_checkpoint(summary["latest_checkpoint"])
+        for entry in checkpoint["history"]:
+            entry["validation"]["loss_statistics"].pop("percussion_negative")
+            entry["validation"].pop("percussion_frame")
+        old_path = self.root / "positive-only-checkpoint.pt"
+        torch.save(checkpoint, old_path)
+        loaded = runtime.load_checkpoint(old_path, expected_identity=IDENTITY)
+        self.assert_tree_equal(checkpoint, loaded)
+        self.assertEqual(loaded["schema_version"], 1)
+        self.assertEqual(set(loaded["training_config"]), {
+            "epochs", "learning_rate", "weight_decay", "gradient_clip", "seed",
+            "device", "max_steps", "sparsity_weight",
+        })
+        clone = toy_model(seed=71)
+        clone.load_state_dict(loaded["model_state"], strict=True)
+        self.assertTrue(runtime.evaluate_model(clone, loaders()[1], "cpu")["available"])
 
     def test_progress_and_summary_preserve_updates_and_count_short_batches(self):
         config = replace(self.config, epochs=1, max_steps=None)
@@ -551,6 +873,39 @@ class RuntimeTests(unittest.TestCase):
                 batch_losses.append(loss.item())
         self.assertNotAlmostEqual(split_metrics["loss"], sum(batch_losses) / len(batch_losses), places=5)
 
+    def test_percussion_weighted_additive_objective_is_independent_of_batch_partition(self):
+        from scripts.transcriber_model import masked_loss
+
+        class FrameScores(nn.Module):
+            def forward(self, features, conditioning, lengths):
+                outputs = synthetic_outputs(*features.shape[:2])
+                outputs["percussion_logits"] = features.expand(-1, -1, 3)
+                return outputs
+
+        self.loss_patch.stop()
+        model = FrameScores()
+        reports = []
+        for batch_size in (1, 2, 3):
+            validation = loaders(PercussionDataset(), batch_size=batch_size)[1]
+            reports.append(runtime.evaluate_model(model, validation, "cpu", sparsity_weight=0))
+        for report in reports:
+            stats = report["loss_statistics"]
+            positive, negative = stats["percussion_positive"], stats["percussion_negative"]
+            self.assertEqual(positive["count"], 3)
+            self.assertEqual(negative["count"], 8)
+            expected = (5 * positive["sum"] + negative["sum"]) / (5 * positive["count"] + negative["count"])
+            self.assertAlmostEqual(report["loss"], expected, places=6)
+            self.assertAlmostEqual(report["loss"], reports[-1]["loss"], places=6)
+            self.assertEqual(report["percussion_frame"], reports[-1]["percussion_frame"])
+        batch_losses = []
+        for batch in loaders(PercussionDataset(), batch_size=1)[1]:
+            loss, _ = masked_loss(
+                model(batch["features"], batch["conditioning"], batch["lengths"]),
+                batch["targets"], batch["masks"], batch["valid_frames"], sparsity_weight=0,
+            )
+            batch_losses.append(loss.item())
+        self.assertNotAlmostEqual(reports[0]["loss"], sum(batch_losses) / len(batch_losses), places=4)
+
     def test_metrics_respect_masks_padding_and_positive_only_annotations(self):
         batch = {
             "features": torch.zeros(1, 4, 1),
@@ -605,12 +960,65 @@ class RuntimeTests(unittest.TestCase):
         for name in ("percussion_positive", "harmonic_presence_positive"):
             self.assertNotIn("precision", metrics[name])
             self.assertNotIn("f1", metrics[name])
+        self.assertFalse(metrics["percussion_frame"]["available"])
+        for name in ("precision", "recall", "f1"):
+            self.assertIsNone(metrics["percussion_frame"][name])
         self.assertEqual(metrics["harmonic_presence_positive"]["recall_at_labelled_positives"], 1)
         batch["masks"]["percussion"].zero_()
         unlabelled = runtime.evaluate_model(model, [batch], "cpu")["percussion_positive"]
         self.assertFalse(unlabelled["available"])
         self.assertIsNone(unlabelled["recall_at_labelled_positives"])
         self.assertAlmostEqual(unlabelled["emitted_positive_rate"], 2 / 3)
+
+    def test_percussion_frame_metrics_require_observed_negatives_and_ignore_unknowns_and_padding(self):
+        self.loss_patch.stop()
+        targets, masks, _ = synthetic_targets(1, 4)
+        for frame, axis, label in ((0, 0, 1), (1, 0, 1), (0, 1, 0), (1, 1, 0)):
+            targets["percussion"][0, frame, axis] = label
+            masks["percussion"][0, frame, axis] = True
+        targets["percussion"][0, 2, 2] = 0
+        targets["percussion"][0, 3] = 0
+        masks["percussion"][0, 3] = True
+        batch = {
+            "features": torch.zeros(1, 4, 1), "conditioning": torch.zeros(1, 4, 12),
+            "lengths": torch.tensor([3]), "valid_frames": torch.tensor([[True, True, True, False]]),
+            "targets": targets, "masks": masks,
+        }
+        outputs = synthetic_outputs(1, 4)
+        outputs["percussion_logits"].fill_(1)
+        outputs["percussion_logits"][0, 1, :2] = -1
+        model = ConstantOutputs(outputs)
+        metrics = runtime.evaluate_model(model, [batch], "cpu")
+        self.assertEqual(metrics["percussion_frame"], {
+            "available": True, "count": 4, "labelled_positive_count": 2, "labelled_negative_count": 2,
+            "true_positive": 1, "false_positive": 1, "false_negative": 1, "true_negative": 1,
+            "precision": .5, "recall": .5, "f1": .5,
+        })
+        self.assertEqual(metrics["percussion_positive"]["recall_at_labelled_positives"], .5)
+        self.assertAlmostEqual(metrics["percussion_positive"]["emitted_positive_rate"], 7 / 9)
+        masks["percussion"][0, :2, 1] = False
+        positive_only = runtime.evaluate_model(model, [batch], "cpu")["percussion_frame"]
+        self.assertFalse(positive_only["available"])
+        self.assertEqual(positive_only["count"], 2)
+        self.assertEqual(positive_only["labelled_negative_count"], 0)
+        for key in ("precision", "recall", "f1"):
+            self.assertIsNone(positive_only[key])
+        masks["percussion"][0, :2, 1] = True
+        masks["percussion"][0, :2, 0] = False
+        negative_only = runtime.evaluate_model(model, [batch], "cpu")["percussion_frame"]
+        self.assertTrue(negative_only["available"])
+        self.assertEqual(negative_only["labelled_positive_count"], 0)
+        self.assertEqual(negative_only["labelled_negative_count"], 2)
+        self.assertEqual(negative_only["precision"], 0)
+        self.assertIsNone(negative_only["recall"])
+        self.assertEqual(negative_only["f1"], 0)
+        masks["percussion"].zero_()
+        unknown = runtime.evaluate_model(model, [batch], "cpu")["percussion_frame"]
+        self.assertFalse(unknown["available"])
+        self.assertEqual(unknown["count"], 0)
+        for key in ("precision", "recall", "f1"):
+            self.assertIsNone(unknown[key])
+        json.dumps(metrics, allow_nan=False)
 
     def test_bad_loss_statistics_and_evaluation_failure_preserve_model_mode(self):
         def bad_stats(*args, **kwargs):
@@ -676,7 +1084,8 @@ class RuntimeTests(unittest.TestCase):
                     total = total + sparsity_weight * prior.mean()
                     stat_name = f"{name}_positive"
                 stats[stat_name] = {"sum": values.sum().item(), "count": values.numel()}
-                total = total + WEIGHTS[stat_name] * values.mean()
+                weight = 1.0 if stat_name == "percussion_positive" else WEIGHTS[stat_name]
+                total = total + weight * values.mean()
             return total, stats
 
         with mock.patch.object(runtime, "_loss_api", return_value=(categorical_loss, WEIGHTS)):
@@ -691,8 +1100,10 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(stats["percussion_sparsity"]["count"], 6)
         expected = sum(
             WEIGHTS[name] * stats[name]["sum"]
-            for name in ("harmonic_positive", "harmonic_kind", "harmonic_node", "percussion_positive")
-        ) + 0.02 * (stats["harmonic_sparsity"]["sum"] / 12 + stats["percussion_sparsity"]["sum"] / 6)
+            for name in ("harmonic_positive", "harmonic_kind", "harmonic_node")
+        ) + stats["percussion_positive"]["sum"] + 0.02 * (
+            stats["harmonic_sparsity"]["sum"] / 12 + stats["percussion_sparsity"]["sum"] / 6
+        )
         self.assertAlmostEqual(metrics["loss"], expected)
         harmonic = metrics["harmonic_presence_positive"]
         self.assertEqual(harmonic["recall_at_labelled_positives"], 0)
@@ -702,12 +1113,8 @@ class RuntimeTests(unittest.TestCase):
             self.assertNotIn("f1", metrics[name])
         self.assertNotIn("harmonic_fret_mae", metrics)
 
-    def test_frozen_objective_balances_onsets_and_keeps_priors_separate(self):
-        weights = {
-            "note_onset": 1.0, "fret": 1.0, "pitch": 1.0, "voice": 0.25,
-            "duration_log": 0.25, "harmonic_positive": 0.5, "harmonic_kind": 0.25,
-            "harmonic_node": 0.25, "percussion_positive": 1.0,
-        }
+    def test_objective_balances_onsets_pools_percussion_and_keeps_priors_separate(self):
+        weights = WEIGHTS
         stats = {
             "note_onset_positive": {"sum": 4.0, "count": 2},
             "note_onset_negative": {"sum": 9.0, "count": 9},
@@ -716,12 +1123,14 @@ class RuntimeTests(unittest.TestCase):
             "harmonic_positive": {"sum": 3.0, "count": 3},
             "harmonic_kind": {"sum": 0.0, "count": 0}, "harmonic_node": {"sum": 0.0, "count": 0},
             "percussion_positive": {"sum": 2.0, "count": 1},
+            "percussion_negative": {"sum": 27.0, "count": 9},
             "harmonic_sparsity": {"sum": 4.0, "count": 8},
             "percussion_sparsity": {"sum": 6.0, "count": 30},
         }
         parsed = runtime._stats(stats, weights)
-        self.assertAlmostEqual(runtime._objective(parsed, weights, 0.02), 1.5 + 0.5 + 2 + 0.02 * (0.5 + 0.2))
+        self.assertAlmostEqual(runtime._objective(parsed, weights, 0.02), 1.5 + 0.5 + 37 / 14 + 0.02 * (0.5 + 0.2))
         stats["note_onset_negative"] = {"sum": 0.0, "count": 0}
+        stats["percussion_negative"] = {"sum": 0.0, "count": 0}
         self.assertAlmostEqual(runtime._objective(stats, weights, 0.02), 2 + 0.5 + 2 + 0.02 * (0.5 + 0.2))
         for name in stats:
             if name not in ("harmonic_sparsity", "percussion_sparsity"):
@@ -783,6 +1192,8 @@ class RuntimeTests(unittest.TestCase):
             masks[name][0, 1, 0] = True
         targets["percussion"][1, 1, 1] = 1
         masks["percussion"][1, 1, 1] = True
+        targets["percussion"][0, 2, 1] = 0
+        masks["percussion"][0, 2, 1] = True
         batch = {
             "features": torch.linspace(-0.3, 0.7, 2 * 4 * config.n_mels).reshape(2, 4, config.n_mels),
             "conditioning": torch.zeros(2, 4, config.conditioning_dim),
@@ -804,6 +1215,9 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(metrics["loss_statistics"]["note_onset_negative"]["count"], 35)
         self.assertEqual(metrics["harmonic_presence_positive"]["labelled_positive_count"], 1)
         self.assertEqual(metrics["percussion_positive"]["labelled_positive_count"], 1)
+        self.assertEqual(metrics["loss_statistics"]["percussion_negative"]["count"], 1)
+        self.assertEqual(metrics["loss_statistics"]["percussion_sparsity"]["count"], 0)
+        self.assertTrue(metrics["percussion_frame"]["available"])
         self.assertTrue(model.training)
         self.assertTrue(all(parameter.grad is None for parameter in model.parameters()))
         self.assert_tree_equal(state, model.state_dict())
@@ -820,9 +1234,11 @@ class RuntimeTests(unittest.TestCase):
             invalid[alias] = invalid.pop(original)
             with self.subTest(alias=alias), self.assertRaisesRegex(ValueError, "loss statistics schema"):
                 runtime._stats(invalid, WEIGHTS)
-        stats.pop("percussion_sparsity")
-        with self.assertRaisesRegex(ValueError, "loss statistics schema"):
-            runtime._stats(stats, WEIGHTS)
+        for missing in ("percussion_negative", "percussion_sparsity"):
+            invalid = copy.deepcopy(stats)
+            invalid.pop(missing)
+            with self.subTest(missing=missing), self.assertRaisesRegex(ValueError, "loss statistics schema"):
+                runtime._stats(invalid, WEIGHTS)
 
 
 if __name__ == "__main__":

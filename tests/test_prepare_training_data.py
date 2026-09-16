@@ -1,9 +1,11 @@
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import unittest
 from unittest.mock import patch
 from uuid import uuid4
@@ -16,7 +18,8 @@ from scripts import transcriber
 from scripts.dataset_io import read_json, sha256
 from scripts.audio_tools import AcquisitionError, executable
 from scripts.dataset_release import candidate_digest, validate_release
-from scripts.prepare_training_data import ARTIFACTS, automatic_candidate, extract_score, main, parser, rules_template, source_paths, workspace_path
+from scripts.percussion_supervision import percussion_annotation_coverage
+from scripts.prepare_training_data import ARTIFACTS, automatic_candidate, extract_score, main, parser, rules_template, selection, source_paths, workspace_path
 from scripts.score_alignment import ScoreClock
 from tests.test_gp_events import musical_score, note_xml
 from tests.test_gp_normalization import archive_bytes
@@ -72,6 +75,19 @@ def fresh_audio(path, shift=0, *, rate=8000):
 
 
 class TrainingPreparationTests(unittest.TestCase):
+    def test_explicit_pair_order_is_preserved_for_repeatable_release_windows(self):
+        self.add("pair-A")
+        self.add("pair-B", 2)
+        self.assertEqual([pair["id"] for pair in selection(self.workspace, ["pair-B", "pair-A"])], ["pair-B", "pair-A"])
+
+    def test_cli_emits_utf8_notation_even_with_ascii_console_environment(self):
+        self.add("pair-A", title="Notation \u25b2")
+        result = subprocess.run(
+            [sys.executable, "-m", "scripts.prepare_training_data", "--workspace", str(self.workspace), "status"],
+            cwd=ROOT, env={**os.environ, "PYTHONIOENCODING": "ascii"}, capture_output=True, check=True,
+        )
+        self.assertEqual(json.loads(result.stdout.decode("utf-8"))["pairs"][0]["title"], "Notation \u25b2")
+
     def setUp(self):
         self.root = ROOT / f".training-preparation-tests-{uuid4().hex}"
         self.root.mkdir()
@@ -122,6 +138,75 @@ class TrainingPreparationTests(unittest.TestCase):
 
     def release(self, version="v1"):
         return self.run_cli("release", "--version", version, "--validation-group", "group-pair-B")
+
+    def test_completeness_confirmation_requires_reviewer_and_grants_no_other_approval(self):
+        self.add("pair-A")
+        self.run_cli("prepare", "--accept-owner-conventions")
+        directory = self.workspace / "pairs" / "pair-A"
+        before = {name: sha256(directory / name) for name in ARTIFACTS}
+        self.run_cli("review", "--id", "pair-A", "--confirm-percussion-completeness", error="--reviewer")
+        self.assertFalse((directory / "review.json").exists())
+        report = self.run_cli("review", "--id", "pair-A", "--reviewer", "source-owner", "--confirm-percussion-completeness")
+        approval = report["approval"]
+        self.assertTrue(approval["percussionAnnotationsComplete"])
+        self.assertEqual(approval["reviewer"], "source-owner")
+        self.assertFalse(any(approval.get(field) for field in ("authorizedUse", "recordingAndTargetPitchConfirmed", "notationReviewed", "approveExperimentalRangesAndSplit", "groupingConfirmed", "uncertaintyAcknowledged")))
+        self.assertEqual(self.run_cli("status")["pairs"][0]["status"], "needs-review")
+        self.assertEqual(before, {name: sha256(directory / name) for name in ARTIFACTS})
+        state = read_json(directory / "preparation.json")
+        self.assertEqual(state["inputs"]["implementation"]["percussion_supervision.py"], sha256(ROOT / "scripts" / "percussion_supervision.py"))
+        self.assertEqual(read_json(directory / "review.json")["preparationSha256"], candidate_digest(state))
+
+    def test_candidate_range_and_source_revisions_invalidate_completeness(self):
+        self.add("pair-A")
+        self.run_cli("prepare", "--accept-owner-conventions")
+        directory = self.workspace / "pairs" / "pair-A"
+        for changed in (
+            ("--anchor", "2=4.6"), ("--approve-range", "1:16.4"),
+            ("--exclude-range", "7:7.5"), ("--split", "validation"),
+        ):
+            self.approve("pair-A")
+            self.run_cli("review", "--id", "pair-A", "--reviewer", "source-owner", "--confirm-percussion-completeness")
+            report = self.run_cli("review", "--id", "pair-A", "--reviewer", "source-owner", *changed)
+            with self.subTest(changed=changed):
+                self.assertNotIn("percussionAnnotationsComplete", report["approval"])
+        self.run_cli("review", "--id", "pair-A", "--reviewer", "source-owner", "--confirm-percussion-completeness")
+        (directory / "raw.gp").write_bytes(archive_bytes(fresh_score("owner-selected revision")))
+        self.run_cli("review", "--id", "pair-A", "--reviewer", "source-owner", "--confirm-percussion-completeness", error="invalidate with a reason")
+        self.run_cli("invalidate", "--id", "pair-A", "--reason", "synthetic source revision")
+        self.run_cli("prepare", "--ids", "pair-A")
+        self.assertNotIn("percussionAnnotationsComplete", self.run_cli("review", "--id", "pair-A")["approval"])
+        self.assertTrue(read_json(directory / "history.json")[-1]["review"]["approval"]["percussionAnnotationsComplete"])
+
+    def test_release_projects_only_confirmed_sources_and_preserves_old_release(self):
+        self.prepare_two(unknown=True)
+        self.approve("pair-A", exclude=True)
+        self.approve("pair-B")
+        old_release = Path(self.release()["manifestPath"]).parent
+        frozen = {path: sha256(path) for path in old_release.rglob("*") if path.is_file()}
+        musical = {path: sha256(path) for identifier in ("pair-A", "pair-B") for name in ARTIFACTS for path in [self.workspace / "pairs" / identifier / name]}
+        self.run_cli("review", "--id", "pair-A", "--reviewer", "source-owner", "--confirm-percussion-completeness")
+        released = self.release("v2")
+        manifest, records, _ = validate_release(released["manifestPath"])
+        for entry, payload in records:
+            approved = entry["id"] == "pair-A"
+            scope = next(item for item in manifest["releaseAuthorization"]["selectedScope"] if item["id"] == entry["id"])
+            self.assertEqual(scope.get("percussionAnnotationsComplete"), True if approved else None)
+            coverage = percussion_annotation_coverage(payload["canonical"], payload["candidate"], payload["normalization"]) if approved else None
+            if approved:
+                self.assertTrue(coverage)
+                self.assertFalse(any(left <= 3.4 < right for left, right in coverage))
+            for window in payload["windows"]:
+                targets = window["targets"]
+                self.assertEqual(targets["negativePercussionSupervision"], approved)
+                if approved:
+                    left, right = window["startSample"] / entry["sampleRate"], window["stopSampleExclusive"] / entry["sampleRate"]
+                    self.assertEqual(targets["percussionAnnotationCoverage"], [[max(a, left) - left, min(b, right) - left] for a, b in coverage if max(a, left) < min(b, right)])
+                else:
+                    self.assertNotIn("percussionAnnotationCoverage", targets)
+        self.assertEqual(frozen, {path: sha256(path) for path in frozen})
+        self.assertEqual(musical, {path: sha256(path) for path in musical})
+        validate_release(old_release / "manifest.json")
 
     def test_optional_title_is_retained_in_registry_binding_status_and_review(self):
         title = "A Human-Readable Song (Fingerstyle)"

@@ -1,8 +1,9 @@
 """Small, randomly initialized musical model and reusable event decoding.
 
-Harmonic/percussion presence has positive-only supervision. Its sigmoid scores
-are uncalibrated, not reliable probabilities. The explicit sparsity penalty
-assumes these techniques are uncommon; it never supplies negative labels.
+Presence scores are uncalibrated, not reliable probabilities. Harmonics remain
+positive-only; percussion uses only explicitly masked positive/negative labels.
+The sparsity penalty assumes techniques are uncommon, not that unknowns are
+negative, and does not supplement classes with confirmed percussion negatives.
 This module neither trains a model nor writes notation or downloads weights.
 """
 
@@ -23,7 +24,7 @@ PERCUSSION_TYPES = ("wrist_thump", "thumb_slap", "percussive_hit")
 HARMONIC_TYPES = ("Natural", "Artificial", "Tap", "Pinch")
 HARMONIC_FRETS = (5, 7, 9, 12, 19, 24)
 _HARMONIC_OFFSETS = dict(zip(HARMONIC_FRETS, (24, 19, 28, 12, 19, 24)))
-PRESENCE_CALIBRATION = "unvalidated-positive-only-with-sparsity-prior"
+PRESENCE_CALIBRATION = "unvalidated-model-scores"
 
 LOSS_WEIGHTS = {
     "note_onset": 1.0,
@@ -34,12 +35,13 @@ LOSS_WEIGHTS = {
     "harmonic_positive": 0.5,
     "harmonic_kind": 0.25,
     "harmonic_node": 0.25,
-    "percussion_positive": 1.0,
+    "percussion_positive": 5.0,
+    "percussion_negative": 1.0,
 }
 LOSS_STAT_KEYS = (
     "note_onset_positive", "note_onset_negative", "fret", "pitch", "voice",
     "duration_log", "harmonic_positive", "harmonic_kind", "harmonic_node",
-    "percussion_positive", "harmonic_sparsity", "percussion_sparsity",
+    "percussion_positive", "percussion_negative", "harmonic_sparsity", "percussion_sparsity",
 )
 _HEADS = {
     "note_onset": "note_onset_logits",
@@ -230,14 +232,17 @@ def masked_loss(outputs: Mapping[str, Tensor], targets: Mapping[str, Tensor], ma
     Aggregate stats by summing each component's ``sum`` and ``count`` across
     batches, then dividing only nonempty components. ``note_onset`` is the
     average of the nonempty positive and negative means, not their pooled mean.
-    Apply LOSS_WEIGHTS; add sparsity_weight times both nonempty sparsity means.
+    Percussion pools weighted BCE sums over weighted observed counts, using
+    LOSS_WEIGHTS for positive/negative labels, not separate side means. Other
+    supervised means use LOSS_WEIGHTS; both sparsity means use sparsity_weight.
     Duration uses smooth L1 in log1p(quarter-note duration) units.
 
     Masked-out target values are not inspected (including padded values).
-    Harmonic/percussion masks may label only positives. Their priors act only
-    when this batch supplies positive evidence: percussion on valid frames of
-    evidenced classes, harmonic at explicitly known note attacks. These are
-    uncalibrated sparsity assumptions, not supervised negative observations.
+    Harmonic masks may label only positives. Percussion masks may label 0 or 1;
+    false masks remain unknown. Priors require positive evidence in this batch:
+    percussion on valid frames of classes with no explicit negative labels,
+    harmonic at explicitly known note attacks. These are uncalibrated sparsity
+    assumptions, not supervised negative observations.
     """
     _real("sparsity_weight", sparsity_weight, 0)
     prefix = _validate_outputs(outputs, batched=True)
@@ -268,7 +273,7 @@ def masked_loss(outputs: Mapping[str, Tensor], targets: Mapping[str, Tensor], ma
                 raise ValueError("supervised duration_log targets must be nonnegative")
         elif ((selected != 0) & (selected != 1)).any().item():
             raise ValueError(f"supervised {name} targets must be 0 or 1")
-        if name in ("harmonic", "percussion") and (selected != 1).any().item():
+        if name == "harmonic" and (selected != 1).any().item():
             raise ValueError(f"{name} has positive-only supervision; masked negative targets are forbidden")
 
     # Empty slices keep every head connected to a differentiable zero without
@@ -309,13 +314,35 @@ def masked_loss(outputs: Mapping[str, Tensor], targets: Mapping[str, Tensor], ma
         if not mask.any().item():
             continue
         predictions = outputs[_HEADS[name]]
-        values = F.binary_cross_entropy_with_logits(predictions[mask], targets[name][mask], reduction="none")
-        loss = loss + LOSS_WEIGHTS[f"{name}_positive"] * term(f"{name}_positive", values)
         if name == "harmonic":
+            values = F.binary_cross_entropy_with_logits(predictions[mask], targets[name][mask], reduction="none")
+            loss = loss + LOSS_WEIGHTS["harmonic_positive"] * term("harmonic_positive", values)
             prior_mask = effective["note_onset"] & (targets["note_onset"] == 1)
         else:
-            positive_classes = mask.any(dim=(0, 1))
-            prior_mask = valid_frames[:, :, None] & positive_classes[None, None, :]
+            components = []
+            for value, suffix in ((1, "positive"), (0, "negative")):
+                selected = mask & (targets[name] == value)
+                if not selected.any().item():
+                    continue
+                values = F.binary_cross_entropy_with_logits(
+                    predictions[selected], targets[name][selected], reduction="none",
+                )
+                numerator, count = values.sum(), values.numel()
+                stat_name = f"percussion_{suffix}"
+                stats[stat_name] = {"sum": float(numerator.detach().item()), "count": count}
+                components.append((numerator, count, LOSS_WEIGHTS[stat_name]))
+            if len(components) == 1:
+                # The class weight cancels; retain the positive-only BCE exactly.
+                numerator, count, _ = components[0]
+                loss = loss + numerator / count
+            else:
+                loss = loss + sum(total * weight for total, _, weight in components) / sum(
+                    count * weight for _, count, weight in components
+                )
+            positive_classes = (mask & (targets[name] == 1)).any(dim=(0, 1))
+            negative_classes = (mask & (targets[name] == 0)).any(dim=(0, 1))
+            prior_classes = positive_classes & ~negative_classes
+            prior_mask = valid_frames[:, :, None] & prior_classes[None, None, :]
         loss = loss + sparsity_weight * term(f"{name}_sparsity", predictions[prior_mask].sigmoid())
     return loss, stats
 

@@ -92,6 +92,18 @@ def encode_targets(window, canonical, frame_times, model_config, *, negative_ons
     hop = frame_times[1] - frame_times[0] if count > 1 else .02
     valid_interior = (frame_times >= .5) & (frame_times < frame_times[-1] - .5)
     masks["note_onset"][:] = torch.from_numpy(valid_interior[:, None] & np.array(negative_onsets_allowed)[None, :])
+    negative_percussion = window["targets"].get("negativePercussionSupervision", False)
+    coverage = window["targets"].get("percussionAnnotationCoverage", [])
+    if type(negative_percussion) is not bool or not isinstance(coverage, list) or bool(coverage) != negative_percussion:
+        raise HarnessError("Percussion negative labels require explicit nonempty annotation coverage.")
+    covered = np.zeros(count, dtype=bool)
+    previous_end = -1.
+    for left, right in coverage:
+        if not np.isfinite([left, right]).all() or not 0 <= left < right <= frame_times[-1] + hop + 1e-9 or left < previous_end:
+            raise HarnessError("Invalid percussion annotation coverage.")
+        covered |= (frame_times >= left) & (frame_times < right)
+        previous_end = right
+    masks["percussion"][:] = torch.from_numpy((valid_interior & covered)[:, None])
     source_notes = {note["id"]: note for note in canonical["targets"]["notes"]}
     source_gestures = {gesture["id"]: gesture for gesture in canonical["targets"]["gestures"]}
     events = {}
@@ -142,6 +154,7 @@ def encode_targets(window, canonical, frame_times, model_config, *, negative_ons
             if node in HARMONIC_FRETS:
                 targets["harmonic_node"][index, string] = HARMONIC_FRETS.index(node)
                 masks["harmonic_node"][index, string] = True
+    percussion_events = []
     for gesture in window["targets"]["gestures"]:
         source = source_gestures[gesture["sourceGestureId"]]
         if gesture["technique"] != source["technique"]:
@@ -150,6 +163,9 @@ def encode_targets(window, canonical, frame_times, model_config, *, negative_ons
             continue
         index = int(np.argmin(np.abs(frame_times - gesture["onsetWindowSeconds"])))
         category = PERCUSSION_TYPES.index(gesture["technique"])
+        masks["percussion"][max(0, index - radius):min(count, index + radius + 1), category] = False
+        percussion_events.append((index, category))
+    for index, category in percussion_events:
         targets["percussion"][index, category] = 1
         masks["percussion"][index, category] = True
     return targets, masks, collisions
@@ -244,7 +260,10 @@ class TrainingDataset(Dataset):
                 audio_path=release_path(self.manifest_path.parent, row["audioPath"], "audio"),
                 entry={"audioAsset": {"sampleCount": row["sampleCount"]}},
             )
-            record = {"data": data, "candidate": payload["candidate"], "row": row, "negativeAllowed": negative_onset_coverage(labels)}
+            record = {
+                "data": data, "candidate": payload["candidate"], "row": row, "negativeAllowed": negative_onset_coverage(labels),
+                "percussionAnnotationsComplete": payload["approval"].get("percussionAnnotationsComplete") is True,
+            }
             self.records.append(record)
             self.windows.extend((record, window) for window in payload["windows"])
         if len(self.windows) != manifest["counts"]["windowsBySplit"][split]:

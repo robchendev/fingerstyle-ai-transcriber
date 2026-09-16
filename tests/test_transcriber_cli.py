@@ -18,9 +18,9 @@ from scripts.transcriber_audio import FeatureConfig, HarnessError
 class HarnessCommandTests(unittest.TestCase):
     def test_default_manifest_and_explicit_overrides_always_use_training_loader(self):
         config, features, model, _ = transcriber.load_config()
-        self.assertEqual(config["data"]["manifest"], "data\\releases\\pilot-v1\\manifest.json")
+        self.assertEqual(config["data"]["manifest"], "data\\releases\\pilot-v2\\manifest.json")
         for root, override, expected in (
-            (ROOT, None, ROOT / "data" / "releases" / "pilot-v1" / "manifest.json"),
+            (ROOT, None, ROOT / "data" / "releases" / "pilot-v2" / "manifest.json"),
             (ROOT / "private-workspace", "releases\\v2\\manifest.json", ROOT / "private-workspace" / "releases" / "v2" / "manifest.json"),
             (ROOT, ROOT / "custom" / "manifest.json", ROOT / "custom" / "manifest.json"),
         ):
@@ -65,7 +65,8 @@ class HarnessCommandTests(unittest.TestCase):
                     if resume:
                         args.extend(["--resume", resume])
                     self.assertEqual(transcriber.main(args), 0)
-                    run_training.assert_called_once_with(model, train_loader, validation_loader, config[3], root / "runs" / "example", {"synthetic": True}, resume=resume, progress=transcriber.log_progress)
+                    run_training.assert_called_once_with(model, train_loader, validation_loader, config[3], root / "runs" / "example", {"synthetic": True}, resume=resume, progress=transcriber.log_progress, event_evaluator=ANY)
+                    self.assertTrue(callable(run_training.call_args.kwargs["event_evaluator"]))
                     text = output.getvalue()
                     self.assertIn("Loading training data", text)
                     self.assertIn("Loading validation data", text)
@@ -82,6 +83,22 @@ class HarnessCommandTests(unittest.TestCase):
             transcriber.log_progress("Epoch progress")
         output.assert_called_once_with(ANY, flush=True)
         self.assertIn("Epoch progress", output.call_args.args[0])
+
+    def test_event_evaluation_records_explicitly_selected_release_without_training(self):
+        with TemporaryDirectory(dir=ROOT) as directory:
+            root = Path(directory).resolve()
+            _, features, model_config, _ = transcriber.load_config()
+            identity = {"features": asdict(features), "model": asdict(model_config), "manifest_sha256": "training-release"}
+            dataset = SimpleNamespace(manifest_sha256="evaluation-release")
+            model = object()
+            with patch.object(transcriber, "checkpoint_model", return_value=(model, {"identity": identity}, torch.device("cpu"))), patch.object(transcriber, "make_dataset", return_value=dataset), patch.object(transcriber, "sha256", return_value="checkpoint-hash"), patch("scripts.transcriber_events.evaluate_events", return_value={"metricsByToleranceSeconds": {}, "trainingPerformed": False}) as evaluate, patch("sys.stdout", new=StringIO()):
+                self.assertEqual(transcriber.main(["evaluate-events", "--data-root", str(root), "--manifest", "releases\\v2\\manifest.json", "--checkpoint", "synthetic.pt", "--output", "runs\\events.json"]), 0)
+            evaluate.assert_called_once()
+            report = read_json(root / "runs" / "events.json")
+            self.assertEqual(report["trainingManifestSha256"], "training-release")
+            self.assertEqual(report["manifestSha256"], "evaluation-release")
+            self.assertFalse(report["sameReleaseAsTraining"])
+            self.assertFalse(report["trainingPerformed"])
 
     def test_inference_metadata_never_defaults_missing_tuning_or_timing(self):
         value = self.metadata()

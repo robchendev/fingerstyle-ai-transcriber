@@ -14,6 +14,7 @@ import torch
 from scripts import transcriber
 from scripts.dataset_io import ROOT, read_json, sha256, publish_json
 from scripts.dataset_release import candidate_digest, release_scope, validate_mapping, validate_release
+from scripts.percussion_supervision import percussion_annotation_coverage
 from scripts.training_windows import projected_targets, targets_in_window
 from scripts.score_alignment import ScoreClock
 from scripts.transcriber_audio import FeatureConfig
@@ -22,7 +23,7 @@ from scripts.transcriber_model import ModelConfig
 from tests.test_score_alignment import clock_fixture
 
 
-def synthetic_release(root, *, plateau=False):
+def synthetic_release(root, *, plateau=False, percussion_complete=None, unresolved_percussion=None):
     entries, records = [], []
     for index, split in enumerate(("train", "validation")):
         identifier = f"piece-{index}"
@@ -41,6 +42,8 @@ def synthetic_release(root, *, plateau=False):
             "notes": [{"id": "n", "voiceIndex": 0, "string": 6, "fret": 0, "soundingPitchMidi": 40, "onsetQuarter": [1, 1], "notatedDurationQuarter": [2, 1], "isAttack": True, "sourceSegments": [{"graceMode": None, "harmonic": None}], "labelMask": {"attack": True, "pitch": True, "fingering": True, "notatedDuration": True}}],
             "gestures": [{"id": "g", "voiceIndex": 0, "technique": "wrist_thump", "onsetQuarter": [1, 1], "scoreOnsetKnown": True, "graceMode": None}],
         }
+        if percussion_complete is not None:
+            labels["review"] = {"notationSymbols": [], "unresolvedGestures": [deepcopy(unresolved_percussion)] if unresolved_percussion is not None else []}
         candidate = {"denseMapping": [{"clipSeconds": float(t), "referenceSeconds": float(t), "scoreQuarter": float(t)} for t in (0, 3, 6)]}
         if plateau:
             labels["targets"]["notes"].append({**deepcopy(labels["targets"]["notes"][0]), "id": "n2", "onsetQuarter": [2, 1], "fret": 2, "soundingPitchMidi": 42})
@@ -56,10 +59,13 @@ def synthetic_release(root, *, plateau=False):
         }
         if plateau:
             approval["uncertaintyAcknowledged"] = True
+        if percussion_complete is not None:
+            approval.update(percussionAnnotationsComplete=percussion_complete, reviewer="Synthetic source reviewer")
+        coverage = percussion_annotation_coverage(labels, candidate, normalization) if percussion_complete is True else None
         payload = {
             "schemaVersion": 1, "kind": "local-training-targets", "id": identifier,
             "canonical": labels, "normalization": normalization, "candidate": candidate, "approval": approval,
-            "windows": [{"windowId": f"{identifier}:0-{rate * 6}", "startSample": 0, "stopSampleExclusive": rate * 6, "targets": targets_in_window(notes, gestures, 0, rate * 6, rate)}],
+            "windows": [{"windowId": f"{identifier}:0-{rate * 6}", "startSample": 0, "stopSampleExclusive": rate * 6, "targets": targets_in_window(notes, gestures, 0, rate * 6, rate, percussion_coverage=coverage)}],
         }
         entries.append({
             "id": identifier, "groupId": identifier, "split": split,
@@ -87,6 +93,94 @@ def synthetic_release(root, *, plateau=False):
 
 
 class DatasetReleaseTests(unittest.TestCase):
+    def test_unconfirmed_schema_one_release_keeps_exact_bytes_and_projection(self):
+        with TemporaryDirectory(dir=ROOT) as directory:
+            root = Path(directory).resolve()
+            manifest_path = synthetic_release(root)
+            before = {path: sha256(path) for path in root.rglob("*") if path.is_file()}
+            with patch("scripts.dataset_release.percussion_annotation_coverage", side_effect=AssertionError("No completeness approval")):
+                manifest, records, _ = validate_release(manifest_path)
+            self.assertEqual(before, {path: sha256(path) for path in before})
+            self.assertEqual(manifest["schemaVersion"], 1)
+            self.assertTrue(all("percussionAnnotationsComplete" not in scope for scope in manifest["releaseAuthorization"]["selectedScope"]))
+            for _, payload in records:
+                targets = payload["windows"][0]["targets"]
+                self.assertNotIn("percussionAnnotationCoverage", targets)
+                self.assertFalse(targets["negativePercussionSupervision"])
+
+    def test_explicit_completeness_is_optional_and_bound_in_release_scope(self):
+        for complete in (False, True):
+            with self.subTest(complete=complete), TemporaryDirectory(dir=ROOT) as directory:
+                manifest_path = synthetic_release(Path(directory).resolve(), percussion_complete=complete)
+                manifest, records, _ = validate_release(manifest_path)
+                self.assertEqual([scope["percussionAnnotationsComplete"] for scope in manifest["releaseAuthorization"]["selectedScope"]], [complete, complete])
+                for _, payload in records:
+                    targets = payload["windows"][0]["targets"]
+                    self.assertEqual(targets["negativePercussionSupervision"], complete)
+                    self.assertEqual(targets.get("percussionAnnotationCoverage"), [[0., 6.]] if complete else None)
+                scope = release_scope(records)
+                records[0][1]["approval"]["percussionAnnotationsComplete"] = not complete
+                self.assertNotEqual(release_scope(records), scope)
+
+    def test_confirmed_uncertainty_preserves_temporal_holes_or_empty_coverage(self):
+        for unresolved, expected in (
+            ({"onsetQuarter": [3, 1], "scoreOnsetKnown": True, "reason": "unknown_symbol"}, [[0., 2.9], [3.1, 6.]]),
+            ({"reason": "unbounded_unknown_timing"}, []),
+        ):
+            with self.subTest(unresolved=unresolved), TemporaryDirectory(dir=ROOT) as directory:
+                manifest_path = synthetic_release(Path(directory).resolve(), percussion_complete=True, unresolved_percussion=unresolved)
+                _, records, _ = validate_release(manifest_path)
+                for _, payload in records:
+                    targets = payload["windows"][0]["targets"]
+                    self.assertEqual(targets["percussionAnnotationCoverage"], expected)
+                    self.assertEqual(targets["negativePercussionSupervision"], bool(expected))
+                    self.assertTrue(targets["gestures"][0]["supervisionMask"]["gesture"])
+
+    def test_rehashed_coverage_cannot_expand_censored_passages(self):
+        with TemporaryDirectory(dir=ROOT) as directory:
+            manifest_path = synthetic_release(
+                Path(directory).resolve(), percussion_complete=True,
+                unresolved_percussion={"onsetQuarter": [3, 1], "scoreOnsetKnown": True},
+            )
+            manifest = read_json(manifest_path)
+            target = manifest_path.parent / "targets" / "piece-0.json"
+            original = read_json(target)
+            for coverage, negative in (([[0., 6.]], True), ([[0., 2.9], [3.1, 6.]], False), ([], True)):
+                payload = deepcopy(original)
+                payload["windows"][0]["targets"].update(percussionAnnotationCoverage=coverage, negativePercussionSupervision=negative)
+                publish_json(target, payload)
+                manifest["entries"][0]["targetsSha256"] = sha256(target)
+                publish_json(manifest_path, manifest)
+                with self.subTest(coverage=coverage, negative=negative), self.assertRaisesRegex(ValueError, "canonical projection"):
+                    validate_release(manifest_path)
+
+    def test_coverage_and_negative_flags_require_explicit_true_and_source_reviewer(self):
+        with TemporaryDirectory(dir=ROOT) as directory:
+            manifest_path = synthetic_release(Path(directory).resolve())
+            manifest = read_json(manifest_path)
+            target = manifest_path.parent / "targets" / "piece-0.json"
+            original = read_json(target)
+            for approval in ({}, {"percussionAnnotationsComplete": False}, {"percussionAnnotationsComplete": 1}, {"percussionAnnotationsComplete": "true"}, {"percussionAnnotationsComplete": True}, {"percussionAnnotationsComplete": True, "reviewer": " "}):
+                payload = deepcopy(original)
+                payload["approval"].update(approval)
+                payload["windows"][0]["targets"].update(percussionAnnotationCoverage=[[0., 6.]], negativePercussionSupervision=True)
+                publish_json(target, payload)
+                manifest["entries"][0]["targetsSha256"] = sha256(target)
+                publish_json(manifest_path, manifest)
+                with self.subTest(approval=approval), self.assertRaises(ValueError):
+                    validate_release(manifest_path)
+
+    def test_completeness_scope_cannot_be_omitted_even_after_authorization_rehash(self):
+        with TemporaryDirectory(dir=ROOT) as directory:
+            manifest_path = synthetic_release(Path(directory).resolve(), percussion_complete=True)
+            manifest = read_json(manifest_path)
+            authorization = manifest["releaseAuthorization"]
+            del authorization["selectedScope"][0]["percussionAnnotationsComplete"]
+            authorization["sha256"] = candidate_digest({key: value for key, value in authorization.items() if key != "sha256"})
+            publish_json(manifest_path, manifest)
+            with self.assertRaisesRegex(ValueError, "selected dataset scope"):
+                validate_release(manifest_path)
+
     def test_mapping_bounds_finiteness_clock_and_reference_order_are_required(self):
         clock = ScoreClock(*clock_fixture())
         mapping = [{"clipSeconds": clip, "referenceSeconds": reference, "scoreQuarter": reference} for clip, reference in ((0., 0.), (1., 1.), (1., 2.), (6., 6.))]

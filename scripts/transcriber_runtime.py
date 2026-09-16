@@ -22,9 +22,10 @@ from torch.utils.data import BatchSampler, DataLoader, SequentialSampler
 SCHEMA_VERSION = 1
 _PRIOR_NAMES = frozenset({"harmonic_sparsity", "percussion_sparsity"})
 _NOTE_ONSET_STATS = ("note_onset_positive", "note_onset_negative")
+_PERCUSSION_STATS = ("percussion_positive", "percussion_negative")
 _LOSS_STAT_KEYS = (
     *_NOTE_ONSET_STATS, "fret", "pitch", "voice", "duration_log", "harmonic_positive",
-    "harmonic_kind", "harmonic_node", "percussion_positive", "harmonic_sparsity", "percussion_sparsity",
+    "harmonic_kind", "harmonic_node", *_PERCUSSION_STATS, "harmonic_sparsity", "percussion_sparsity",
 )
 _CHECKPOINT_KEYS = {
     "schema_version", "run_id", "identity", "training_config", "runtime", "model_state",
@@ -501,6 +502,7 @@ def _outputs(model, batch):
 
 
 def _stat_weight(name, weights):
+    # Percussion weights scale both observed counts and BCE sums when pooled.
     key = "note_onset" if name in _NOTE_ONSET_STATS else name
     if key not in weights:
         raise ValueError(f"Missing LOSS_WEIGHTS entry for loss statistic {name}")
@@ -537,7 +539,16 @@ def _objective(stats, weights, sparsity_weight):
     ]
     loss = weights["note_onset"] * sum(onset_means) / len(onset_means) if onset_means else 0.0
     for name, value in stats.items():
-        if value["count"] and name not in _NOTE_ONSET_STATS:
+        if name == "percussion_positive":
+            percussion = [key for key in _PERCUSSION_STATS if stats[key]["count"]]
+            if len(percussion) == 1:
+                observed = stats[percussion[0]]
+                loss += observed["sum"] / observed["count"]
+            elif percussion:
+                loss += sum(stats[key]["sum"] * _stat_weight(key, weights) for key in percussion) / sum(
+                    stats[key]["count"] * _stat_weight(key, weights) for key in percussion
+                )
+        elif value["count"] and name not in (*_NOTE_ONSET_STATS, *_PERCUSSION_STATS):
             weight = sparsity_weight if name in _PRIOR_NAMES else _stat_weight(name, weights)
             loss += weight * value["sum"] / value["count"]
     return _finite(loss, "aggregated loss")
@@ -607,12 +618,14 @@ def _metric_counts(outputs, batch, counts):
                 raise ValueError(f"Invalid binary output shape for {name}")
             emitted = prediction >= 0
             positive = target > 0.5
-            if name == "note_onset":
-                count["count"] += int(mask.sum().item())
-                count["tp"] += int((emitted & positive & mask).sum().item())
-                count["fp"] += int((emitted & ~positive & mask).sum().item())
-                count["fn"] += int((~emitted & positive & mask).sum().item())
-            else:
+            if name in ("note_onset", "percussion"):
+                frame_count = counts["percussion_frame"] if name == "percussion" else count
+                frame_count["count"] += int(mask.sum().item())
+                frame_count["tp"] += int((emitted & positive & mask).sum().item())
+                frame_count["fp"] += int((emitted & ~positive & mask).sum().item())
+                frame_count["fn"] += int((~emitted & positive & mask).sum().item())
+                frame_count["tn"] += int((~emitted & ~positive & mask).sum().item())
+            if name != "note_onset":
                 labelled = positive & mask
                 emission_mask = valid.reshape(*valid.shape, *((1,) * (target.ndim - 2))).expand_as(target)
                 count["count"] += int(labelled.sum().item())
@@ -655,6 +668,17 @@ def _metrics(counts):
             "emitted_positive_count": value["emitted"], "emission_position_count": value["positions"],
             "emitted_positive_rate": _divide(value["emitted"], value["positions"]),
         }
+    percussion = counts["percussion_frame"]
+    tp, fp, fn, tn = (percussion[key] for key in ("tp", "fp", "fn", "tn"))
+    available = fp + tn > 0
+    result["percussion_frame"] = {
+        "available": available, "count": percussion["count"],
+        "labelled_positive_count": tp + fn, "labelled_negative_count": fp + tn,
+        "true_positive": tp, "false_positive": fp, "false_negative": fn, "true_negative": tn,
+        "precision": _divide(tp, tp + fp) if available else None,
+        "recall": _divide(tp, tp + fn) if available else None,
+        "f1": _divide(2 * tp, 2 * tp + fp + fn) if available else None,
+    }
     return result
 
 
@@ -684,8 +708,8 @@ def evaluate_model(model, loader, device, *, sparsity_weight=0.02, progress=None
     generator_state = generator.get_state() if isinstance(generator, torch.Generator) else None
     totals = {name: {"sum": 0.0, "count": 0} for name in _LOSS_STAT_KEYS}
     counts = {
-        name: {"count": 0, "sum": 0.0, "correct": 0, "tp": 0, "fp": 0, "fn": 0, "emitted": 0, "positions": 0}
-        for name in ("note_onset", "fret", "pitch", "voice", "duration", "harmonic_presence", "percussion")
+        name: {"count": 0, "sum": 0.0, "correct": 0, "tp": 0, "fp": 0, "fn": 0, "tn": 0, "emitted": 0, "positions": 0}
+        for name in ("note_onset", "fret", "pitch", "voice", "duration", "harmonic_presence", "percussion", "percussion_frame")
     }
     batches = frames = windows = 0
     started = last_log = time.perf_counter()
@@ -731,14 +755,14 @@ def _fixed_config(config):
     return {key: value for key, value in config.items() if key not in ("epochs", "max_steps")}
 
 
-def _require_same_rng(before, after):
+def _require_same_rng(before, after, *, source="Data loading"):
     if not (
         before["python"] == after["python"] and before["numpy"] == after["numpy"]
         and torch.equal(before["torch_cpu"], after["torch_cpu"])
         and len(before["torch_cuda"]) == len(after["torch_cuda"])
         and all(torch.equal(left, right) for left, right in zip(before["torch_cuda"], after["torch_cuda"]))
     ):
-        raise ValueError("Data loading consumed global RNG; exact training resume is unsupported")
+        raise ValueError(f"{source} consumed global RNG; exact training resume is unsupported")
 
 
 def _checked_next(iterator):
@@ -764,17 +788,68 @@ def _require_validation(metrics):
         raise ValueError("Validation needs data and a meaningful supervised objective")
 
 
-def run_training(model, train_loader, validation_loader, config, run_dir, identity, *, resume=None, progress=None):
+def _event_result(value, *, metric=None):
+    result = _json_copy(value)
+    _keys(result, {"score", "metric", "windows"}, "decoded-event evaluation")
+    result["score"] = _finite(result["score"], "decoded-event score")
+    if result["score"] > 1:
+        raise ValueError("Decoded-event score must be within [0, 1]")
+    if type(result["metric"]) is not str or not result["metric"].strip():
+        raise ValueError("Decoded-event metric must be a nonempty string")
+    if metric is not None and result["metric"] != metric:
+        raise ValueError("Decoded-event metric must stay stable within a run")
+    _integer(result["windows"], "decoded-event windows")
+    return result
+
+
+def _best_event_selection(history, run_id):
+    best = None
+    for entry in history:
+        if "decoded_events" not in entry["validation"]:
+            continue
+        result = _event_result(
+            entry["validation"]["decoded_events"], metric=best["metric"] if best else None,
+        )
+        if best is None or result["score"] > best["score"]:
+            best = {
+                "run_id": run_id, "metric": result["metric"], "score": result["score"],
+                "global_step": entry["global_step"], "checkpoint": "best-events.pt",
+            }
+    return best
+
+
+def _evaluate_events(model, evaluator, *, metric=None):
+    modes = [(module, module.training) for module in model.modules()]
+    rng = _capture_rng()
+    try:
+        model.eval()
+        with torch.no_grad():
+            result = evaluator(model)
+        _require_same_rng(rng, _capture_rng(), source="Event evaluation")
+        return _event_result(result, metric=metric)
+    finally:
+        for module, mode in modes:
+            module.training = mode
+        _restore_rng(rng)
+
+
+def run_training(model, train_loader, validation_loader, config, run_dir, identity, *, resume=None, progress=None,
+                 event_evaluator=None):
     """Perform bounded AdamW updates only when explicitly called by the owner.
 
     Epochs and max_steps are total ceilings. Exact resume requires unchanged,
     deterministic map-style loaders with private generators and zero workers.
     The caller must seed model construction separately for reproducible new runs.
+    Optional decoded-event evaluation runs after each training validation, not
+    the initial preflight. Its highest stable-metric score selects best-events.pt;
+    best.pt remains the lowest-loss checkpoint and latest.pt the resume cursor.
     """
     started = time.perf_counter()
-    training_windows = validation_windows = 0
+    training_windows = validation_windows = event_validation_windows = 0
     if not isinstance(config, TrainingConfig):
         raise ValueError("config must be a TrainingConfig")
+    if event_evaluator is not None and not callable(event_evaluator):
+        raise ValueError("event_evaluator must be callable or None")
     identity = _identity(identity)
     model_config = getattr(model, "config", None)
     if model_config is not None and is_dataclass(model_config) and not _json_equal(asdict(model_config), identity["model"]):
@@ -793,6 +868,8 @@ def run_training(model, train_loader, validation_loader, config, run_dir, identi
     if run_dir == run_dir.parent:
         raise ValueError("A filesystem root cannot be a training run directory")
     checkpoint = None
+    best_event = None
+    event_files = ("best-events.pt", "event-selection.json")
     source_stamps = {}
     if resume is None:
         if run_dir.exists() and (not run_dir.is_dir() or any(run_dir.iterdir())):
@@ -835,6 +912,22 @@ def run_training(model, train_loader, validation_loader, config, run_dir, identi
             or not best["history"] or best["history"][-1]["validation"]["loss"] != checkpoint["best_score"]
         ):
             raise ValueError("best.pt and latest.pt do not describe a consistent run")
+        best_event = _best_event_selection(checkpoint["history"], run_id)
+        for filename in event_files:
+            present = (run_dir / filename).exists()
+            if present != (best_event is not None):
+                raise ValueError("Decoded-event selection files and checkpoint history are inconsistent")
+            if present:
+                source_stamps[filename] = _file_stamp(run_dir / filename)
+        if best_event is not None:
+            selection = _read_json(run_dir / "event-selection.json")
+            selected = load_checkpoint(run_dir / "best-events.pt", expected_identity=identity)
+            if (
+                not _json_equal(selection, best_event) or selected["run_id"] != run_id
+                or selected["global_step"] != best_event["global_step"]
+                or not _json_equal(_best_event_selection(selected["history"], run_id), best_event)
+            ):
+                raise ValueError("best-events.pt and event selection do not describe a consistent run")
         if any(_file_stamp(run_dir / name) != stamp for name, stamp in source_stamps.items()):
             raise ValueError("Run changed while its checkpoint was being loaded")
     loss_function, weights = _loss_api()
@@ -889,6 +982,8 @@ def run_training(model, train_loader, validation_loader, config, run_dir, identi
         lock = lock_path.open("xb")
         if any(_file_stamp(run_dir / name) != stamp for name, stamp in source_stamps.items()):
             raise ValueError("Run changed before the training lock was acquired; reload latest.pt")
+        if best_event is None and any((run_dir / name).exists() for name in event_files):
+            raise ValueError("Decoded-event selection files appeared before the training lock was acquired")
         _write_json(run_dir / "run.json", {
             "schema_version": SCHEMA_VERSION, "run_id": run_id, "identity": identity, "config": asdict(config),
         }, replace=checkpoint is not None)
@@ -954,6 +1049,16 @@ def run_training(model, train_loader, validation_loader, config, run_dir, identi
             validation = evaluate_model(model, validation_loader, device, sparsity_weight=config.sparsity_weight, progress=progress, phase=f"Epoch {epoch_index + 1} validation")
             _require_validation(validation)
             validation_windows += validation["windows"]
+            event_improved = False
+            if event_evaluator is not None:
+                _emit(progress, f"Epoch {epoch_index + 1} decoded-event validation: starting.")
+                events = _evaluate_events(
+                    model, event_evaluator, metric=best_event["metric"] if best_event else None,
+                )
+                validation["decoded_events"] = events
+                event_validation_windows += events["windows"]
+                event_improved = best_event is None or events["score"] > best_event["score"]
+                _emit(progress, f"Decoded-event {events['metric']}: {events['score']:.6f} | {events['windows']} windows")
             history.append({
                 "epoch": epoch_index, "global_step": global_step,
                 "epoch_complete": epoch_complete, "validation": validation,
@@ -961,6 +1066,8 @@ def run_training(model, train_loader, validation_loader, config, run_dir, identi
             improved = best_score is None or validation["loss"] < best_score
             if improved:
                 best_score = validation["loss"]
+            if event_improved:
+                best_event = _best_event_selection(history, run_id)
             payload = {
                 "schema_version": SCHEMA_VERSION, "run_id": run_id, "identity": identity,
                 "training_config": asdict(config), "runtime": runtime, "global_step": global_step,
@@ -977,6 +1084,11 @@ def run_training(model, train_loader, validation_loader, config, run_dir, identi
             _emit(progress, "Saving checkpoint and metrics...")
             if improved:
                 _atomic_write(run_dir / "best.pt", lambda stream: torch.save(payload, stream))
+            if event_improved:
+                _emit(progress, "Saving best-events.pt and event-selection.json...")
+                _atomic_write(run_dir / "best-events.pt", lambda stream: torch.save(payload, stream))
+                _write_json(run_dir / "event-selection.json", best_event)
+                _emit(progress, f"Saved best-events.pt | best decoded-event {best_event['metric']} {best_event['score']:.6f}")
             _atomic_write(run_dir / "latest.pt", lambda stream: torch.save(payload, stream))
             _write_json(run_dir / "metrics.json", history)
             saved = "latest.pt, best.pt and metrics.json" if improved else "latest.pt and metrics.json"
@@ -988,10 +1100,13 @@ def run_training(model, train_loader, validation_loader, config, run_dir, identi
             "next_batch_index": next_batch, "best_score": best_score, "validation": validation,
             "stopped_by": "epochs" if epoch >= config.epochs else "max_steps",
             "latest_checkpoint": str(run_dir / "latest.pt"), "best_checkpoint": str(run_dir / "best.pt"),
+            "best_event_checkpoint": str(run_dir / best_event["checkpoint"]) if best_event else None,
+            "best_event_score": best_event["score"] if best_event else None,
             "elapsed_seconds": time.perf_counter() - started,
             "epochs_requested": config.epochs, "epochs_completed_this_run": epoch - initial_epoch,
             "training_steps_processed": global_step - initial_step,
             "training_windows_processed": training_windows, "validation_windows_processed": validation_windows,
+            "event_validation_windows_processed": event_validation_windows,
             "dataset_windows": {"train": runtime["train_loader"]["dataset_size"], "validation": runtime["validation_loader"]["dataset_size"]},
         })
     finally:
