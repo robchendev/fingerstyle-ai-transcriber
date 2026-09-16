@@ -2,6 +2,12 @@
 /data/guitar-perf-gp/
 /data/guitar-perf-gp-normalized/
 /data/guitar-perf-alignment/
+# Dataset privacy must survive a future public code repository.
+# Ignoring paths does not remove dataset metadata already tracked in history.
+/data/
+/docs/PILOT_DATASET*.md
+/docs/ALIGNMENT_*REVIEW.md
+/docs/DATASET_ELIGIBILITY.md
 .venv/
 .tools/
 __pycache__/
