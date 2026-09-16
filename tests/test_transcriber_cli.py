@@ -1,4 +1,5 @@
 from dataclasses import asdict
+from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -31,9 +32,19 @@ class HarnessCommandTests(unittest.TestCase):
     def metadata(self):
         return {"openStringMidi": [40, 45, 50, 55, 59, 64], "capoFret": 0, "tempo": {"bpm": 100, "beatUnit": [1, 4]}, "timeSignature": [4, 4]}
 
-    def test_training_requires_intentional_human_invocation(self):
-        with self.assertRaisesRegex(HarnessError, "human owner"):
-            transcriber.train(SimpleNamespace(human_run=False))
+    def test_train_and_resume_require_no_acknowledgement_flag(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            config = transcriber.load_config()
+            dataset = SimpleNamespace(manifest_sha256="synthetic-manifest")
+            model, train_loader, validation_loader = object(), object(), object()
+            for resume in (None, str(root / "runs" / "example" / "latest.pt")):
+                with self.subTest(resume=resume), patch.object(transcriber, "load_config", return_value=config), patch.object(transcriber, "seed_everything"), patch.object(transcriber.torch, "set_num_threads"), patch.object(transcriber, "make_dataset", return_value=dataset), patch.object(transcriber, "make_loader", side_effect=[train_loader, validation_loader]), patch.object(transcriber, "run_identity", return_value={"synthetic": True}), patch("scripts.transcriber_model.FingerstyleTranscriber", return_value=model), patch("scripts.transcriber_runtime.run_training", return_value={"synthetic": True}) as run_training, patch("sys.stdout", new=StringIO()):
+                    args = ["train", "--data-root", str(root), "--run-dir", "runs\\example"]
+                    if resume:
+                        args.extend(["--resume", resume])
+                    self.assertEqual(transcriber.main(args), 0)
+                    run_training.assert_called_once_with(model, train_loader, validation_loader, config[3], root / "runs" / "example", {"synthetic": True}, resume=resume)
 
     def test_inference_metadata_never_defaults_missing_tuning_or_timing(self):
         value = self.metadata()

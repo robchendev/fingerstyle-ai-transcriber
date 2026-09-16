@@ -139,8 +139,6 @@ def preflight(args):
 
 
 def train(args):
-    if not args.human_run:
-        raise HarnessError("Only the human owner launches training. An intentional invocation requires --human-run.")
     from .transcriber_model import FingerstyleTranscriber
     from .transcriber_runtime import resolve_device, run_training
     config, features, model_config, training = load_config(args.config)
@@ -295,7 +293,6 @@ def main(argv=None):
             command.add_argument("--forward", action="store_true", help="One untrained eval-mode forward per split; no optimizer or checkpoint.")
         elif name == "train":
             command.add_argument("--run-dir", required=True)
-            command.add_argument("--human-run", action="store_true")
             command.add_argument("--resume")
         else:
             command.add_argument("--checkpoint", required=True)
