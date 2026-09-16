@@ -1,10 +1,11 @@
-"""Load only approved private pilot windows and preserve canonical supervision."""
+"""Load approved private windows and preserve canonical supervision."""
 
 from dataclasses import asdict
 import hashlib
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 
 import numpy as np
 import scipy
@@ -157,7 +158,71 @@ def encode_targets(window, canonical, frame_times, model_config, *, negative_ons
     return targets, masks, collisions
 
 
-class PilotDataset(Dataset):
+def negative_onset_coverage(labels):
+    allowed = [True] * 6
+    for note in labels["targets"]["notes"]:
+        if note["isAttack"] is not True or not note["labelMask"]["attack"] or note["sourceSegments"][0]["graceMode"] is not None:
+            allowed[6 - note["string"]] = False
+    return allowed
+
+
+class WindowDataset(Dataset):
+    @staticmethod
+    def _stat(path):
+        value = path.stat()
+        return value.st_size, value.st_mtime_ns
+
+    def check_unchanged(self):
+        for path, original in self._guards.items():
+            if self._stat(path) != original:
+                raise HarnessError("A bound dataset file changed during use; stop and revalidate the release.")
+
+    def __len__(self):
+        return len(self.windows)
+
+    def _features(self, record, window):
+        row, data = record["row"], record["data"]
+        key = hashlib.sha256(json.dumps({"audio": row["audioSha256"], "start": window["startSample"], "stop": window["stopSampleExclusive"], "config": asdict(self.feature_config), "featureImplementation": sha256(Path(__file__).with_name("transcriber_audio.py")), "torch": torch.__version__, "numpy": np.__version__, "scipy": scipy.__version__, "soundfile": soundfile.__version__}, sort_keys=True).encode()).hexdigest()
+        path = self.cache_dir / f"{key}.npz" if self.cache_dir is not None else None
+        if path is not None and (path.resolve() != path.absolute() or path.is_symlink() or path.exists() and path.stat().st_nlink > 1):
+            raise HarnessError("Feature cache files must not alias other assets.")
+        if path is not None and path.exists():
+            with np.load(path, allow_pickle=False) as cached:
+                features = np.array(cached["features"], copy=True)
+                times = np.array(cached["times"], copy=True)
+            expected_samples = ((window["stopSampleExclusive"] - window["startSample"]) * self.feature_config.sample_rate + row["sampleRate"] - 1) // row["sampleRate"]
+            expected_frames = (expected_samples + self.feature_config.hop_length - 1) // self.feature_config.hop_length
+            if features.dtype != np.float32 or features.ndim != 2 or features.shape != (expected_frames, self.feature_config.n_mels) or times.shape != (expected_frames,) or not np.isfinite(features).all() or not np.allclose(times, np.arange(expected_frames) * self.feature_config.hop_seconds):
+                raise HarnessError("Corrupt feature cache; remove it explicitly before retrying.")
+            return torch.from_numpy(features), times
+        samples, rate = read_audio_window(data.audio_path, window["startSample"], window["stopSampleExclusive"], sample_rate=row["sampleRate"], channels=row["channels"], sample_count=data.entry["audioAsset"]["sampleCount"])
+        features, times = audio_features(samples, rate, self.feature_config)
+        if path is not None:
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile(dir=self.cache_dir, prefix=".features-", suffix=".tmp", delete=False) as stream:
+                    temporary = Path(stream.name)
+                    np.savez_compressed(stream, features=features.numpy(), times=times)
+                temporary.replace(path)
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+        return features, times
+
+    def __getitem__(self, index):
+        self.check_unchanged()
+        record, window = self.windows[index]
+        features, times = self._features(record, window)
+        clip_times = times + window["startSample"] / record["row"]["sampleRate"]
+        conditioning = training_conditioning(record, clip_times)
+        targets, masks, collisions = encode_targets(window, record["data"].labels, times, self.model_config, negative_onsets_allowed=record["negativeAllowed"])
+        return {
+            "features": features, "conditioning": conditioning, "targets": targets, "masks": masks,
+            "metadata": {"windowId": window["windowId"], "stringFrameCollisionsMasked": collisions},
+        }
+
+
+class PilotDataset(WindowDataset):
     def __init__(self, manifest_path, split, feature_config, model_config, *, root=ROOT, cache_dir=None):
         self.root = Path(root).resolve()
         self.manifest_path = Path(manifest_path).resolve()
@@ -225,11 +290,7 @@ class PilotDataset(Dataset):
             if payload["windows"] != original["windows"]:
                 raise HarnessError("Released musical targets or masks differ from the approved canonical projection.")
             self._guards[original_path] = self._stat(original_path)
-            negative_allowed = [True] * 6
-            for note in data.labels["targets"]["notes"]:
-                if note["isAttack"] is not True or not note["labelMask"]["attack"] or note["sourceSegments"][0]["graceMode"] is not None:
-                    negative_allowed[6 - note["string"]] = False
-            record = {"data": data, "candidate": candidate, "row": row, "negativeAllowed": negative_allowed}
+            record = {"data": data, "candidate": candidate, "row": row, "negativeAllowed": negative_onset_coverage(data.labels)}
             self.records.append(record)
             for window in payload["windows"]:
                 if not any(a <= window["startSample"] < window["stopSampleExclusive"] <= b for a, b in row["rangeSampleBounds"]):
@@ -238,56 +299,37 @@ class PilotDataset(Dataset):
         if not self.windows or len(self.windows) != manifest["counts"]["windowsBySplit"][split]:
             raise HarnessError("Released split is empty or has an inconsistent window count.")
 
-    @staticmethod
-    def _stat(path):
-        value = path.stat()
-        return value.st_size, value.st_mtime_ns
+class LocalDataset(WindowDataset):
+    def __init__(self, manifest_path, split, feature_config, model_config, *, root=ROOT, cache_dir=None):
+        from .local_dataset_release import release_path, validate_release
 
-    def check_unchanged(self):
-        for path, original in self._guards.items():
-            if self._stat(path) != original:
-                raise HarnessError("A bound dataset file changed during use; stop and revalidate the release.")
-
-    def __len__(self):
-        return len(self.windows)
-
-    def _features(self, record, window):
-        row, data = record["row"], record["data"]
-        key = hashlib.sha256(json.dumps({"audio": row["audioSha256"], "start": window["startSample"], "stop": window["stopSampleExclusive"], "config": asdict(self.feature_config), "featureImplementation": sha256(Path(__file__).with_name("transcriber_audio.py")), "torch": torch.__version__, "numpy": np.__version__, "scipy": scipy.__version__, "soundfile": soundfile.__version__}, sort_keys=True).encode()).hexdigest()
-        path = self.cache_dir / f"{key}.npz" if self.cache_dir is not None else None
-        if path is not None and (path.resolve() != path.absolute() or path.is_symlink() or path.exists() and path.stat().st_nlink > 1):
-            raise HarnessError("Feature cache files must not alias other assets.")
-        if path is not None and path.exists():
-            with np.load(path, allow_pickle=False) as cached:
-                features = np.array(cached["features"], copy=True)
-                times = np.array(cached["times"], copy=True)
-            expected_samples = ((window["stopSampleExclusive"] - window["startSample"]) * self.feature_config.sample_rate + row["sampleRate"] - 1) // row["sampleRate"]
-            expected_frames = (expected_samples + self.feature_config.hop_length - 1) // self.feature_config.hop_length
-            if features.dtype != np.float32 or features.ndim != 2 or features.shape != (expected_frames, self.feature_config.n_mels) or times.shape != (expected_frames,) or not np.isfinite(features).all() or not np.allclose(times, np.arange(expected_frames) * self.feature_config.hop_seconds):
-                raise HarnessError("Corrupt feature cache; remove it explicitly before retrying.")
-            return torch.from_numpy(features), times
-        samples, rate = read_audio_window(data.audio_path, window["startSample"], window["stopSampleExclusive"], sample_rate=row["sampleRate"], channels=row["channels"], sample_count=data.entry["audioAsset"]["sampleCount"])
-        features, times = audio_features(samples, rate, self.feature_config)
-        if path is not None:
-            temporary = None
-            try:
-                with tempfile.NamedTemporaryFile(dir=self.cache_dir, prefix=".features-", suffix=".tmp", delete=False) as stream:
-                    temporary = Path(stream.name)
-                    np.savez_compressed(stream, features=features.numpy(), times=times)
-                temporary.replace(path)
-            finally:
-                if temporary is not None:
-                    temporary.unlink(missing_ok=True)
-        return features, times
-
-    def __getitem__(self, index):
-        self.check_unchanged()
-        record, window = self.windows[index]
-        features, times = self._features(record, window)
-        clip_times = times + window["startSample"] / record["row"]["sampleRate"]
-        conditioning = training_conditioning(record, clip_times)
-        targets, masks, collisions = encode_targets(window, record["data"].labels, times, self.model_config, negative_onsets_allowed=record["negativeAllowed"])
-        return {
-            "features": features, "conditioning": conditioning, "targets": targets, "masks": masks,
-            "metadata": {"windowId": window["windowId"], "stringFrameCollisionsMasked": collisions},
-        }
+        self.root = Path(root).resolve()
+        self.manifest_path = Path(manifest_path).absolute()
+        if not self.manifest_path.is_relative_to(self.root):
+            raise HarnessError("The release manifest must be inside its declared private data root.")
+        if split not in ("train", "validation"):
+            raise HarnessError("Local releases contain train and validation splits only.")
+        if feature_config.n_mels != model_config.n_mels or model_config.conditioning_dim != 12:
+            raise HarnessError("Feature/model dimensions disagree.")
+        self.feature_config, self.model_config = feature_config, model_config
+        manifest, records, bindings = validate_release(self.manifest_path)
+        self.manifest_sha256 = bindings[self.manifest_path]
+        self._guards = {path: self._stat(path) for path in bindings}
+        self.cache_dir = Path(cache_dir).resolve() if cache_dir is not None else None
+        if self.cache_dir is not None:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.records, self.windows = [], []
+        for row, payload in records:
+            if row["split"] != split:
+                continue
+            labels = payload["canonical"]
+            data = SimpleNamespace(
+                labels=labels, normalization=payload["normalization"],
+                audio_path=release_path(self.manifest_path.parent, row["audioPath"], "audio"),
+                entry={"audioAsset": {"sampleCount": row["sampleCount"]}},
+            )
+            record = {"data": data, "candidate": payload["candidate"], "row": row, "negativeAllowed": negative_onset_coverage(labels)}
+            self.records.append(record)
+            self.windows.extend((record, window) for window in payload["windows"])
+        if len(self.windows) != manifest["counts"]["windowsBySplit"][split]:
+            raise HarnessError("Local release window count changed during loading.")

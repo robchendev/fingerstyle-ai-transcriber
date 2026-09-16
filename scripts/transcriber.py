@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 from .align_pilot import publish_json
 from .catalogs import ROOT, read_json, sha256
 from .transcriber_audio import FeatureConfig, HarnessError, audio_features, conditioning_features, read_audio_window
-from .transcriber_data import EpochShuffleSampler, PilotDataset, collate_windows
+from .transcriber_data import EpochShuffleSampler, LocalDataset, PilotDataset, collate_windows
 
 
 def private_output(path, root=ROOT):
@@ -74,10 +74,14 @@ def seed_everything(seed):
 
 
 def make_dataset(config, feature_config, model_config, split, root, manifest_override=None):
+    from .local_dataset_release import RELEASE_KIND
+
     manifest = Path(manifest_override or config["data"]["manifest"])
     if not manifest.is_absolute():
         manifest = Path(root) / manifest
-    return PilotDataset(manifest, split, feature_config, model_config, root=root, cache_dir=private_output(config["data"]["cache"], root))
+    kind = read_json(manifest).get("kind")
+    dataset_type = LocalDataset if kind == RELEASE_KIND else PilotDataset
+    return dataset_type(manifest, split, feature_config, model_config, root=root, cache_dir=private_output(config["data"]["cache"], root))
 
 
 def make_loader(dataset, config, training, *, shuffle):
@@ -94,13 +98,15 @@ def run_identity(dataset, config, features, model, training, device):
     settings.pop("epochs", None)
     settings.pop("max_steps", None)
     modules = ("transcriber.py", "transcriber_audio.py", "transcriber_data.py", "transcriber_model.py", "transcriber_runtime.py")
+    if isinstance(dataset, LocalDataset):
+        modules += ("local_dataset_release.py", "prepare_pilot_windows.py", "score_alignment.py")
     return {
         "schemaVersion": 1, "manifest_sha256": dataset.manifest_sha256,
         "features": asdict(features), "model": asdict(model), "training": settings,
         "batch_size": config["data"]["batch_size"], "num_workers": config["data"]["num_workers"],
         "device": str(device), "implementationSha256": {name: sha256(Path(__file__).with_name(name)) for name in modules},
         "runtime": {"torch": str(torch.__version__), "numpy": np.__version__, "scipy": scipy.__version__, "soundfile": sf.__version__},
-        "dataPolicy": "private-approved-pilot; no source legends or presentation settings as model inputs",
+        "dataPolicy": "private-approved-local-release; no source legends or presentation settings as model inputs" if isinstance(dataset, LocalDataset) else "private-approved-pilot; no source legends or presentation settings as model inputs",
     }
 
 
