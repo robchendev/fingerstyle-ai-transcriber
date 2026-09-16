@@ -1,6 +1,7 @@
 """Prepare private local GP/trimmed-audio pairs without an LLM or training."""
 
 import argparse
+from collections.abc import Sequence
 from copy import deepcopy
 from io import BytesIO
 from importlib.metadata import version as package_version
@@ -21,7 +22,7 @@ from .audio_alignment import AlignmentError, align_first_attack, audio_features,
 from .audio_tools import AcquisitionError, executable, probe, run_media
 from .canonical_events import canonical_counts, canonicalize, dead_note_marks, fraction, pitched_note_marks
 from .dataset_io import ROOT, read_json, sha256
-from .dataset_release import candidate_digest, mapping_risks, release_scope, validate_mapping, validate_release
+from .dataset_release import candidate_digest, mapping_risks, release_scope, validate_mapping, validate_release, validation_groups as read_validation_groups
 from .gp_events import catalog_timing, decode_score, performance_events, playback_order
 from .gp_normalization import normalize_gp_bytes
 from .inspect_gp_files import GpInspectionError, inspect_gp, read_gp
@@ -617,20 +618,23 @@ def review_pair(workspace, pair, args):
     return report
 
 
-def release_dataset(workspace, version, validation_group, identifiers=None, *, reviewer=None, authorize_release=False):
+def release_dataset(workspace, version, validation_groups, identifiers=None, *, reviewer=None, authorize_release=False):
     if authorize_release is not True or not isinstance(reviewer, str) or not reviewer.strip():
-        raise ValueError("Release requires --reviewer and --authorize-release: explicitly authorize the entire selected scope and chosen validation group.")
+        raise ValueError("Release requires --reviewer and --authorize-release: explicitly authorize the entire selected scope and chosen validation groups.")
     safe_id(version)
-    if not validation_group.strip():
-        raise ValueError("Choose an explicit nonempty validation relationship group.")
+    if isinstance(validation_groups, str) or not isinstance(validation_groups, Sequence):
+        raise ValueError("Validation groups must be an explicit sequence of group IDs.")
+    validation_groups = list(read_validation_groups({"validationGroups": list(validation_groups)}))
     entries, payloads, sources, review_hashes = [], {}, {}, {}
     counts = {"train": 0, "validation": 0}
     selected = selection(workspace, identifiers)
+    if set(validation_groups) - {pair["groupId"] for pair in selected}:
+        raise ValueError("Every validation group must be present in the explicitly selected pairs.")
     for pair in selected:
         directory, state = load_current(workspace, pair)
         review = load_review(directory, state)
         approval = deepcopy(review["approval"])
-        split = "validation" if pair["groupId"] == validation_group else "train"
+        split = "validation" if pair["groupId"] in validation_groups else "train"
         if any(approval.get(field) is not True for field in CONFIRMATIONS.values()) or approval.get("split") not in (None, split) or approval.get("groupId") != pair["groupId"]:
             raise ValueError(f"{pair['id']}: missing human source/notation/use/group/range approval, or reviewed split differs from --validation-group.")
         labels, normalization, clock, _ = score_positions(directory)
@@ -674,7 +678,7 @@ def release_dataset(workspace, version, validation_group, identifiers=None, *, r
         raise ValueError("A release requires nonempty train AND validation windows from different relationship groups.")
     authorization = {
         "schemaVersion": 1, "kind": "local-release-authorization", "reviewer": reviewer,
-        "version": version, "validationGroup": validation_group, "authorizedUse": True,
+        "version": version, "validationGroups": validation_groups, "authorizedUse": True,
         "approveExperimentalRangesAndSplit": True, "groupingConfirmed": True,
         "distributionAuthorized": False, "trainingExecution": "human-owner-only",
         "selectedScope": release_scope([(entry, payloads[entry["id"]]) for entry in entries]),
@@ -686,7 +690,7 @@ def release_dataset(workspace, version, validation_group, identifiers=None, *, r
         "schemaVersion": 1, "kind": "local-training-dataset", "trainingReady": True,
         "visibility": "private", "distributionAuthorized": False,
         "entries": entries, "counts": {"windowsBySplit": counts}, "version": version,
-        "trainingExecution": "human-owner-only", "validationGroup": validation_group,
+        "trainingExecution": "human-owner-only", "validationGroups": validation_groups,
         "releaseAuthorization": authorization,
     }
     releases = regular_path(workspace / "releases")
@@ -775,12 +779,16 @@ def parser():
     review.add_argument("--acknowledge-uncertainty", action="store_true")
     review.add_argument("--cue", action="append", help="Generate plain/cued WAV for an ordinal, first-attack or end.")
     review.add_argument("--listen", action="store_true", help="Open requested cue WAVs in the Windows default player.")
+    proposal = commands.add_parser("propose", help="Write a private dataset proposal without approving sources, releasing data or running training.")
+    proposal.add_argument("--name", required=True)
+    proposal.add_argument("--validation-group-count", type=int, default=10, help="Target number of independent validation relationship groups, not recordings (default: 10).")
+    proposal.add_argument("--validation-ids", nargs="+", help="Explicit validation recording IDs; their complete relationship groups stay together.")
     release = commands.add_parser("release", help="Freeze a private self-contained release; NEVER runs training.")
     release.add_argument("--version", required=True)
-    release.add_argument("--validation-group", required=True)
+    release.add_argument("--validation-group", dest="validation_groups", action="append", required=True, help="Existing relationship group to hold out; repeat for multiple independent groups.")
     release.add_argument("--ids", nargs="+", help="Explicit subset; omit uncertain pairs rather than fabricating approval.")
     release.add_argument("--reviewer", help="Human owner authorizing this complete release scope and split.")
-    release.add_argument("--authorize-release", action="store_true", help="Explicitly authorize the chosen validation group and ALL selected pairs/ranges (all pairs unless --ids is supplied).")
+    release.add_argument("--authorize-release", action="store_true", help="Explicitly authorize the chosen validation groups and ALL selected pairs/ranges (all pairs unless --ids is supplied).")
     commands.add_parser("status", help="Report stale, blocked and reviewed pairs without running training.")
     return result
 
@@ -801,8 +809,15 @@ def main(argv=None):
             output = {"id": args.id, "status": "invalidated", "frozenReleases": "unchanged"}
         elif args.command == "review":
             output = review_pair(workspace, selection(workspace, [args.id])[0], args)
+        elif args.command == "propose":
+            from .dataset_proposal import propose_dataset
+
+            output = propose_dataset(
+                workspace, args.name, validation_group_count=args.validation_group_count,
+                validation_ids=args.validation_ids, progress=lambda message: print(message, flush=True),
+            )
         elif args.command == "release":
-            output = release_dataset(workspace, args.version, args.validation_group, args.ids, reviewer=args.reviewer, authorize_release=args.authorize_release)
+            output = release_dataset(workspace, args.version, args.validation_groups, args.ids, reviewer=args.reviewer, authorize_release=args.authorize_release)
         else:
             output = status(workspace)
         print(json.dumps(output, ensure_ascii=False, allow_nan=False, indent=2))

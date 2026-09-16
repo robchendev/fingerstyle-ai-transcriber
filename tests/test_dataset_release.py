@@ -13,7 +13,7 @@ import torch
 
 from scripts import transcriber
 from scripts.dataset_io import ROOT, read_json, sha256, publish_json
-from scripts.dataset_release import candidate_digest, release_scope, validate_mapping, validate_release
+from scripts.dataset_release import candidate_digest, release_scope, validate_mapping, validate_release, validation_groups
 from scripts.percussion_supervision import percussion_annotation_coverage
 from scripts.training_windows import projected_targets, targets_in_window
 from scripts.score_alignment import ScoreClock
@@ -23,9 +23,9 @@ from scripts.transcriber_model import ModelConfig
 from tests.test_score_alignment import clock_fixture
 
 
-def synthetic_release(root, *, plateau=False, percussion_complete=None, unresolved_percussion=None):
+def synthetic_release(root, *, plateau=False, percussion_complete=None, unresolved_percussion=None, validation_groups=("piece-1",), frozen_scalar=False):
     entries, records = [], []
-    for index, split in enumerate(("train", "validation")):
+    for index, split in enumerate(("train",) + ("validation",) * len(validation_groups)):
         identifier = f"piece-{index}"
         rate = 8000
         audio = root / "audio" / f"{identifier}.flac"
@@ -74,9 +74,10 @@ def synthetic_release(root, *, plateau=False, percussion_complete=None, unresolv
             "targetsPath": f"targets\\{identifier}.json",
         })
         records.append((entries[-1], payload))
+    group_fields = {"validationGroup": validation_groups[0]} if frozen_scalar else {"validationGroups": list(validation_groups)}
     authorization = {
         "schemaVersion": 1, "kind": "local-release-authorization", "reviewer": "Synthetic reviewer",
-        "version": "v1", "validationGroup": "piece-1", "authorizedUse": True,
+        "version": "v1", **group_fields, "authorizedUse": True,
         "approveExperimentalRangesAndSplit": True, "groupingConfirmed": True,
         "distributionAuthorized": False, "trainingExecution": "human-owner-only",
         "selectedScope": release_scope(records),
@@ -88,25 +89,164 @@ def synthetic_release(root, *, plateau=False, percussion_complete=None, unresolv
         publish_json(target, payload)
         entry["targetsSha256"] = sha256(target)
     manifest = root / "manifest.json"
-    publish_json(manifest, {"schemaVersion": 1, "kind": "local-training-dataset", "trainingReady": True, "visibility": "private", "distributionAuthorized": False, "entries": entries, "counts": {"windowsBySplit": {"train": 1, "validation": 1}}, "version": "v1", "validationGroup": "piece-1", "trainingExecution": "human-owner-only", "releaseAuthorization": authorization})
+    publish_json(manifest, {"schemaVersion": 1, "kind": "local-training-dataset", "trainingReady": True, "visibility": "private", "distributionAuthorized": False, "entries": entries, "counts": {"windowsBySplit": {"train": 1, "validation": len(validation_groups)}}, "version": "v1", **group_fields, "trainingExecution": "human-owner-only", "releaseAuthorization": authorization})
     return manifest
 
 
 class DatasetReleaseTests(unittest.TestCase):
-    def test_unconfirmed_schema_one_release_keeps_exact_bytes_and_projection(self):
+    def test_validation_group_documents_preserve_order_and_reject_invalid_or_ambiguous_ids(self):
+        document = {"validationGroups": ["piece-2", "piece-1"]}
+        self.assertEqual(validation_groups(document), ("piece-2", "piece-1"))
+        self.assertEqual(document, {"validationGroups": ["piece-2", "piece-1"]})
+        self.assertEqual(validation_groups({"validationGroup": "piece-1"}), ("piece-1",))
+        for document in (
+            None, {}, {"validationGroup": "piece-1", "validationGroups": ["piece-1"]},
+            *({"validationGroups": groups} for groups in (None, "piece-1", (), {}, [], [""], [" "], [None], [12], [["nested"]], ["piece-1", "piece-1"])),
+            *({"validationGroup": group} for group in (None, "", " ", 12, ["piece-1"])),
+        ):
+            with self.subTest(document=document), self.assertRaises(ValueError):
+                validation_groups(document)
+
+    def test_frozen_scalar_schema_one_release_keeps_exact_bytes_and_projection(self):
         with TemporaryDirectory(dir=ROOT) as directory:
             root = Path(directory).resolve()
-            manifest_path = synthetic_release(root)
+            manifest_path = synthetic_release(root, frozen_scalar=True)
             before = {path: sha256(path) for path in root.rglob("*") if path.is_file()}
             with patch("scripts.dataset_release.percussion_annotation_coverage", side_effect=AssertionError("No completeness approval")):
                 manifest, records, _ = validate_release(manifest_path)
             self.assertEqual(before, {path: sha256(path) for path in before})
             self.assertEqual(manifest["schemaVersion"], 1)
+            self.assertEqual(manifest["validationGroup"], "piece-1")
+            self.assertEqual(manifest["releaseAuthorization"]["validationGroup"], "piece-1")
+            self.assertNotIn("validationGroups", manifest)
+            self.assertNotIn("validationGroups", manifest["releaseAuthorization"])
             self.assertTrue(all("percussionAnnotationsComplete" not in scope for scope in manifest["releaseAuthorization"]["selectedScope"]))
             for _, payload in records:
                 targets = payload["windows"][0]["targets"]
                 self.assertNotIn("percussionAnnotationCoverage", targets)
                 self.assertFalse(targets["negativePercussionSupervision"])
+
+    def test_multiple_validation_groups_preserve_order_in_the_existing_loader(self):
+        with TemporaryDirectory(dir=ROOT) as directory:
+            root = Path(directory).resolve()
+            manifest_path = synthetic_release(root, validation_groups=["piece-2", "piece-1"])
+            manifest, records, _ = validate_release(manifest_path)
+            self.assertEqual(validation_groups(manifest), ("piece-2", "piece-1"))
+            self.assertEqual(validation_groups(manifest["releaseAuthorization"]), ("piece-2", "piece-1"))
+            self.assertEqual([entry["split"] for entry, _ in records], ["train", "validation", "validation"])
+            features = FeatureConfig(sample_rate=8000, n_fft=512, hop_length=160, n_mels=16, f_max=3000)
+            dataset = TrainingDataset(manifest_path, "validation", features, ModelConfig(n_mels=16), root=root)
+            self.assertEqual(len(dataset), 2)
+            self.assertEqual([dataset[index]["metadata"]["windowId"].split(":")[0] for index in range(len(dataset))], ["piece-1", "piece-2"])
+
+    def test_confirmed_frozen_scalar_release_loads_without_rewriting_assets_or_supervision(self):
+        with TemporaryDirectory(dir=ROOT) as directory:
+            root = Path(directory).resolve()
+            manifest_path = synthetic_release(root, frozen_scalar=True, percussion_complete=True)
+            before = {path: sha256(path) for path in root.rglob("*") if path.is_file()}
+            manifest, records, _ = validate_release(manifest_path)
+            self.assertEqual(manifest["validationGroup"], "piece-1")
+            self.assertNotIn("validationGroups", manifest)
+            self.assertTrue(all(scope["percussionAnnotationsComplete"] for scope in manifest["releaseAuthorization"]["selectedScope"]))
+            for _, payload in records:
+                targets = payload["windows"][0]["targets"]
+                self.assertEqual(targets["percussionAnnotationCoverage"], [[0., 6.]])
+                self.assertTrue(targets["negativePercussionSupervision"])
+            features = FeatureConfig(sample_rate=8000, n_fft=512, hop_length=160, n_mels=16, f_max=3000)
+            dataset = TrainingDataset(manifest_path, "validation", features, ModelConfig(n_mels=16), root=root)
+            self.assertEqual(len(dataset), 1)
+            self.assertEqual(dataset[0]["metadata"]["windowId"], "piece-1:0-48000")
+            self.assertEqual(before, {path: sha256(path) for path in root.rglob("*") if path.is_file()})
+
+    def test_manifest_and_authorization_reject_dual_fields_and_mismatched_group_lists(self):
+        with TemporaryDirectory(dir=ROOT) as directory:
+            manifest_path = synthetic_release(Path(directory).resolve(), validation_groups=["piece-2", "piece-1"])
+            original = read_json(manifest_path)
+            for name in ("manifest", "authorization"):
+                for fields, error in (
+                    ({"validationGroup": "piece-1"}, "exactly one"),
+                    ({"validationGroups": ["piece-1", "piece-2"]}, "different release or validation group list"),
+                    ({"validationGroups": ["piece-1"]}, "different release or validation group list"),
+                    ({"validationGroups": ["piece-2", "piece-2"]}, "must be unique"),
+                    ({"validationGroups": []}, "nonempty list"),
+                ):
+                    manifest = deepcopy(original)
+                    document = manifest if name == "manifest" else manifest["releaseAuthorization"]
+                    document.update(fields)
+                    publish_json(manifest_path, manifest)
+                    with self.subTest(document=name, fields=fields), self.assertRaisesRegex(ValueError, error):
+                        validate_release(manifest_path)
+
+    def test_authorization_binds_exact_group_order_scope_and_per_recording_digest(self):
+        with TemporaryDirectory(dir=ROOT) as directory:
+            manifest_path = synthetic_release(Path(directory).resolve(), validation_groups=["piece-2", "piece-1"])
+            original = read_json(manifest_path)
+            for change, error in (
+                ("groups-with-old-hash", "selected dataset scope"),
+                ("scope-with-new-hash", "selected dataset scope"),
+                ("groups-with-new-hash", "recording approval differs"),
+            ):
+                manifest = deepcopy(original)
+                authorization = manifest["releaseAuthorization"]
+                if change == "scope-with-new-hash":
+                    authorization["selectedScope"].reverse()
+                else:
+                    manifest["validationGroups"].reverse()
+                    authorization["validationGroups"].reverse()
+                digest = candidate_digest({key: value for key, value in authorization.items() if key != "sha256"})
+                self.assertNotEqual(digest, original["releaseAuthorization"]["sha256"])
+                if change != "groups-with-old-hash":
+                    authorization["sha256"] = digest
+                publish_json(manifest_path, manifest)
+                with self.subTest(change=change), self.assertRaisesRegex(ValueError, error):
+                    validate_release(manifest_path)
+
+    def test_authorized_validation_groups_cannot_be_absent_from_selected_recordings(self):
+        with TemporaryDirectory(dir=ROOT) as directory:
+            manifest_path = synthetic_release(Path(directory).resolve(), validation_groups=["piece-2", "piece-1"])
+            manifest = read_json(manifest_path)
+            authorization = manifest["releaseAuthorization"]
+            for document in (manifest, authorization):
+                document["validationGroups"].append("absent-group")
+            authorization["sha256"] = candidate_digest({key: value for key, value in authorization.items() if key != "sha256"})
+            publish_json(manifest_path, manifest)
+            with self.assertRaisesRegex(ValueError, "present in the selected recordings"):
+                validate_release(manifest_path)
+
+    def test_multiple_validation_groups_do_not_allow_group_audio_or_gp_leakage(self):
+        for duplicate, error in (("group", "related recording group"), ("audio", "Identical audio"), ("score", "Identical GP scores")):
+            with self.subTest(duplicate=duplicate), TemporaryDirectory(dir=ROOT) as directory:
+                root = Path(directory).resolve()
+                manifest_path = synthetic_release(root, validation_groups=["piece-2", "piece-1"])
+                manifest = read_json(manifest_path)
+                train, validation = manifest["entries"][0], manifest["entries"][2]
+                target = root / "targets" / "piece-2.json"
+                payload = read_json(target)
+                if duplicate == "group":
+                    validation["groupId"] = train["groupId"]
+                elif duplicate == "audio":
+                    shutil.copyfile(root / "audio" / "piece-0.flac", root / "audio" / "piece-2.flac")
+                    validation["audioSha256"] = train["audioSha256"]
+                    payload["approval"]["audioSha256"] = train["audioSha256"]
+                else:
+                    payload["approval"]["sourceGpSha256"] = read_json(root / "targets" / "piece-0.json")["approval"]["sourceGpSha256"]
+                publish_json(target, payload)
+                validation["targetsSha256"] = sha256(target)
+                publish_json(manifest_path, manifest)
+                with self.assertRaisesRegex(ValueError, error):
+                    validate_release(manifest_path)
+
+    def test_multiple_validation_groups_still_require_both_nonempty_splits(self):
+        with TemporaryDirectory(dir=ROOT) as directory:
+            manifest_path = synthetic_release(Path(directory).resolve(), validation_groups=["piece-2", "piece-1"])
+            original = read_json(manifest_path)
+            for split in ("train", "validation"):
+                manifest = deepcopy(original)
+                manifest["entries"] = [entry for entry in manifest["entries"] if entry["split"] == split]
+                manifest["counts"]["windowsBySplit"] = {name: len(manifest["entries"]) if name == split else 0 for name in ("train", "validation")}
+                publish_json(manifest_path, manifest)
+                with self.subTest(remaining_split=split), self.assertRaisesRegex(ValueError, "split counts are empty"):
+                    validate_release(manifest_path)
 
     def test_explicit_completeness_is_optional_and_bound_in_release_scope(self):
         for complete in (False, True):
@@ -267,7 +407,7 @@ class DatasetReleaseTests(unittest.TestCase):
                 {**manifest, "entries": [manifest["entries"][0], {**manifest["entries"][1], "groupId": "piece-0"}]},
                 {**manifest, "entries": [manifest["entries"][0], {**manifest["entries"][1], "split": "test"}]},
                 {**manifest, "releaseAuthorization": {**manifest["releaseAuthorization"], "selectedScope": []}},
-                {**manifest, "validationGroup": "piece-0"},
+                {**manifest, "validationGroups": ["piece-0"]},
             ):
                 publish_json(manifest_path, changed)
                 with self.assertRaises(ValueError):

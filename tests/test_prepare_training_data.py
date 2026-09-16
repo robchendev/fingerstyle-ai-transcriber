@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 from uuid import uuid4
 import xml.etree.ElementTree as ET
 
@@ -19,8 +19,11 @@ from scripts.dataset_io import read_json, sha256
 from scripts.audio_tools import AcquisitionError, executable
 from scripts.dataset_release import candidate_digest, validate_release
 from scripts.percussion_supervision import percussion_annotation_coverage
-from scripts.prepare_training_data import ARTIFACTS, automatic_candidate, extract_score, main, parser, rules_template, selection, source_paths, workspace_path
+from scripts.prepare_training_data import ARTIFACTS, CODE_FILES, automatic_candidate, extract_score, main, parser, release_dataset, rules_template, selection, source_paths, workspace_path
 from scripts.score_alignment import ScoreClock
+from scripts.transcriber_audio import FeatureConfig
+from scripts.transcriber_data import TrainingDataset
+from scripts.transcriber_model import ModelConfig
 from tests.test_gp_events import musical_score, note_xml
 from tests.test_gp_normalization import archive_bytes
 
@@ -138,6 +141,93 @@ class TrainingPreparationTests(unittest.TestCase):
 
     def release(self, version="v1"):
         return self.run_cli("release", "--version", version, "--validation-group", "group-pair-B")
+
+    def test_propose_cli_forwards_selection_and_streams_progress_without_mutating_sources(self):
+        self.add("pair-A")
+        before = {path: sha256(path) for path in self.workspace.rglob("*") if path.is_file()}
+
+        def propose(workspace, name, *, validation_group_count, validation_ids, progress):
+            progress("Proposal: synthetic progress.")
+            return {"trainingReady": False, "proposalPath": str(workspace / "proposals" / f"{name}.json")}
+
+        for options, count, identifiers in (
+            ([], 10, None),
+            (["--validation-group-count", "2", "--validation-ids", "pair-C", "pair-B"], 2, ["pair-C", "pair-B"]),
+        ):
+            output, errors = StringIO(), StringIO()
+            with self.subTest(options=options), patch("scripts.dataset_proposal.propose_dataset", side_effect=propose) as proposal, patch("scripts.prepare_training_data.prepare_pair", side_effect=AssertionError("A proposal must not reprepare sources")), patch("scripts.prepare_training_data.release_dataset", side_effect=AssertionError("A proposal must not activate a release")), redirect_stdout(output), redirect_stderr(errors):
+                self.assertEqual(main(["--workspace", str(self.workspace), "propose", "--name", "representative", *options]), 0, errors.getvalue())
+            proposal.assert_called_once_with(self.workspace, "representative", validation_group_count=count, validation_ids=identifiers, progress=ANY)
+            progress, _, document = output.getvalue().partition("\n")
+            self.assertEqual(progress, "Proposal: synthetic progress.")
+            self.assertFalse(json.loads(document)["trainingReady"])
+            self.assertEqual(before, {path: sha256(path) for path in self.workspace.rglob("*") if path.is_file()})
+        self.assertNotIn("dataset_proposal.py", CODE_FILES)
+
+    def test_release_api_rejects_scalar_unordered_empty_and_duplicate_group_inputs(self):
+        for groups in (
+            None, "group-pair-B", b"group-pair-B", {"group-pair-B"}, {"group-pair-B": True},
+            [], (), [""], [" "], [None], [12], [["nested"]], ["group-pair-B", "group-pair-B"],
+        ):
+            with self.subTest(groups=groups), self.assertRaisesRegex(ValueError, "Validation group"):
+                release_dataset(self.workspace, "v1", groups, reviewer="synthetic-owner", authorize_release=True)
+        self.run_cli(
+            "release", "--version", "v1", "--validation-group", "group-pair-B",
+            "--validation-group", "group-pair-B", error="must be unique",
+        )
+        self.assertFalse((self.workspace / "releases").exists())
+
+    def test_requested_validation_groups_must_exist_in_the_explicit_pair_selection(self):
+        self.add("pair-A")
+        self.add("pair-B", 2)
+        self.add("pair-C", 4)
+        for group in ("group-pair-C", "unregistered-group"):
+            with self.subTest(group=group):
+                self.run_cli(
+                    "release", "--version", "v1", "--ids", "pair-A", "pair-B",
+                    "--validation-group", "group-pair-B", "--validation-group", group,
+                    error="present in the explicitly selected pairs",
+                )
+        self.assertFalse((self.workspace / "releases").exists())
+
+    def test_repeated_validation_groups_release_and_load_independent_recordings_in_one_dataset(self):
+        self.add("pair-A")
+        self.add("pair-B", 2)
+        self.add("pair-C", 4)
+        self.run_cli("prepare", "--accept-owner-conventions")
+        self.add("unselected", 6)
+        for identifier in ("pair-A", "pair-B", "pair-C"):
+            self.approve(identifier)
+        arguments = (
+            "release", "--version", "multi", "--ids", "pair-B", "pair-A", "pair-C",
+            "--validation-group", "group-pair-C", "--validation-group", "group-pair-B",
+        )
+        self.run_cli(*arguments, error="reviewed split differs")
+        self.assertFalse((self.workspace / "releases").exists())
+        self.approve("pair-C", split="validation")
+        source_reviews = {identifier: sha256(self.workspace / "pairs" / identifier / "review.json") for identifier in ("pair-A", "pair-B", "pair-C")}
+        released = self.run_cli(*arguments)
+        manifest_path = Path(released["manifestPath"])
+        manifest, records, _ = validate_release(manifest_path)
+        self.assertEqual(manifest["kind"], "local-training-dataset")
+        self.assertEqual(manifest["schemaVersion"], 1)
+        self.assertEqual(manifest["validationGroups"], ["group-pair-C", "group-pair-B"])
+        self.assertEqual(manifest["releaseAuthorization"]["validationGroups"], manifest["validationGroups"])
+        self.assertNotIn("validationGroup", manifest)
+        self.assertNotIn("validationGroup", manifest["releaseAuthorization"])
+        self.assertEqual(
+            [(entry["id"], entry["groupId"], entry["split"]) for entry, _ in records],
+            [("pair-B", "group-pair-B", "validation"), ("pair-A", "group-pair-A", "train"), ("pair-C", "group-pair-C", "validation")],
+        )
+        features = FeatureConfig(sample_rate=8000, n_fft=512, hop_length=160, n_mels=16, f_max=3000)
+        dataset = TrainingDataset(manifest_path, "validation", features, ModelConfig(n_mels=16), root=self.workspace)
+        self.assertEqual(len(dataset), manifest["counts"]["windowsBySplit"]["validation"])
+        self.assertEqual({dataset[index]["metadata"]["windowId"].split(":")[0] for index in range(len(dataset))}, {"pair-B", "pair-C"})
+        frozen = {path: sha256(path) for path in manifest_path.parent.rglob("*") if path.is_file()}
+        self.run_cli(*arguments)
+        self.assertEqual(frozen, {path: sha256(path) for path in frozen})
+        self.assertEqual(source_reviews, {identifier: sha256(self.workspace / "pairs" / identifier / "review.json") for identifier in source_reviews})
+        self.assertEqual([path.name for path in (self.workspace / "releases").iterdir()], ["multi"])
 
     def test_completeness_confirmation_requires_reviewer_and_grants_no_other_approval(self):
         self.add("pair-A")
@@ -664,7 +754,10 @@ class TrainingPreparationTests(unittest.TestCase):
         self.run_cli("release", "--version", "v1", "--validation-group", "group-pair-B", authorize_release=False, error="--authorize-release")
         manifest, records, _ = validate_release(self.release()["manifestPath"])
         authorization = manifest["releaseAuthorization"]
-        self.assertEqual(authorization["validationGroup"], "group-pair-B")
+        self.assertEqual(manifest["validationGroups"], ["group-pair-B"])
+        self.assertEqual(authorization["validationGroups"], ["group-pair-B"])
+        self.assertNotIn("validationGroup", manifest)
+        self.assertNotIn("validationGroup", authorization)
         self.assertEqual([(item["id"], item["split"]) for item in authorization["selectedScope"]], [("pair-A", "train"), ("pair-B", "validation")])
         self.assertEqual(authorization["sha256"], candidate_digest({key: value for key, value in authorization.items() if key != "sha256"}))
         for entry, payload in records:

@@ -24,6 +24,17 @@ def candidate_digest(candidate):
     return hashlib.sha256(json.dumps(candidate, sort_keys=True, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
+def validation_groups(document):
+    if not isinstance(document, dict) or ("validationGroups" in document) == ("validationGroup" in document):
+        raise ValueError("Specify exactly one of validationGroups or historical validationGroup.")
+    groups = document["validationGroups"] if "validationGroups" in document else [document["validationGroup"]]
+    if not isinstance(groups, list) or not groups or any(not isinstance(group, str) or not group.strip() for group in groups):
+        raise ValueError("Validation groups must be a nonempty list of nonempty string IDs.")
+    if len(groups) != len(set(groups)):
+        raise ValueError("Validation group IDs must be unique.")
+    return tuple(groups)
+
+
 def release_scope(records):
     return [{
         "id": entry["id"], "groupId": entry["groupId"], "split": entry["split"],
@@ -47,14 +58,17 @@ def _validate_authorization(manifest, records):
         raise ValueError("Invalid release reviewer or batch authorization decisions.")
     if any(value.get("trainingExecution") != "human-owner-only" for value in (manifest, authorization)):
         raise ValueError("Dataset preparation does not authorize automatic training.")
-    if authorization["version"] != manifest["version"] or authorization["validationGroup"] != manifest["validationGroup"]:
-        raise ValueError("Batch authorization references a different release or validation group.")
+    groups = validation_groups(manifest)
+    if authorization["version"] != manifest["version"] or validation_groups(authorization) != groups:
+        raise ValueError("Batch authorization references a different release or validation group list.")
+    if set(groups) - {entry["groupId"] for entry, _ in records}:
+        raise ValueError("Every validation group must be present in the selected recordings.")
     digest = candidate_digest({key: value for key, value in authorization.items() if key != "sha256"})
     if authorization.get("sha256") != digest or candidate_digest(authorization["selectedScope"]) != candidate_digest(release_scope(records)):
         raise ValueError("The selected dataset scope differs from its batch authorization.")
     for entry, payload in records:
         approval = payload["approval"]
-        expected_split = "validation" if entry["groupId"] == manifest["validationGroup"] else "train"
+        expected_split = "validation" if entry["groupId"] in groups else "train"
         if entry["split"] != expected_split or approval.get("releaseAuthorizationSha256") != digest or approval.get("releaseReviewer") != reviewer:
             raise ValueError("A recording approval differs from the authorized batch split or reviewer.")
 
