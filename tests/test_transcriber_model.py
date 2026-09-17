@@ -536,11 +536,18 @@ class EventDecoderTests(unittest.TestCase):
         outputs["technique_logits"][1, 0] = 8
         outputs["technique_direction_logits"][1, 0, 1] = 8
         outputs["technique_strings_logits"][1, 0, [0, 2, 5]] = 8
+        for axis, pitch in ((0, 40), (2, 50), (5, 64)):
+            choose_category(outputs, "pitch_logits", 1, axis, pitch)
         decoded = self.decode(outputs, [0, .02, .04])
         self.assertEqual(decoded["techniques"][0]["technique"], "brush")
         self.assertEqual(decoded["techniques"][0]["direction"], "Up")
         self.assertEqual(decoded["techniques"][0]["strings"], [6, 4, 1])
         self.assertEqual(set(decoded["techniques"][0]["stringMembershipConfidence"]), {"1", "2", "3", "4", "5", "6"})
+        self.assertEqual(
+            [(note["string"], note["soundingPitchMidi"]) for note in decoded["notes"]],
+            [(6, 40), (4, 50), (1, 64)],
+        )
+        self.assertTrue(all("technique_membership_completed_attack" in note["uncertainty"] for note in decoded["notes"]))
 
     def test_plateaus_repeated_attacks_and_late_audio_are_not_truncated(self):
         outputs = event_outputs(14)

@@ -498,42 +498,46 @@ def decode_events(outputs: Mapping[str, Tensor], frame_seconds: Tensor | Sequenc
     categories = {name: values[_HEADS[name]].argmax(-1) for name in _CATEGORICAL if _HEADS[name] in values}
     notes = []
     duration_limit_log = math.log1p(max_duration_quarter)
+
+    def note_at(frame, axis, confidence, extra_uncertainty=()):
+        fret = int(categories["fret"][frame, axis])
+        pitch = int(categories["pitch"][frame, axis])
+        base = int(tuning[axis]) + int(capo) + fret
+        expected = base
+        uncertainty = list(extra_uncertainty)
+        harmonic = None
+        harmonic_score = float(harmonics[frame, axis])
+        if harmonic_score >= harmonic_threshold:
+            kind = HARMONIC_TYPES[int(categories["harmonic_kind"][frame, axis])]
+            node = HARMONIC_FRETS[int(categories["harmonic_node"][frame, axis])]
+            harmonic = {"type": kind, "fret": node, "confidence": harmonic_score}
+            expected = (int(tuning[axis]) + int(capo) if kind == "Natural" else base) + _HARMONIC_OFFSETS[node]
+            uncertainty.append("harmonic_presence_uncalibrated")
+        if expected != pitch:
+            uncertainty.append("sounding_pitch_harmonic_mismatch" if harmonic else "sounding_pitch_fret_mismatch")
+        if expected > 127:
+            uncertainty.append("expected_pitch_outside_midi_range")
+        duration_log = float(values["duration_log"][frame, axis])
+        duration = math.expm1(duration_log) if duration_log <= duration_limit_log else float(max_duration_quarter)
+        if duration_log > duration_limit_log:
+            uncertainty.append("duration_clipped")
+        return {
+            "onsetSeconds": float(seconds[frame]),
+            "string": 6 - axis,
+            "fret": fret,
+            "soundingPitchMidi": pitch,
+            "fretBasePitchMidi": base,
+            "expectedSoundingPitchMidi": expected,
+            "voiceIndex": int(categories["voice"][frame, axis]),
+            "notatedDurationQuarter": duration,
+            "harmonic": harmonic,
+            "confidence": float(confidence),
+            "uncertainty": uncertainty,
+        }
+
     for axis in range(6):
         for frame in _temporal_peaks(onsets[:, axis].tolist(), seconds, onset_threshold, min_gap_seconds):
-            fret = int(categories["fret"][frame, axis])
-            pitch = int(categories["pitch"][frame, axis])
-            base = int(tuning[axis]) + int(capo) + fret
-            expected = base
-            uncertainty = []
-            harmonic = None
-            harmonic_score = float(harmonics[frame, axis])
-            if harmonic_score >= harmonic_threshold:
-                kind = HARMONIC_TYPES[int(categories["harmonic_kind"][frame, axis])]
-                node = HARMONIC_FRETS[int(categories["harmonic_node"][frame, axis])]
-                harmonic = {"type": kind, "fret": node, "confidence": harmonic_score}
-                expected = (int(tuning[axis]) + int(capo) if kind == "Natural" else base) + _HARMONIC_OFFSETS[node]
-                uncertainty.append("harmonic_presence_uncalibrated")
-            if expected != pitch:
-                uncertainty.append("sounding_pitch_harmonic_mismatch" if harmonic else "sounding_pitch_fret_mismatch")
-            if expected > 127:
-                uncertainty.append("expected_pitch_outside_midi_range")
-            duration_log = float(values["duration_log"][frame, axis])
-            duration = math.expm1(duration_log) if duration_log <= duration_limit_log else float(max_duration_quarter)
-            if duration_log > duration_limit_log:
-                uncertainty.append("duration_clipped")
-            notes.append({
-                "onsetSeconds": float(seconds[frame]),
-                "string": 6 - axis,
-                "fret": fret,
-                "soundingPitchMidi": pitch,
-                "fretBasePitchMidi": base,
-                "expectedSoundingPitchMidi": expected,
-                "voiceIndex": int(categories["voice"][frame, axis]),
-                "notatedDurationQuarter": duration,
-                "harmonic": harmonic,
-                "confidence": float(onsets[frame, axis]),
-                "uncertainty": uncertainty,
-            })
+            notes.append(note_at(frame, axis, onsets[frame, axis]))
     gestures = []
     for axis, technique in enumerate(PERCUSSION_TYPES):
         for frame in _temporal_peaks(percussion[:, axis].tolist(), seconds, percussion_threshold, min_gap_seconds):
@@ -563,6 +567,19 @@ def decode_events(outputs: Mapping[str, Tensor], frame_seconds: Tensor | Sequenc
                     },
                     "presenceCalibration": PRESENCE_CALIBRATION,
                 })
+                for string_axis in range(6):
+                    membership_score = float(membership[frame, axis, string_axis])
+                    if membership_score < .5 or any(
+                        note["string"] == 6 - string_axis
+                        and abs(note["onsetSeconds"] - seconds[frame]) < min_gap_seconds
+                        for note in notes
+                    ):
+                        continue
+                    confidence = min(float(technique_scores[frame, axis]), membership_score)
+                    notes.append(note_at(
+                        frame, string_axis, confidence,
+                        ("technique_membership_completed_attack",),
+                    ))
     notes.sort(key=lambda note: (note["onsetSeconds"], -note["string"]))
     gestures.sort(key=lambda gesture: (gesture["onsetSeconds"], PERCUSSION_TYPES.index(gesture["technique"])))
     techniques.sort(key=lambda event: (event["onsetSeconds"], TECHNIQUE_TYPES.index(event["technique"])))
