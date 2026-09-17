@@ -46,7 +46,7 @@ def _deduplicate(group):
     return [(value[1], value[2]) for value in by_pitch.values()], removed
 
 
-def _optimize_group(group, tuning, capo):
+def _optimize_group(group, tuning, capo, onset, recent, previous_position):
     try:
         from ortools.sat.python import cp_model
     except (ImportError, ModuleNotFoundError) as error:
@@ -94,9 +94,14 @@ def _optimize_group(group, tuning, capo):
     for index, note in playable:
         objective.append(round(1000 * note["confidence"]) * dropped[index])
         for candidate_index, (string, fret) in enumerate(candidates[index]):
-            movement = abs(string - note["string"]) * 18 + abs(fret - note["fret"]) * 4
-            high_position = max(0, fret - 12) * 3
-            objective.append((movement + high_position) * selected[index, candidate_index])
+            model_prior = abs(string - note["string"]) * 4 + abs(fret - note["fret"])
+            ease = (8 + fret + max(0, fret - 7) * 2) if fret else 0
+            hand = abs(fret - previous_position) * 3 if fret and previous_position is not None else 0
+            continuity = 0
+            prior = recent.get(note["soundingPitchMidi"])
+            if prior is not None and onset - prior["onset"] <= Fraction(3, 2):
+                continuity = abs(string - prior["string"]) * 80 + abs(fret - prior["fret"]) * 20
+            objective.append((model_prior + ease + hand + continuity) * selected[index, candidate_index])
     model.minimize(sum(objective))
     solver = cp_model.CpSolver()
     solver.parameters.max_deterministic_time = 5
@@ -131,10 +136,13 @@ def optimize_fingerings(document):
         groups[_onset(note)].append((index, note))
     removed = []
     changes = []
+    difficult = []
     statuses = defaultdict(int)
     keep = set(range(len(result["notes"])))
+    recent = {}
+    previous_position = None
     for onset, group in sorted(groups.items()):
-        assignments, local_removed, status = _optimize_group(group, tuning, capo)
+        assignments, local_removed, status = _optimize_group(group, tuning, capo, onset, recent, previous_position)
         statuses[status] += 1
         for value in local_removed:
             keep.discard(value["index"])
@@ -153,6 +161,23 @@ def optimize_fingerings(document):
                 })
                 note["string"], note["fret"] = string, fret
             note["fretBasePitchMidi"] = tuning[6 - note["string"]] + capo + note["fret"]
+            recent[note["soundingPitchMidi"]] = {"onset": onset, "string": note["string"], "fret": note["fret"]}
+        fretted = [fret for _, fret in assignments.values() if fret]
+        if fretted:
+            previous_position = sorted(fretted)[len(fretted) // 2]
+        by_fret = defaultdict(list)
+        for index, (string, fret) in assignments.items():
+            if fret:
+                by_fret[fret].append(string)
+        for fret, strings in by_fret.items():
+            if len(strings) >= 4:
+                difficult.append({
+                    "onsetQuarter": [onset.numerator, onset.denominator],
+                    "reason": "extended_barre_required_by_retained_pitch_set",
+                    "fret": fret,
+                    "strings": sorted(strings, reverse=True),
+                    "noteIndices": sorted(index for index, value in assignments.items() if value[1] == fret),
+                })
     result["notes"] = [note for index, note in enumerate(result["notes"]) if index in keep]
     return result, {
         "schemaVersion": 1,
@@ -160,12 +185,15 @@ def optimize_fingerings(document):
         "solver": "OR-Tools CP-SAT",
         "maximumFret": MAX_FRET,
         "maximumFrettedChordSpan": MAX_FRETTED_SPAN,
+        "repeatedPitchContinuityQuarter": [3, 2],
         "sourceNoteCount": len(document["notes"]),
         "retainedNoteCount": len(result["notes"]),
         "changedCount": len(changes),
         "removedCount": len(removed),
+        "difficultChordCount": len(difficult),
         "statuses": dict(sorted(statuses.items())),
         "changes": changes,
         "removed": removed,
+        "difficultChords": difficult,
         "rawHypothesesModified": False,
     }

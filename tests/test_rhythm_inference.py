@@ -100,6 +100,30 @@ class RhythmInferenceTests(unittest.TestCase):
         self.assertEqual(len(result["notes"]), 2)
         self.assertTrue(report["beatUnsupportedTailIncluded"])
 
+    def test_isolated_triplet_is_rejected_but_complete_triplet_group_is_allowed(self):
+        beat_evidence = evidence([0, .5, 1, 1.5, 2], [0, 2])
+        isolated = {
+            "metadata": metadata(),
+            "audioDurationSeconds": 2,
+            "notes": [note(1 / 3)],
+            "percussion": [],
+        }
+        result, report = infer_notated_timing(isolated, beat_evidence)
+        self.assertNotEqual(Fraction(*result["notes"][0]["scoreOnsetQuarter"]).denominator, 3)
+        self.assertEqual(report["onsetOptimization"]["tripletBeatCount"], 0)
+        grouped = {
+            "metadata": metadata(),
+            "audioDurationSeconds": 2,
+            "notes": [note(1 / 6), {**note(1 / 3), "string": 5, "soundingPitchMidi": 45}],
+            "percussion": [],
+        }
+        result, report = infer_notated_timing(grouped, beat_evidence)
+        self.assertEqual(
+            {Fraction(*value["scoreOnsetQuarter"]) for value in result["notes"]},
+            {Fraction(1, 3), Fraction(2, 3)},
+        )
+        self.assertEqual(report["onsetOptimization"]["tripletBeatCount"], 1)
+
     def test_malformed_evidence_fails(self):
         with self.assertRaises(HarnessError):
             PerformanceMap(evidence([0, 0], [0]), metadata(), 1)

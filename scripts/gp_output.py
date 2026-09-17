@@ -989,6 +989,11 @@ def write_gp_outputs(template_path, predictions, full_path, single_path, *, prof
     from .fingering_optimizer import optimize_fingerings
 
     cleaned, fingering_optimization = optimize_fingerings(cleaned)
+    voice_optimization = None
+    if rhythm_inference is not None:
+        from .voice_optimizer import optimize_voices
+
+        cleaned, voice_optimization = optimize_voices(cleaned)
     tuning, capo, tempo, audio_end, raw_notes, raw_percussion, rhythm_counts, structured = _validate_predictions(cleaned)
     notes, reconciled, unresolved, shortened, dropped_notes = _resolve_notes(raw_notes, tuning, capo, audio_end)
     percussion, dropped_percussion = _resolve_percussion(raw_percussion)
@@ -1013,6 +1018,7 @@ def write_gp_outputs(template_path, predictions, full_path, single_path, *, prof
         "draftCleanup": cleanup,
         "rhythmInference": rhythm_inference,
         "fingeringOptimization": fingering_optimization,
+        "voiceOptimization": voice_optimization,
         "rhythmicGridPolicy": {
             "mode": "beat-anchored-constrained" if structured else "nominal-tempo-fallback",
             "candidateQuarterGrids": [_rational(value[0]) for value in RHYTHM_GRIDS] if not structured else None,

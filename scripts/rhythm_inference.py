@@ -1,6 +1,7 @@
 """Beat-anchored, constrained symbolic timing for cleaned hypotheses."""
 
 from bisect import bisect_right
+from collections import defaultdict
 from copy import deepcopy
 from fractions import Fraction
 import math
@@ -288,20 +289,37 @@ def _optimize_onsets(document, mapper):
     model = cp_model.CpModel()
     variables = []
     costs = []
-    candidates_by_time = {}
+    regimes = {}
+    triplet_selections = defaultdict(list)
     for index, seconds in enumerate(times):
         candidates = _candidate_ticks(mapper, seconds)
-        candidates_by_time[seconds] = candidates
-        choice = model.new_int_var(0, len(candidates) - 1, f"choice_{index}")
         tick = model.new_int_var_from_domain(cp_model.Domain.from_values([value[0] for value in candidates]), f"tick_{index}")
-        model.add_allowed_assignments([choice, tick], [(candidate_index, value[0]) for candidate_index, value in enumerate(candidates)])
-        cost = model.new_int_var(0, max(value[1] for value in candidates), f"cost_{index}")
-        model.add_element(choice, [value[1] for value in candidates], cost)
+        choices = [model.new_bool_var(f"choice_{index}_{candidate_index}") for candidate_index in range(len(candidates))]
+        model.add(sum(choices) == 1)
+        model.add(tick == sum(value[0] * choice for value, choice in zip(candidates, choices)))
+        cost = sum(value[1] * choice for value, choice in zip(candidates, choices))
+        for (candidate_tick, _), choice in zip(candidates, choices):
+            beat = candidate_tick // TICKS_PER_QUARTER
+            position = candidate_tick % TICKS_PER_QUARTER
+            if beat not in regimes:
+                regimes[beat] = model.new_bool_var(f"triplet_beat_{beat}")
+            regime = regimes[beat]
+            if position in (4, 8, 16, 20):
+                model.add(regime == 1).only_enforce_if(choice)
+                triplet_selections[beat].append(choice)
+            elif position not in (0,):
+                model.add(regime == 0).only_enforce_if(choice)
         variables.append(tick)
         costs.append(cost)
+    for beat, regime in regimes.items():
+        selections = triplet_selections.get(beat, [])
+        if selections:
+            model.add(sum(selections) >= 2 * regime)
+        else:
+            model.add(regime == 0)
     for left, right in zip(variables, variables[1:]):
         model.add(right >= left)
-    model.minimize(sum(costs))
+    model.minimize(sum(costs) + 100 * sum(regimes.values()))
     solver = cp_model.CpSolver()
     solver.parameters.max_deterministic_time = 30
     solver.parameters.num_search_workers = 1
@@ -330,6 +348,7 @@ def _optimize_onsets(document, mapper):
         "maximumAbsoluteTimingErrorSeconds": max(timing_errors, default=0),
         "meanAbsoluteTimingErrorSeconds": sum(timing_errors) / len(timing_errors) if timing_errors else 0,
         "eventsByFinestSubdivisionTicks": dict(sorted(complexities.items(), key=lambda item: int(item[0]), reverse=True)),
+        "tripletBeatCount": sum(solver.value(value) for value in regimes.values()),
         "ticksPerQuarter": TICKS_PER_QUARTER,
         "candidateStepsTicks": list(GRID_STEPS),
     }

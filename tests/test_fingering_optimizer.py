@@ -51,6 +51,33 @@ class FingeringOptimizerTests(unittest.TestCase):
         self.assertLessEqual(len(result["notes"]), 6)
         self.assertTrue(any(value["reason"] == "unplayable_chord_voice" for value in report["removed"]))
 
+    def test_phrase_context_prefers_open_position_and_repeated_string(self):
+        opening = [
+            note(44, 5, 1),
+            note(51, 4, 3),
+            note(56, 3, 1),
+            note(67, 1, 2),
+        ]
+        first_c = {**note(60, 3, 5), "scoreOnsetQuarter": [1, 1], "onsetSeconds": .5}
+        second_c = {**note(60, 3, 5), "scoreOnsetQuarter": [2, 1], "onsetSeconds": 1}
+        result, _ = optimize_fingerings(self.document([*opening, first_c, second_c]))
+        c_notes = [value for value in result["notes"] if value["soundingPitchMidi"] == 60]
+        self.assertEqual([(value["string"], value["fret"]) for value in c_notes], [(2, 0), (2, 0)])
+
+    def test_pitch_set_forcing_extended_barre_is_reported_not_hidden(self):
+        document = self.document([
+            note(39, 6, 3),
+            note(46, 5, 3),
+            note(51, 4, 3),
+            note(58, 3, 3),
+            note(63, 2, 3),
+            note(65, 1, 0),
+        ])
+        result, report = optimize_fingerings(document)
+        self.assertEqual(len(result["notes"]), 6)
+        self.assertEqual(report["difficultChordCount"], 1)
+        self.assertEqual(report["difficultChords"][0]["reason"], "extended_barre_required_by_retained_pitch_set")
+
     def test_pitch_without_guitar_position_and_malformed_input_fail(self):
         result, report = optimize_fingerings(self.document([note(10, 6, 0)]))
         self.assertEqual(result["notes"], [])
