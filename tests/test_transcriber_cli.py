@@ -149,7 +149,9 @@ class HarnessCommandTests(unittest.TestCase):
                 result = transcriber.infer(args)
             self.assertEqual(len(captured["times"]), 700)
             torch.testing.assert_close(captured["outputs"]["note_onset_logits"], torch.full((700, 6), 2.))
-            self.assertFalse(result["gpWriterImplemented"])
+            self.assertEqual(result["audioDurationSeconds"], 14)
+            self.assertTrue(result["gpWriterImplemented"])
+            self.assertFalse(result["gpWrittenByThisCommand"])
             self.assertFalse(result["modelTrainingPerformedByThisCommand"])
             self.assertEqual(read_json(root / "runs" / "prediction.json")["visibility"], "private")
 

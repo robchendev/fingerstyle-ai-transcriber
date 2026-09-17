@@ -355,12 +355,43 @@ def infer(args):
     report = {
         "schemaVersion": 1, "kind": "fingerstyle-transcription-hypotheses", "visibility": "private", "distributionAuthorized": False,
         "audioSha256": audio_hash, "checkpointSha256": sha256(Path(args.checkpoint)),
+        "audioDurationSeconds": duration,
         "metadata": metadata, "timeUnit": "input-audio-seconds", "notatedDurationUnit": "quarter-note",
-        "gpWriterImplemented": False, "modelTrainingPerformedByThisCommand": False,
+        "gpWriterImplemented": True, "gpWrittenByThisCommand": False, "modelTrainingPerformedByThisCommand": False,
         **events,
     }
     publish_json(private_output(args.output, args.data_root), report)
     print({"notes": len(report["notes"]), "percussionHypotheses": len(report["percussion"]), "gpWritten": False})
+    return report
+
+
+def export_gp(args):
+    from .gp_output import write_gp_outputs
+
+    predictions_path = Path(args.predictions).resolve()
+    predictions = read_json(predictions_path)
+    full_path = private_output(args.full_output, args.data_root)
+    single_path = private_output(args.single_output, args.data_root)
+    if full_path.suffix.lower() != ".gp" or single_path.suffix.lower() != ".gp" or full_path == single_path:
+        raise HarnessError("GP outputs require two different .gp paths under the private runs directory.")
+    before = sha256(predictions_path)
+    report = write_gp_outputs(args.template, predictions, full_path, single_path)
+    if sha256(predictions_path) != before:
+        raise HarnessError("Prediction hypotheses changed during GP export.")
+    report.update(
+        visibility="private",
+        predictionsSha256=before,
+        fullOutputSha256=sha256(full_path),
+        singleOutputSha256=sha256(single_path),
+    )
+    report_path = private_output(args.report, args.data_root)
+    publish_json(report_path, report)
+    print({
+        "fullVoices": str(full_path),
+        "singleVoice": str(single_path),
+        "measures": report["fullVoices"]["measureCount"],
+        "report": str(report_path),
+    })
     return report
 
 
@@ -399,13 +430,20 @@ def main(argv=None):
     inference.add_argument("--device", default="auto")
     inference.add_argument("--onset-threshold", type=float, default=.5)
     inference.add_argument("--percussion-threshold", type=float, default=.5)
+    export = commands.add_parser("export-gp")
+    export.add_argument("--data-root", default=str(ROOT))
+    export.add_argument("--predictions", required=True)
+    export.add_argument("--template", required=True)
+    export.add_argument("--full-output", default="runs/transcription.full-voices.gp")
+    export.add_argument("--single-output", default="runs/transcription.single-voice.gp")
+    export.add_argument("--report", default="runs/gp-output.json")
     args = parser.parse_args(argv)
     try:
         if args.command == "config":
             publish_json(private_output(args.output), default_config())
             print("Generic configuration written under the private runs directory.")
         else:
-            {"preflight": preflight, "train": train, "evaluate": evaluate, "evaluate-events": evaluate_decoded_events, "infer": infer}[args.command](args)
+            {"preflight": preflight, "train": train, "evaluate": evaluate, "evaluate-events": evaluate_decoded_events, "infer": infer, "export-gp": export_gp}[args.command](args)
     except (HarnessError, OSError, ValueError, RuntimeError) as error:
         print(f"Transcriber error: {error}", file=sys.stderr)
         return 1
