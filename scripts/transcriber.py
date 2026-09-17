@@ -187,6 +187,10 @@ def train(args):
         raise HarnessError("Training and validation reference different releases.")
     model = FingerstyleTranscriber(model_config)
     identity = run_identity(train_data, config, features, model_config, training, device)
+    if args.initialize_from:
+        identity["initialization"] = initialize_model(
+            model, model_config, args.initialize_from, train_data.manifest_sha256,
+        )
     run_dir = private_output(args.run_dir, args.data_root)
     train_loader = make_loader(train_data, config, training, shuffle=True)
     validation_loader = make_loader(validation_data, config, training, shuffle=False)
@@ -209,6 +213,36 @@ def train(args):
     publish_json(summary_path, result)
     print_training_summary(result, summary_path)
     return result
+
+
+def initialize_model(model, target_config, checkpoint_path, manifest_sha256):
+    from .transcriber_model import ModelConfig
+    from .transcriber_runtime import load_checkpoint
+
+    checkpoint_path = Path(checkpoint_path).resolve()
+    checkpoint = load_checkpoint(checkpoint_path)
+    source = ModelConfig(**checkpoint["identity"]["model"])
+    source_values, target_values = asdict(source), asdict(target_config)
+    if source_values.pop("architecture_version") != 1 or target_values.pop("architecture_version") != 2 or source_values != target_values:
+        raise HarnessError("V2 initialization requires a compatible architecture-v1 checkpoint differing only by architecture_version.")
+    if checkpoint["identity"]["manifest_sha256"] != manifest_sha256 or checkpoint["global_step"] <= 0:
+        raise HarnessError("V2 initialization requires a trained architecture-v1 checkpoint from the same release.")
+    current = model.state_dict()
+    state = checkpoint["model_state"]
+    new_keys = {key for key in current if key.startswith("heads.technique")}
+    if set(state) != set(current) - new_keys or any(current[key].shape != value.shape for key, value in state.items()):
+        raise HarnessError("Architecture-v1 checkpoint parameters do not exactly match the shared v2 model.")
+    current.update(state)
+    model.load_state_dict(current, strict=True)
+    return {
+        "kind": "architecture-transfer-with-new-random-heads",
+        "checkpointSha256": sha256(checkpoint_path),
+        "sourceArchitectureVersion": 1,
+        "sourceGlobalStep": checkpoint["global_step"],
+        "copiedParameterTensors": len(state),
+        "newParameterTensors": sorted(new_keys),
+        "optimizerStateImported": False,
+    }
 
 
 def checkpoint_model(path, device_name):
@@ -451,7 +485,9 @@ def main(argv=None):
             command.add_argument("--forward", action="store_true", help="One untrained eval-mode forward per split; no optimizer or checkpoint.")
         elif name == "train":
             command.add_argument("--run-dir", required=True)
-            command.add_argument("--resume")
+            start = command.add_mutually_exclusive_group()
+            start.add_argument("--resume")
+            start.add_argument("--initialize-from", help="Start a new v2 experiment from compatible v1 model weights; optimizer/RNG/history are not resumed.")
         else:
             command.add_argument("--checkpoint", required=True)
             command.add_argument("--split", choices=("train", "validation"), default="validation")

@@ -84,6 +84,38 @@ class HarnessCommandTests(unittest.TestCase):
         output.assert_called_once_with(ANY, flush=True)
         self.assertIn("Epoch progress", output.call_args.args[0])
 
+    def test_v2_initialization_copies_v1_weights_but_not_new_heads_or_optimizer(self):
+        from scripts.transcriber_model import FingerstyleTranscriber, ModelConfig
+
+        source_config = ModelConfig()
+        target_config = ModelConfig(architecture_version=2)
+        source_model = FingerstyleTranscriber(source_config)
+        target_model = FingerstyleTranscriber(target_config)
+        new_before = {
+            key: value.clone()
+            for key, value in target_model.state_dict().items()
+            if key.startswith("heads.technique")
+        }
+        checkpoint = {
+            "identity": {"model": asdict(source_config), "manifest_sha256": "manifest"},
+            "global_step": 24800,
+            "model_state": source_model.state_dict(),
+        }
+        with TemporaryDirectory(dir=ROOT) as directory:
+            path = Path(directory) / "source.pt"
+            path.write_bytes(b"checkpoint")
+            with patch("scripts.transcriber_runtime.load_checkpoint", return_value=checkpoint), patch.object(transcriber, "sha256", return_value="source-hash"):
+                report = transcriber.initialize_model(target_model, target_config, path, "manifest")
+        for key, value in source_model.state_dict().items():
+            torch.testing.assert_close(target_model.state_dict()[key], value)
+        for key, value in new_before.items():
+            torch.testing.assert_close(target_model.state_dict()[key], value)
+        self.assertFalse(report["optimizerStateImported"])
+        self.assertEqual(report["sourceGlobalStep"], 24800)
+        with patch("scripts.transcriber_runtime.load_checkpoint", return_value=checkpoint):
+            with self.assertRaises(HarnessError):
+                transcriber.initialize_model(target_model, target_config, path, "different")
+
     def test_event_evaluation_records_explicitly_selected_release_without_training(self):
         with TemporaryDirectory(dir=ROOT) as directory:
             root = Path(directory).resolve()
