@@ -18,9 +18,9 @@ from scripts.transcriber_audio import FeatureConfig, HarnessError
 class HarnessCommandTests(unittest.TestCase):
     def test_default_manifest_and_explicit_overrides_always_use_training_loader(self):
         config, features, model, _ = transcriber.load_config()
-        self.assertEqual(config["data"]["manifest"], "data\\releases\\pilot-v2\\manifest.json")
+        self.assertEqual(config["data"]["manifest"], "data\\releases\\dataset-v1\\manifest.json")
         for root, override, expected in (
-            (ROOT, None, ROOT / "data" / "releases" / "pilot-v2" / "manifest.json"),
+            (ROOT, None, ROOT / "data" / "releases" / "dataset-v1" / "manifest.json"),
             (ROOT / "private-workspace", "releases\\v2\\manifest.json", ROOT / "private-workspace" / "releases" / "v2" / "manifest.json"),
             (ROOT, ROOT / "custom" / "manifest.json", ROOT / "custom" / "manifest.json"),
         ):

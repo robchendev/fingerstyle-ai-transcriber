@@ -37,7 +37,7 @@ def default_config():
     return {
         "schemaVersion": 1, "features": asdict(FeatureConfig()), "model": asdict(ModelConfig()),
         "training": asdict(TrainingConfig()),
-        "data": {"manifest": "data\\releases\\pilot-v2\\manifest.json", "batch_size": 4, "num_workers": 0, "num_threads": 4, "cache": "cache\\transcriber"},
+        "data": {"manifest": "data\\releases\\dataset-v1\\manifest.json", "batch_size": 4, "num_workers": 0, "num_threads": 4, "cache": "cache\\transcriber"},
     }
 
 
