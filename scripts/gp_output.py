@@ -644,6 +644,16 @@ class _ScoreWriter:
         self.ids = defaultdict(int)
         self.rhythms = {}
         self.fallbacks = []
+        voices = sorted({note["voice"] for note in notes} | {0})
+        self.percussion_voices = {}
+        for event in percussion:
+            def host_cost(voice):
+                local = [note for note in notes if note["voice"] == voice]
+                boundary = any(event["onset"] in (note["onset"], note["end"]) for note in local)
+                active = sum(note["onset"] < event["onset"] < note["end"] for note in local)
+                return (0 if boundary else 1 + 100 * active, voice)
+
+            self.percussion_voices[event["id"]] = min(voices, key=host_cost)
         masters = root.findall("./MasterBars/MasterBar")
         bars = root.findall("./Bars/Bar")
         if not masters or not bars:
@@ -728,14 +738,17 @@ class _ScoreWriter:
         self.root.find("Beats").append(beat)
         return identifier
 
-    def percussion_at(self, onset):
-        return [event for event in self.percussion if event["onset"] == onset]
+    def percussion_at(self, onset, voice):
+        return [
+            event for event in self.percussion
+            if event["onset"] == onset and self.percussion_voices[event["id"]] == voice
+        ]
 
     def active_strings(self, onset):
         return {note["string"] for note in self.notes if note["onset"] <= onset < note["end"]}
 
-    def percussion_content(self, onset):
-        events = self.percussion_at(onset)
+    def percussion_content(self, onset, voice):
+        events = self.percussion_at(onset, voice)
         occupied = self.active_strings(onset)
         carriers = []
         text = []
@@ -758,16 +771,19 @@ class _ScoreWriter:
         boundaries = {measure["start"], measure["end"]}
         for note in notes:
             boundaries.update((max(measure["start"], note["onset"]), min(measure["end"], note["end"])))
-        if voice == 0:
-            for event in self.percussion:
+        hosted = [event for event in self.percussion if self.percussion_voices[event["id"]] == voice]
+        if hosted:
+            for event in hosted:
                 if measure["start"] <= event["onset"] < measure["end"]:
                     boundaries.add(event["onset"])
-                    boundaries.add(min(measure["end"], event["onset"] + PERCUSSION_DURATION))
+                    active = any(note["onset"] <= event["onset"] < note["end"] for note in notes)
+                    if not active:
+                        boundaries.add(min(measure["end"], event["onset"] + PERCUSSION_DURATION))
         points = sorted(boundaries)
         beats = []
         for left, right in zip(points, points[1:]):
             active = [note for note in notes if note["onset"] <= left < note["end"]]
-            carriers, text = self.percussion_content(left) if voice == 0 else ([], "")
+            carriers, text = self.percussion_content(left, voice)
             cursor = left
             for duration, notation in _split_duration(right - left):
                 stop = cursor + duration
@@ -780,7 +796,7 @@ class _ScoreWriter:
     def build(self):
         master_parent = self.root.find("MasterBars")
         bar_parent = self.root.find("Bars")
-        voices_used = {note["voice"] for note in self.notes}
+        voices_used = {note["voice"] for note in self.notes} | set(self.percussion_voices.values())
         for measure in self.measures:
             master = deepcopy(self.master_prototype)
             for tag in ("Repeat", "AlternateEndings", "Directions", "Section", "Fermatas", "TripletFeel", "DoubleBar", "XProperties"):
@@ -804,6 +820,9 @@ class _ScoreWriter:
                 if voice != 0 and all(
                     not (note["voice"] == voice and note["onset"] < measure["end"] and note["end"] > measure["start"])
                     for note in self.notes
+                ) and all(
+                    self.percussion_voices[event["id"]] != voice or not measure["start"] <= event["onset"] < measure["end"]
+                    for event in self.percussion
                 ):
                     continue
                 beat_ids = self.voice_beats(measure, voice)
@@ -967,6 +986,9 @@ def write_gp_outputs(template_path, predictions, full_path, single_path, *, prof
         from .rhythm_inference import infer_notated_timing
 
         cleaned, rhythm_inference = infer_notated_timing(cleaned, beat_evidence, include_unsupported_tail=include_unsupported_tail)
+    from .fingering_optimizer import optimize_fingerings
+
+    cleaned, fingering_optimization = optimize_fingerings(cleaned)
     tuning, capo, tempo, audio_end, raw_notes, raw_percussion, rhythm_counts, structured = _validate_predictions(cleaned)
     notes, reconciled, unresolved, shortened, dropped_notes = _resolve_notes(raw_notes, tuning, capo, audio_end)
     percussion, dropped_percussion = _resolve_percussion(raw_percussion)
@@ -990,6 +1012,7 @@ def write_gp_outputs(template_path, predictions, full_path, single_path, *, prof
         "resolvedHypotheses": {"notes": len(notes), "percussion": len(percussion)},
         "draftCleanup": cleanup,
         "rhythmInference": rhythm_inference,
+        "fingeringOptimization": fingering_optimization,
         "rhythmicGridPolicy": {
             "mode": "beat-anchored-constrained" if structured else "nominal-tempo-fallback",
             "candidateQuarterGrids": [_rational(value[0]) for value in RHYTHM_GRIDS] if not structured else None,

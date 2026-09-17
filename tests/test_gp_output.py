@@ -115,7 +115,8 @@ class GpOutputTests(unittest.TestCase):
             self.assertEqual(hashlib.sha256(template_path.read_bytes()).hexdigest(), before)
             self.assertEqual(report["fullVoices"]["measureCount"], 3)
             self.assertEqual(report["singleVoice"]["measureCount"], 3)
-            self.assertEqual(report["pitchFretReconciliations"][0]["resolvedFret"], 3)
+            self.assertFalse(report["pitchFretReconciliations"])
+            self.assertEqual(report["fingeringOptimization"]["changes"][0]["selectedFret"], 3)
             for output in (full, single):
                 with ZipFile(output) as archive:
                     self.assertEqual(
@@ -218,6 +219,48 @@ class GpOutputTests(unittest.TestCase):
             mixed["notes"][0]["scoreDurationQuarter"] = [1, 1]
             with self.assertRaisesRegex(HarnessError, "same structured"):
                 write_gp_outputs(template, mixed, directory / "mixed.gp", directory / "mixed-single.gp")
+
+    def test_percussion_uses_existing_voice_boundary_without_splitting_sustain(self):
+        document = hypotheses()
+        document["audioDurationSeconds"] = 3
+        document["notes"] = [
+            {
+                "onsetSeconds": 0,
+                "string": 6,
+                "fret": 0,
+                "soundingPitchMidi": 40,
+                "voiceIndex": 0,
+                "notatedDurationQuarter": 2,
+                "harmonic": None,
+                "confidence": .99,
+                "uncertainty": [],
+            },
+            {
+                "onsetSeconds": .5,
+                "string": 1,
+                "fret": 0,
+                "soundingPitchMidi": 64,
+                "voiceIndex": 1,
+                "notatedDurationQuarter": 1,
+                "harmonic": None,
+                "confidence": .99,
+                "uncertainty": [],
+            },
+        ]
+        document["percussion"] = [{"onsetSeconds": .5, "technique": "wrist_thump", "confidence": .99}]
+        with TemporaryDirectory(dir=ROOT) as directory:
+            directory = Path(directory)
+            template = directory / "template.gpt"
+            full, single = directory / "full.gp", directory / "single.gp"
+            template.write_bytes(archive_bytes(output_template()))
+            write_gp_outputs(template, document, full, single)
+            score = decode_score(gp_root(full), [40, 45, 50, 55, 59, 64], 0)
+            voice_zero = [event for event in score["scoreEvents"] if event["voiceIndex"] == 0 and not event["isRest"]]
+            self.assertEqual(len(voice_zero), 1)
+            self.assertEqual(voice_zero[0]["notatedDurationQuarter"], [2, 1])
+            self.assertFalse(voice_zero[0]["notes"][0]["tie"]["origin"])
+            wrist = [event for event in score["scoreEvents"] if event["text"] == "O"]
+            self.assertEqual([(event["voiceIndex"], event["offsetQuarter"]) for event in wrist], [(1, [1, 1])])
 
     def test_duration_is_bounded_by_audio_and_same_string_reattacks_are_reported(self):
         document = hypotheses()
