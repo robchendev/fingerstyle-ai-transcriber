@@ -185,7 +185,9 @@ def logical_notes(score, written_notes):
                 prior_end += fraction(prior["durationQuarter"], prior_id)
             if attack is not False or not note["tie"]["destination"]:
                 raise CanonicalLabelError(f"Tie flags contradict the link: {identifier}")
-            if (beat["voiceIndex"], note["string"], note["basePitchMidi"]) != (prior_beat["voiceIndex"], prior_note["string"], prior_note["basePitchMidi"]) or prior_end != onset:
+            same_kind = note["techniques"]["dead"] == prior_note["techniques"]["dead"]
+            same_pitch = note["techniques"]["dead"] or note["basePitchMidi"] == prior_note["basePitchMidi"]
+            if (beat["voiceIndex"], note["string"]) != (prior_beat["voiceIndex"], prior_note["string"]) or not same_kind or not same_pitch or prior_end != onset:
                 raise CanonicalLabelError(f"Tie crosses voice, string, pitch, or a timing gap: {identifier}")
             root = owners[prior_id]
             successors[prior_id] = identifier
@@ -398,10 +400,53 @@ def gesture_events(score, rules, segments, conventions=None):
                 gesture["evidenceSource"] = rule["evidenceSource"]
             gestures.append(gesture)
         uncovered_dead = dead_ids and not any(rule["consumesDeadNotes"] for rule in candidates)
+        conventional = {}
+        if uncovered_dead and not conflicting and performance_id not in suppressed_ids and not (set(normalized_text(beat["text"]).split()) - consumed):
+            for identifier in dead_ids:
+                event, _, note = segments[identifier]
+                if event["isAttack"] is False:
+                    continue
+                ghost = note["techniques"].get("antiAccent") == "Normal"
+                convention = "ghostXIsPercussiveHit" if ghost else "plainXIsThumbSlap"
+                if conventions is not None and conventions.get(convention) is True:
+                    conventional.setdefault("percussive_hit" if ghost else "thumb_slap", []).append(identifier)
+            for technique, identifiers in conventional.items():
+                known = beat["graceMode"] is None and all(segments[identifier][0]["isAttack"] is True for identifier in identifiers)
+                rule_id = "owner-ghost-X-generic" if technique == "percussive_hit" else "owner-plain-X-thumb"
+                gestures.append({
+                    "id": f"{performance_id}:{rule_id}", "technique": technique, "attributes": {},
+                    "voiceIndex": beat["voiceIndex"], "onsetQuarter": onset, "durationQuarter": None,
+                    "writtenBeatId": beat["id"], "visitIndex": visit["visitIndex"], "graceMode": beat["graceMode"],
+                    "scoreOnsetKnown": known, "symbolicNoteIds": identifiers,
+                    "sourcePitchedNoteIds": [], "contextPitchedNoteIds": [],
+                    "labelMask": {"gesture": True, "fingering": False, "pitch": False, "onset": known},
+                    "interpretationRuleId": rule_id, "evidenceBeatIds": [], "evidenceSource": "owner-notation-conventions",
+                })
+            classified = {identifier for identifiers in conventional.values() for identifier in identifiers}
+            dead_ids = [identifier for identifier in dead_ids if identifier not in classified]
+            uncovered_dead = bool(dead_ids)
         if uncovered_dead and not conflicting and any(segments[identifier][0]["isAttack"] is not False for identifier in dead_ids):
             unresolved.append({"performanceBeatId": performance_id, "onsetQuarter": onset, "reason": "uninterpreted_dead_note_cluster", "symbolicNoteIds": dead_ids})
         if set(normalized_text(beat["text"]).split()) - consumed:
             unresolved.append({"performanceBeatId": performance_id, "onsetQuarter": onset, "reason": "uninterpreted_annotation", "writtenBeatId": beat["id"]})
+    if conventions is not None and conventions.get("plainXIsThumbSlap") is True:
+        by_position, merged = {}, []
+        positions = {f"p{visit['visitIndex']}:{beat['id']}": slot for (visit, beat, _), slot in zip(performed, slots)}
+        for gesture in gestures:
+            if gesture["technique"] != "thumb_slap" or not gesture["symbolicNoteIds"]:
+                merged.append(gesture)
+                continue
+            position = positions[f"p{gesture['visitIndex']}:{gesture['writtenBeatId']}"]
+            if position not in by_position:
+                by_position[position] = gesture
+                merged.append(gesture)
+            else:
+                first = by_position[position]
+                first.setdefault("coincidentSourceGestures", []).append(deepcopy(gesture))
+                first["symbolicNoteIds"].extend(identifier for identifier in gesture["symbolicNoteIds"] if identifier not in first["symbolicNoteIds"])
+                first["scoreOnsetKnown"] = first["scoreOnsetKnown"] and gesture["scoreOnsetKnown"]
+                first.setdefault("labelMask", {"gesture": True, "fingering": False, "pitch": False})["onset"] = first["scoreOnsetKnown"]
+        gestures = merged
     return gestures, unresolved, rests, suppressed
 
 
@@ -447,6 +492,12 @@ def canonicalize(score, annotations=None, conventions=None):
         "review": {"notationSymbols": symbols, "unresolvedGestures": unresolved, "suppressedAnnotations": suppressed, "issues": issues, "sourceIssues": score["issues"]},
         "provenance": {"sourceGpSha256": score["sourceGpSha256"], "fretConvention": instrument["fretConvention"], "ruleIds": [rule["id"] for rule in rules], "referenceBeatIds": [beat["id"] for beat in score["scoreEvents"] if beat["referenceOnly"]], "percussiveHitTextDetectionMaxLen": percussive_hit_text_max_len()},
     }
+    if conventions is not None:
+        for name in ("plainXIsThumbSlap", "ghostXIsPercussiveHit"):
+            if name in conventions:
+                if type(conventions[name]) is not bool:
+                    raise CanonicalLabelError(f"{name} must be an explicit boolean.")
+                output["provenance"][name] = conventions[name]
     return deepcopy(output)
 
 

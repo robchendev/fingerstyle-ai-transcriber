@@ -108,9 +108,9 @@ def note_event(note, identifier, tuning, capo, issues):
         raise EventExtractionError(f"Invalid string/fret at {identifier}.")
     base_pitch = tuning[string_index] + capo + fret
     stored_midi = number(props.get("Midi"), "Number")
-    if stored_midi is not None and stored_midi != base_pitch:
-        issues.append({"code": "stored_midi_disagrees_with_fret", "eventId": identifier, "storedMidi": stored_midi, "derivedMidi": base_pitch})
     techniques = {target: enabled(props.get(source)) for source, target in NOTE_FLAGS.items()}
+    if not techniques["dead"] and stored_midi is not None and stored_midi != base_pitch:
+        issues.append({"code": "stored_midi_disagrees_with_fret", "eventId": identifier, "storedMidi": stored_midi, "derivedMidi": base_pitch})
     slide = number(props.get("Slide"), "Flags")
     if slide is not None:
         techniques["slideFlags"] = slide
@@ -470,6 +470,7 @@ def performance_events(decoded, order, *, silence_repeated_entry_ties=False):
             for note in beat["notes"]:
                 identifier = f"p{visit_index}:{note['id']}"
                 prior = previous.get((beat["voiceIndex"], note["string"]))
+                same_tie_kind = prior and prior["dead"] == note["techniques"]["dead"] and (note["techniques"]["dead"] or prior["pitch"] == note["basePitchMidi"])
                 tie_origin = None
                 attack = not note["tie"]["destination"]
                 suppression = None
@@ -478,12 +479,12 @@ def performance_events(decoded, order, *, silence_repeated_entry_ties=False):
                     original_origin = first_tie_origins.get(note["id"])
                     if silence_repeated_entry_ties and returning_entry and original_origin is not None and (prior is None or prior["sourceEventId"] != original_origin):
                         suppression = "repeated_entry_tie_without_original_origin"
-                    elif silence_repeated_entry_ties and prior and prior["isSilent"] and prior["end"] == onset and prior["pitch"] == note["basePitchMidi"]:
+                    elif silence_repeated_entry_ties and prior and prior["isSilent"] and prior["end"] == onset and same_tie_kind:
                         suppression = "continuation_of_silenced_repeat_entry"
                     # GPIF's destination establishes the tie; its origin flag is redundant.
                     if suppression:
                         attack = False
-                    elif prior and prior["end"] == onset and prior["pitch"] == note["basePitchMidi"]:
+                    elif prior and prior["end"] == onset and same_tie_kind:
                         tie_origin = prior["id"]
                         first_tie_origins.setdefault(note["id"], prior["sourceEventId"])
                     else:
@@ -500,6 +501,7 @@ def performance_events(decoded, order, *, silence_repeated_entry_ties=False):
                 previous[(beat["voiceIndex"], note["string"])] = {
                     "id": identifier, "sourceEventId": note["id"], "isSilent": suppression is not None,
                     "end": onset if beat["graceMode"] else onset + duration, "pitch": note["basePitchMidi"],
+                    "dead": note["techniques"]["dead"],
                 }
         position += Fraction(*measure["durationQuarter"])
         visited.add(measure_index)

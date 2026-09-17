@@ -66,7 +66,9 @@ def training_conditioning(record, clip_times):
     mapping = candidate["denseMapping"]
     audio = np.array([point["clipSeconds"] for point in mapping])
     quarters = np.array([point["scoreQuarter"] for point in mapping])
-    if np.any(clip_times < audio[0]) or np.any(clip_times > audio[-1]) or np.any(np.diff(audio) < 0) or not np.isfinite(audio).all():
+    lower = np.nextafter(np.nextafter(audio[0], -np.inf), -np.inf)
+    upper = np.nextafter(np.nextafter(audio[-1], np.inf), np.inf)
+    if np.any(clip_times < lower) or np.any(clip_times > upper) or np.any(np.diff(audio) < 0) or not np.isfinite(audio).all():
         raise HarnessError("Training frames extend outside the approved candidate mapping.")
     positions = np.interp(clip_times, audio, quarters)
     visits = data.labels["measureVisits"]

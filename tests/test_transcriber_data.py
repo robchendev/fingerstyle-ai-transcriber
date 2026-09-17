@@ -5,7 +5,7 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-from scripts.transcriber_data import EpochShuffleSampler, collate_windows, encode_targets
+from scripts.transcriber_data import EpochShuffleSampler, collate_windows, encode_targets, training_conditioning
 
 
 VOCABULARY = SimpleNamespace(PERCUSSION_TYPES=("wrist_thump", "thumb_slap", "percussive_hit"), HARMONIC_TYPES=("Natural", "Artificial", "Tap", "Pinch"), HARMONIC_FRETS=(5, 7, 9, 12, 19, 24))
@@ -13,6 +13,21 @@ MODEL = SimpleNamespace(max_fret=36, max_voices=4)
 
 
 class TargetEncodingTests(unittest.TestCase):
+    def test_sample_clock_roundoff_is_not_real_timing_extrapolation(self):
+        from scripts.transcriber_audio import HarnessError
+        from tests.test_score_alignment import clock_fixture
+
+        labels, normalization = clock_fixture()
+        labels["conditioning"]["instrument"] = {"openStringMidi": [40, 45, 50, 55, 59, 64], "capoFret": 0}
+        labels["conditioning"]["providedTiming"]["sourceTimeSignatureChanges"] = []
+        record = {
+            "data": SimpleNamespace(labels=labels, normalization=normalization),
+            "candidate": {"denseMapping": [{"clipSeconds": .35000000000000003, "scoreQuarter": 0.}, {"clipSeconds": 6., "scoreQuarter": 6.}]},
+        }
+        self.assertEqual(training_conditioning(record, np.array([.35, .37])).shape, (2, 12))
+        with self.assertRaisesRegex(HarnessError, "outside"):
+            training_conditioning(record, np.array([.35 - 1 / 48000, .37]))
+
     def test_confirmed_percussion_negatives_keep_gaps_boundaries_and_close_positives(self):
         gestures = [
             {"sourceGestureId": name, "technique": "wrist_thump", "onsetWindowSeconds": time, "supervisionMask": {"gesture": True, "onset": True}}

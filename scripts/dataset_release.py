@@ -10,7 +10,7 @@ import soundfile as sf
 
 from .dataset_io import read_json, sha256
 from .percussion_supervision import percussion_annotation_coverage
-from .training_windows import projected_targets, targets_in_window
+from .training_windows import projected_targets, range_sample_bounds, targets_in_window
 from .score_alignment import ScoreClock
 
 
@@ -174,6 +174,7 @@ def _validate_payload(entry, payload):
     if not isinstance(windows, list) or not windows:
         raise ValueError("Each released recording requires nonempty windows.")
     identifiers, bounds = set(), set()
+    approved_samples = range_sample_bounds(ranges, entry["sampleRate"])
     for window in windows:
         identifier = window["windowId"]
         start, stop = window["startSample"], window["stopSampleExclusive"]
@@ -185,8 +186,7 @@ def _validate_payload(entry, payload):
         bounds.add((start, stop))
         if not 2 * entry["sampleRate"] <= stop - start <= 8 * entry["sampleRate"]:
             raise ValueError("Released windows must last between two and eight seconds.")
-        left, right = start / entry["sampleRate"], stop / entry["sampleRate"]
-        if not any(a <= left < right <= b for a, b in ranges):
+        if not any(a <= start < stop <= b for a, b in approved_samples):
             raise ValueError("A released window crosses an unapproved interval.")
         expected = targets_in_window(notes, gestures, start, stop, entry["sampleRate"], percussion_coverage=percussion_coverage)
         if candidate_digest(window["targets"]) != candidate_digest(expected):

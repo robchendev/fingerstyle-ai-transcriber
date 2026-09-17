@@ -31,7 +31,10 @@ from .training_windows import projected_targets, range_sample_bounds, sample_win
 from .score_alignment import AlignmentInputError, ScoreClock, candidate_mapping, matching_events
 
 
-CONVENTIONS = {"schemaVersion": 1, "uppercaseOIsWristThump": True, "simultaneousTextPriority": "lowest-voice-index"}
+CONVENTIONS = {
+    "schemaVersion": 1, "uppercaseOIsWristThump": True, "simultaneousTextPriority": "lowest-voice-index",
+    "plainXIsThumbSlap": True, "ghostXIsPercussiveHit": True,
+}
 CONFIRMATIONS = {
     "authorize_use": "authorizedUse", "confirm_pitch": "recordingAndTargetPitchConfirmed",
     "confirm_notation": "notationReviewed", "approve_experimental_ranges": "approveExperimentalRangesAndSplit",

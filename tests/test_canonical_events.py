@@ -59,9 +59,97 @@ def harmonic_gesture_score(companion=False):
 
 
 OWNER_CONVENTIONS = {"schemaVersion": 1, "uppercaseOIsWristThump": True, "simultaneousTextPriority": "lowest-voice-index"}
+X_CONVENTIONS = {**OWNER_CONVENTIONS, "plainXIsThumbSlap": True, "ghostXIsPercussiveHit": True}
 
 
 class CanonicalEventTests(unittest.TestCase):
+    def test_plain_x_defaults_to_unpitched_thumb_independent_of_carrier(self):
+        for string in range(6):
+            for fret in (0, 5, 23, 99):
+                root = musical_score()
+                root.find("Notes").clear()
+                root.find("Notes").append(note_xml("0", string=string, fret=fret, dead=True))
+                root.find("Notes").append(note_xml("1", string=string, fret=fret, dead=True))
+                root.find("./Beats/Beat[@id='0']/FreeText").text = ""
+                root.find("./Beats/Beat[@id='0']/Properties").clear()
+                score = extracted(root, order=[0])
+                before = deepcopy(score)
+                with self.subTest(string=string, fret=fret):
+                    labels = canonicalize(score, conventions=X_CONVENTIONS)
+                    self.assertEqual(labels["targets"]["notes"], [])
+                    self.assertEqual([g["technique"] for g in labels["targets"]["gestures"]], ["thumb_slap"])
+                    gesture = labels["targets"]["gestures"][0]
+                    self.assertTrue(gesture["scoreOnsetKnown"])
+                    self.assertFalse(gesture["labelMask"]["fingering"])
+                    self.assertFalse(gesture["labelMask"]["pitch"])
+                    self.assertEqual(labels["review"]["unresolvedGestures"], [])
+                    self.assertEqual(score, before)
+
+    def test_plain_and_ghost_x_keep_distinct_gestures_and_simultaneous_wrist(self):
+        root = musical_score()
+        root.find("Notes").clear()
+        plain = note_xml("0", fret=99, dead=True)
+        ghost = note_xml("2", string=2, fret=23, dead=True)
+        ET.SubElement(ghost, "AntiAccent").text = "Normal"
+        root.find("Notes").extend([plain, ghost])
+        root.find("Notes").append(note_xml("1", dead=True))
+        root.find("./Beats/Beat[@id='0']/Notes").text = "0 2"
+        labels = canonicalize(extracted(root, order=[0]), conventions=X_CONVENTIONS)
+        self.assertEqual([g["technique"] for g in labels["targets"]["gestures"]], ["wrist_thump", "thumb_slap", "percussive_hit"])
+        self.assertEqual(labels["targets"]["notes"], [])
+        self.assertEqual(len(labels["review"]["notationSymbols"]), 2)
+
+    def test_simultaneous_voice_x_carriers_produce_one_thumb_slap(self):
+        root = musical_score()
+        root.find("Notes").clear()
+        root.find("Notes").extend([note_xml("0", string=0, fret=99, dead=True), note_xml("1", dead=True), note_xml("2", string=3, fret=23, dead=True)])
+        ET.SubElement(root.find("./Beats/Beat[@id='2']"), "Notes").text = "2"
+        labels = canonicalize(extracted(root, order=[0]), conventions=X_CONVENTIONS)
+        thumbs = [g for g in labels["targets"]["gestures"] if g["technique"] == "thumb_slap"]
+        self.assertEqual(len(thumbs), 1)
+        self.assertEqual(len(thumbs[0]["symbolicNoteIds"]), 2)
+        self.assertEqual(len(thumbs[0]["coincidentSourceGestures"]), 1)
+        self.assertEqual(len([g for g in labels["targets"]["gestures"] if g["technique"] == "wrist_thump"]), 1)
+
+    def test_source_rules_and_unknown_text_precede_common_x_conventions(self):
+        score = gesture_score()
+        labels = canonicalize(score, gesture_rules("muted_strum"), X_CONVENTIONS)
+        self.assertEqual([g["technique"] for g in labels["targets"]["gestures"]], ["muted_strum"])
+        score["scoreEvents"][0]["text"] = "???"
+        labels = canonicalize(score, conventions=X_CONVENTIONS)
+        self.assertEqual(labels["targets"]["gestures"], [])
+        self.assertTrue(labels["review"]["unresolvedGestures"])
+
+    def test_dead_tie_ignores_arbitrary_pitch_without_creating_a_second_attack(self):
+        root = musical_score()
+        root.find("Notes").clear()
+        root.find("Notes").append(note_xml("0", fret=99, dead=True))
+        root.find("Notes").append(note_xml("1", fret=5, dead=True, tie={"destination": "true"}))
+        root.find("./Beats/Beat[@id='0']/FreeText").text = ""
+        root.find("./Beats/Beat[@id='0']/Properties").clear()
+        score = extracted(root)
+        labels = canonicalize(score, conventions=X_CONVENTIONS)
+        self.assertEqual(len(labels["targets"]["gestures"]), 1)
+        self.assertEqual(labels["targets"]["gestures"][0]["technique"], "thumb_slap")
+        self.assertEqual(len(labels["review"]["notationSymbols"]), 1)
+        self.assertEqual(labels["review"]["notationSymbols"][0]["notatedDurationQuarter"], [8, 1])
+        self.assertFalse(score["playback"]["noteEvents"][1]["isAttack"])
+
+    def test_unknown_tie_and_grace_x_remain_masked_attacks(self):
+        for grace in (False, True):
+            root = musical_score()
+            root.find("Notes").clear()
+            root.find("Notes").append(note_xml("0", dead=True, tie=None if grace else {"destination": "true"}))
+            root.find("Notes").append(note_xml("1", dead=True))
+            root.find("./Beats/Beat[@id='0']/FreeText").text = ""
+            root.find("./Beats/Beat[@id='0']/Properties").clear()
+            if grace:
+                ET.SubElement(root.find("./Beats/Beat[@id='0']"), "GraceNotes").text = "BeforeBeat"
+            labels = canonicalize(extracted(root, order=[0]), conventions=X_CONVENTIONS)
+            self.assertEqual(labels["targets"]["gestures"][0]["technique"], "thumb_slap")
+            self.assertFalse(labels["targets"]["gestures"][0]["scoreOnsetKnown"])
+            self.assertFalse(labels["targets"]["gestures"][0]["labelMask"]["onset"])
+
     def test_short_percussion_text_limit_is_configurable_and_excludes_instructions(self):
         for text in ("a", "m1", "PM2", "***", "  a  "):
             with self.subTest(text=text):

@@ -13,7 +13,7 @@ import torch
 
 from scripts import transcriber
 from scripts.dataset_io import ROOT, read_json, sha256, publish_json
-from scripts.dataset_release import candidate_digest, release_scope, validate_mapping, validate_release, validation_groups
+from scripts.dataset_release import _validate_payload, candidate_digest, release_scope, validate_mapping, validate_release, validation_groups
 from scripts.percussion_supervision import percussion_annotation_coverage
 from scripts.training_windows import projected_targets, targets_in_window
 from scripts.score_alignment import ScoreClock
@@ -94,6 +94,24 @@ def synthetic_release(root, *, plateau=False, percussion_complete=None, unresolv
 
 
 class DatasetReleaseTests(unittest.TestCase):
+    def test_approved_sample_boundaries_use_the_proposed_integer_sample_ranges(self):
+        with TemporaryDirectory(dir=ROOT) as directory:
+            path = synthetic_release(Path(directory).resolve())
+            _, records, _ = validate_release(path)
+            entry, payload = records[0]
+            payload["approval"]["approvedClipRanges"] = [[.35000000000000003, 5.9]]
+            start, stop = 2800, 47200
+            clock = ScoreClock(payload["canonical"], payload["normalization"])
+            notes, gestures = projected_targets(payload["canonical"], payload["candidate"], clock)
+            payload["windows"] = [{
+                "windowId": "sample-boundary", "startSample": start, "stopSampleExclusive": stop,
+                "targets": targets_in_window(notes, gestures, start, stop, entry["sampleRate"]),
+            }]
+            _validate_payload(entry, payload)
+            payload["windows"][0]["startSample"] -= 1
+            with self.assertRaisesRegex(ValueError, "unapproved"):
+                _validate_payload(entry, payload)
+
     def test_validation_group_documents_preserve_order_and_reject_invalid_or_ambiguous_ids(self):
         document = {"validationGroups": ["piece-2", "piece-1"]}
         self.assertEqual(validation_groups(document), ("piece-2", "piece-1"))

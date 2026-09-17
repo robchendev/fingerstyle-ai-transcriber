@@ -117,6 +117,43 @@ def normalized_root(raw):
 
 
 class GpNormalizationTests(unittest.TestCase):
+    def test_all_dead_carriers_use_zero_fret_but_keep_pitch_note_and_ghost_status(self):
+        from tests.test_canonical_events import X_CONVENTIONS
+
+        root = template_score()
+        root.find("Notes").clear()
+        root.find("Notes").extend([note_xml("0", fret=99, dead=True), note_xml("1", fret=5, dead=True), note_xml("2", string=3, fret=8)])
+        ET.SubElement(root.find("./Notes/Note[@id='1']"), "AntiAccent").text = "Normal"
+        root.find("./Beats/Beat[@id='0']/FreeText").text = ""
+        root.find("./Beats/Beat[@id='0']/Notes").text = "0 2"
+        arguments = prepared(root, conventions=X_CONVENTIONS, rule=False)
+        before = arguments[0]
+        output, labels, report = normalize_gp_bytes(*arguments)
+        decoded = normalized_root(output)
+        parsed = decode_score(decoded, TUNING, 2)
+        dead = [note for beat in parsed["scoreEvents"] for note in beat["notes"] if note["techniques"]["dead"]]
+        pitched = [note for beat in parsed["scoreEvents"] for note in beat["notes"] if not note["techniques"]["dead"]]
+        self.assertEqual([note["fret"] for note in dead], [0, 0])
+        self.assertEqual([note["soundingPitchMidi"] for note in dead], [None, None])
+        self.assertNotIn("antiAccent", dead[0]["techniques"])
+        self.assertEqual(dead[1]["techniques"]["antiAccent"], "Normal")
+        self.assertEqual([note["fret"] for note in pitched], [8])
+        self.assertEqual([g["technique"] for g in labels["targets"]["gestures"]], ["thumb_slap", "percussive_hit"])
+        self.assertEqual(report["normalizationVersion"], 4)
+        self.assertEqual(len(report["unpitchedCarrierNormalizations"]), 2)
+        self.assertEqual(arguments[0], before)
+        with ZipFile(BytesIO(before)) as old, ZipFile(BytesIO(output)) as new:
+            for name in old.namelist():
+                if name != GPIF_ENTRY:
+                    self.assertEqual(old.read(name), new.read(name))
+        for note in decoded.findall("./Notes/Note"):
+            if note.find("./Properties/Property[@name='Muted']") is not None:
+                props = {prop.get("name"): prop for prop in note.findall("./Properties/Property")}
+                midi = int(props["Midi"].findtext("Number"))
+                for name, offset in report["nativePitchOffsets"].items():
+                    from scripts.gp_normalization import _pitch_value
+                    self.assertEqual(_pitch_value(props[name]), midi + offset)
+
     def test_native_cdata_title_and_retained_wrist_text_are_preserved(self):
         root = template_score()
         ET.SubElement(root.find("./Beats/Beat[@id='1']"), "FreeText").text = "O"

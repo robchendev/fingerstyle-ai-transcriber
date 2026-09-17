@@ -11,11 +11,11 @@ from xml.dom import Node, minidom
 from zipfile import BadZipFile, ZipFile
 
 from .canonical_events import canonical_counts, canonicalize, fraction, normalized_text, rule_tokens, source_indices, is_percussive_hit_text, performance_beats, performance_slot_keys
-from .gp_events import NOTE_VALUES, beat_techniques, catalog_timing, decode_score, index_section, performance_events, rational
+from .gp_events import NOTE_VALUES, beat_techniques, catalog_timing, decode_score, index_section, note_event, performance_events, rational
 
 
 GPIF_ENTRY = "Content/score.gpif"
-NORMALIZATION_VERSION = 3
+NORMALIZATION_VERSION = 4
 GENERIC_TECHNIQUES = frozenset({
     "body_tap", "body_flam", "body_scratch", "body_slap", "body_rasgueado",
     "string_slap", "nail_attack", "slap_pluck", "finger_snap", "snare_tap",
@@ -66,7 +66,9 @@ def _pitch_value(prop):
 def native_pitch_profile(root):
     offsets = {name: set() for name in ("ConcertPitch", "TransposedPitch")}
     spellings = {}
-    for note in root.findall("./Notes/Note"):
+    notes = root.findall("./Notes/Note")
+    pitched = [note for note in notes if note.find("./Properties/Property[@name='Muted']/Enable") is None]
+    for note in pitched or notes:
         props = {prop.get("name"): prop for prop in note.findall("./Properties/Property")}
         if "Midi" not in props:
             continue
@@ -111,6 +113,48 @@ def ghost_dead_note(identifier, string, tuning, capo, *, pitch_profile):
     ET.SubElement(ET.SubElement(props, "Property", name="String"), "String").text = str(6 - string)
     props.append(transposed)
     return note
+
+
+def _zero_dead_carrier(node, instrument, profile):
+    props = node.find("Properties")
+    string = int(props.findtext("Property[@name='String']/String"))
+    midi = instrument["openStringMidi"][string] + instrument["capoFret"]
+    for name, child, value in (("Fret", "Fret", 0), ("Midi", "Number", midi)):
+        prop = props.find(f"Property[@name='{name}']")
+        if prop is None:
+            prop = ET.SubElement(props, "Property", name=name)
+        _set_text(prop, child, str(value))
+    for name, offset in profile["offsets"].items():
+        expected = _pitch_property(name, midi + offset)
+        prop = props.find(f"Property[@name='{name}']")
+        if prop is None:
+            props.append(expected)
+        else:
+            pitch = prop.find("Pitch")
+            if pitch is None:
+                pitch = ET.SubElement(prop, "Pitch")
+            for child in expected.find("Pitch"):
+                _set_text(pitch, child.tag, child.text)
+
+
+def _normalize_dead_carriers(writer):
+    _, notes = source_indices(writer.score)
+    events = {event["id"]: event for event in writer.score["playback"]["noteEvents"]}
+    changes = []
+    for identifier, clone in writer.note_clones.items():
+        note = notes[events[identifier]["sourceEventId"]][1]
+        if not note["techniques"]["dead"]:
+            continue
+        before = semantic_node(clone)
+        _zero_dead_carrier(clone, writer.score["instrument"], writer.pitch_profile)
+        if semantic_node(clone) != before:
+            changes.append({
+                "sourcePerformanceId": identifier, "sourceFret": note["fret"], "normalizedFret": 0,
+                "sourceStoredMidi": note["storedMidi"],
+                "normalizedStoredMidi": writer.score["instrument"]["openStringMidi"][6 - note["string"]] + writer.score["instrument"]["capoFret"],
+                "stringRole": "notation-carrier-only", "pitchSupervision": False, "fingeringSupervision": False,
+            })
+    return changes
 
 
 def notated_uncertainty_intervals(notes, score):
@@ -298,6 +342,8 @@ def _conversion_candidates(labels, annotations, score):
     result = []
     for gesture in labels["targets"]["gestures"]:
         technique = gesture["technique"]
+        if gesture.get("interpretationRuleId") == "owner-ghost-X-generic" and gesture.get("evidenceSource") == "owner-notation-conventions":
+            continue
         retained = []
         timing_uncertain = False
         if technique == "compound_gesture":
@@ -799,10 +845,14 @@ def _verify_music(writer, decoded, playback, consumed, by_note, note_map):
             raise NormalizationError(f"{event['id']}: normalization changed the voice.")
         if new_beat["techniques"] != source_beat["techniques"]:
             raise NormalizationError(f"{event['id']}: a retained note's beat articulation changed.")
-        if any(new_note[key] != value for key, value in note.items() if key not in {"id", "sourceNoteId"}):
-            raise NormalizationError(f"{event['id']}: note pitch/fingering/articulation changed.")
         original = deepcopy(writer.definitions["Notes"][note["sourceNoteId"]])
         original.set("id", new_note["sourceNoteId"])
+        expected_note = note
+        if note["techniques"]["dead"]:
+            _zero_dead_carrier(original, writer.score["instrument"], writer.pitch_profile)
+            expected_note = note_event(original, note["id"], writer.score["instrument"]["openStringMidi"], writer.score["instrument"]["capoFret"], [])
+        if any(new_note[key] != value for key, value in expected_note.items() if key not in {"id", "sourceNoteId"}):
+            raise NormalizationError(f"{event['id']}: note pitch/fingering/articulation changed.")
         if semantic_node(original) != semantic_node(writer.note_clones[event["id"]]):
             raise NormalizationError(f"{event['id']}: an unmodified note's GPIF fields changed.")
     if playback["durationQuarter"] != writer.score["playback"]["durationQuarter"]:
@@ -951,6 +1001,7 @@ def normalize_gp_bytes(raw, score, labels, annotations=None, conventions=None):
     removed_marks = _strip_consumed_marks(writer, candidates, labels)
     _retain_compound_notation(writer, candidates)
     placements = _place_hits(writer, candidates, labels, consumed)
+    carrier_changes = _normalize_dead_carriers(writer)
     if _protected_tree(source) != _protected_tree(writer.root):
         raise NormalizationError("Nonmusical GPIF nodes or settings changed.")
     for identifier, original in writer.definitions["Rhythms"].items():
@@ -985,6 +1036,7 @@ def normalize_gp_bytes(raw, score, labels, annotations=None, conventions=None):
         "nativePitchOffsets": dict(writer.pitch_profile["offsets"]),
         "nativeGhostEncoding": "AntiAccent=Normal; Muted Enable; complete ConcertPitch/TransposedPitch",
         "nativeTextEncoding": "Preserve source CDATA fields, including titles and retained FreeText",
+        "unpitchedCarrierNormalizations": carrier_changes,
         "percussiveHitTextDetectionMaxLen": labels["provenance"]["percussiveHitTextDetectionMaxLen"],
         "rawCounts": canonical_counts(labels), "normalizedCounts": canonical_counts(normalized),
         "rawWrittenMeasureCount": len(score["measures"]),
