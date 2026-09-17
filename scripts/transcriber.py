@@ -366,6 +366,7 @@ def infer(args):
 
 
 def export_gp(args):
+    from .draft_cleanup import DraftProfile
     from .gp_output import write_gp_outputs
 
     predictions_path = Path(args.predictions).resolve()
@@ -375,7 +376,15 @@ def export_gp(args):
     if full_path.suffix.lower() != ".gp" or single_path.suffix.lower() != ".gp" or full_path == single_path:
         raise HarnessError("GP outputs require two different .gp paths under the private runs directory.")
     before = sha256(predictions_path)
-    report = write_gp_outputs(args.template, predictions, full_path, single_path)
+    profile = DraftProfile(
+        note_threshold=args.draft_note_threshold,
+        percussion_threshold=args.draft_percussion_threshold,
+        harmonic_threshold=args.draft_harmonic_threshold,
+        include_harmonics=args.include_harmonics,
+        chord_tolerance_seconds=args.chord_tolerance,
+        same_string_gap_seconds=args.same_string_gap,
+    )
+    report = write_gp_outputs(args.template, predictions, full_path, single_path, profile=profile)
     if sha256(predictions_path) != before:
         raise HarnessError("Prediction hypotheses changed during GP export.")
     report.update(
@@ -437,6 +446,12 @@ def main(argv=None):
     export.add_argument("--full-output", default="runs/transcription.full-voices.gp")
     export.add_argument("--single-output", default="runs/transcription.single-voice.gp")
     export.add_argument("--report", default="runs/gp-output.json")
+    export.add_argument("--draft-note-threshold", type=float, default=.9)
+    export.add_argument("--draft-percussion-threshold", type=float, default=.6)
+    export.add_argument("--draft-harmonic-threshold", type=float, default=.8)
+    export.add_argument("--include-harmonics", action="store_true", help="Export consistency-gated harmonic guesses; disabled by default because the positive-only harmonic head is uncalibrated.")
+    export.add_argument("--chord-tolerance", type=float, default=.04)
+    export.add_argument("--same-string-gap", type=float, default=.08)
     args = parser.parse_args(argv)
     try:
         if args.command == "config":

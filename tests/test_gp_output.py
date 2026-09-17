@@ -1,4 +1,5 @@
 from io import BytesIO
+from fractions import Fraction
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import hashlib
@@ -9,9 +10,10 @@ from zipfile import ZipFile
 
 from scripts.dataset_io import ROOT
 from scripts.dataset_io import publish_json, read_json
-from scripts.gp_events import decode_score
+from scripts.gp_events import decode_score, rhythm_duration
 from scripts.gp_normalization import GPIF_ENTRY
-from scripts.gp_output import GRID, TempoMap, write_gp_outputs
+from scripts.gp_output import GRID, TempoMap, _rhythmic_positions, write_gp_outputs
+from scripts.draft_cleanup import DraftProfile
 from scripts import transcriber
 from scripts.transcriber_audio import HarnessError
 from tests.test_gp_normalization import archive_bytes, template_score
@@ -50,7 +52,7 @@ def hypotheses():
                 "voiceIndex": 0,
                 "notatedDurationQuarter": 0.5,
                 "harmonic": {"type": "Natural", "fret": 12, "confidence": 0.8},
-                "confidence": 0.8,
+                "confidence": 0.95,
                 "uncertainty": ["harmonic_presence_uncalibrated"],
             },
         ],
@@ -86,6 +88,14 @@ class GpOutputTests(unittest.TestCase):
         self.assertAlmostEqual(float(mapping.quarter_at(1)), 1.1951677046)
         self.assertAlmostEqual(float(mapping.quarter_at(2)), 2 / math.log(2))
         self.assertAlmostEqual(float(mapping.quarter_at(3)), 2 / math.log(2) + 2)
+
+    def test_beat_relative_grid_prefers_sixteenths_but_retains_needed_thirty_seconds(self):
+        positions, counts = _rhythmic_positions([Fraction(0), Fraction(1, 4), Fraction(1, 2), Fraction(3, 4)])
+        self.assertEqual({value[1] for value in positions.values()}, {Fraction(1, 4)})
+        self.assertEqual(counts, {"sixteenth": 4})
+        positions, counts = _rhythmic_positions([Fraction(0), Fraction(1, 8), Fraction(1, 4)])
+        self.assertEqual({value[1] for value in positions.values()}, {Fraction(1, 8)})
+        self.assertEqual(counts, {"thirty-second": 3})
 
     def test_template_bar_scaffold_is_rebuilt_for_full_audio_duration(self):
         root = output_template()
@@ -135,7 +145,32 @@ class GpOutputTests(unittest.TestCase):
             dead = [note for note in full_root.findall("./Notes/Note") if note.find("./Properties/Property[@name='Muted']/Enable") is not None]
             self.assertEqual(len(dead), 2)
             self.assertEqual(sum(note.findtext("AntiAccent") == "Normal" for note in dead), 1)
-            self.assertEqual(report["gridQuarter"], [GRID.numerator, GRID.denominator])
+            self.assertEqual(report["finestCandidateQuarterGrid"], [GRID.numerator, GRID.denominator])
+            self.assertFalse(full_root.findall("./Rhythms/Rhythm/PrimaryTuplet"))
+            self.assertEqual(report["draftCleanup"]["profile"]["note_threshold"], 0.9)
+            rhythms = {node.get("id"): node for node in full_root.findall("./Rhythms/Rhythm")}
+            beats = {node.get("id"): node for node in full_root.findall("./Beats/Beat")}
+            dead_ids = {note.get("id") for note in dead}
+            carrier_beats = [
+                beat for beat in beats.values()
+                if dead_ids & set(beat.findtext("Notes", "").split())
+            ]
+            self.assertEqual([rhythm_duration(rhythms[beat.find("Rhythm").get("ref")])[0] for beat in carrier_beats], [Fraction(1, 4), Fraction(1, 4)])
+
+    def test_consistency_gated_harmonic_export_remains_available_explicitly(self):
+        with TemporaryDirectory(dir=ROOT) as directory:
+            directory = Path(directory)
+            template = directory / "template.gpt"
+            full, single = directory / "full.gp", directory / "single.gp"
+            template.write_bytes(archive_bytes(output_template()))
+            write_gp_outputs(
+                template,
+                hypotheses(),
+                full,
+                single,
+                profile=DraftProfile(note_threshold=.5, include_harmonics=True, harmonic_threshold=.5),
+            )
+            self.assertTrue(gp_root(full).findall("./Notes/Note/Properties/Property[@name='Harmonic']"))
 
     def test_duration_is_bounded_by_audio_and_same_string_reattacks_are_reported(self):
         document = hypotheses()

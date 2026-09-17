@@ -122,6 +122,22 @@ class HarnessCommandTests(unittest.TestCase):
                 with self.subTest(path=path), self.assertRaises(HarnessError):
                     transcriber.private_output(path, root)
 
+    def test_export_gp_cli_uses_validation_calibrated_cleanup_defaults(self):
+        parser = []
+        with patch("scripts.gp_output.write_gp_outputs") as write, patch.object(transcriber, "read_json", return_value={"notes": [], "percussion": []}), patch.object(transcriber, "sha256", return_value="hash"), patch.object(transcriber, "publish_json"), patch.object(transcriber, "private_output", side_effect=lambda path, root=None: Path(path)), patch("sys.stdout", new=StringIO()):
+            write.return_value = {"fullVoices": {"measureCount": 1}, "singleVoice": {}}
+            parser = [
+                "export-gp", "--predictions", "predictions.json", "--template", "template.gpt",
+                "--full-output", "runs\\full.gp", "--single-output", "runs\\single.gp",
+            ]
+            self.assertEqual(transcriber.main(parser), 0)
+        profile = write.call_args.kwargs["profile"]
+        self.assertEqual(profile.note_threshold, .9)
+        self.assertEqual(profile.percussion_threshold, .6)
+        self.assertFalse(profile.include_harmonics)
+        self.assertEqual(profile.chord_tolerance_seconds, .04)
+        self.assertEqual(profile.same_string_gap_seconds, .08)
+
     def test_whole_audio_stitching_has_no_uncovered_or_duplicated_frame_positions(self):
         class ConstantModel(torch.nn.Module):
             def forward(self, features, conditioning, lengths):

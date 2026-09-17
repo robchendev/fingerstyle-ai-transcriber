@@ -11,6 +11,7 @@ import tempfile
 import xml.etree.ElementTree as ET
 
 from .gp_events import HARMONIC_OFFSETS, NOTE_VALUES, TEMPO_BEAT_UNITS, decode_score
+from .draft_cleanup import DraftProfile, clean_hypotheses
 from .gp_normalization import (
     GPIF_ENTRY,
     NormalizationError,
@@ -25,7 +26,9 @@ from .transcriber_audio import HarnessError
 from .transcriber_model import HARMONIC_FRETS, HARMONIC_TYPES, PERCUSSION_TYPES
 
 
-GRID = Fraction(1, 24)
+GRID = Fraction(1, 8)
+RHYTHM_GRIDS = ((Fraction(1, 4), 0.0, "sixteenth"), (Fraction(1, 8), 0.02, "thirty-second"))
+PERCUSSION_DURATION = Fraction(1, 4)
 MAX_FRET = 36
 MAX_MEASURES = 4096
 KEY_ORDER = (0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6, 7, -7)
@@ -53,9 +56,30 @@ def _fraction(value):
     return Fraction(str(value)).limit_denominator(1_000_000)
 
 
-def _quantize(value):
-    units = value / GRID
-    return max(Fraction(0), (units.numerator * 2 + units.denominator) // (2 * units.denominator) * GRID)
+def _quantize(value, grid=GRID, origin=Fraction(0)):
+    units = (value - origin) / grid
+    return max(Fraction(0), origin + (units.numerator * 2 + units.denominator) // (2 * units.denominator) * grid)
+
+
+def _rhythmic_positions(values):
+    grouped = defaultdict(set)
+    for value in values:
+        grouped[value.numerator // value.denominator].add(value)
+    result = {}
+    counts = defaultdict(int)
+    for beat, positions in grouped.items():
+        origin = Fraction(beat)
+        candidates = []
+        for grid, penalty, name in RHYTHM_GRIDS:
+            snapped = {value: _quantize(value, grid, origin) for value in positions}
+            collisions = len(snapped) - len(set(snapped.values()))
+            error = sum(abs(snapped[value] - value) for value in positions)
+            score = float(error) + penalty * len(positions) + collisions * 0.25
+            candidates.append((score, penalty, -grid, name, grid, snapped))
+        _, _, _, name, grid, snapped = min(candidates)
+        result.update({value: (position, grid) for value, position in snapped.items()})
+        counts[name] += len(positions)
+    return result, dict(sorted(counts.items()))
 
 
 def _rational(value):
@@ -185,7 +209,6 @@ def _validate_predictions(document):
         note = {
             "id": f"note-{index}",
             "onsetRaw": tempo.quarter_at(value["onsetSeconds"]),
-            "onset": _quantize(tempo.quarter_at(value["onsetSeconds"])),
             "durationRaw": _fraction(_finite(value["notatedDurationQuarter"], "Note duration", minimum=0)),
             "string": _integer(value["string"], "Note string", 1, 6),
             "fret": _integer(value["fret"], "Note fret", 0, MAX_FRET),
@@ -197,10 +220,6 @@ def _validate_predictions(document):
         }
         if note["confidence"] > 1:
             raise HarnessError("Note confidence must be from zero through one.")
-        note["duration"] = _quantize(note["durationRaw"])
-        note["durationQuantized"] = note["duration"]
-        note["duration"] = max(GRID, note["duration"])
-        note["end"] = note["onset"] + note["duration"]
         notes.append(note)
     percussion = []
     for index, value in enumerate(document.get("percussion", [])):
@@ -211,7 +230,6 @@ def _validate_predictions(document):
             "id": f"percussion-{index}",
             "technique": value["technique"],
             "onsetRaw": tempo.quarter_at(value["onsetSeconds"]),
-            "onset": _quantize(tempo.quarter_at(value["onsetSeconds"])),
             "confidence": _finite(value["confidence"], "Percussion confidence", minimum=0),
         }
         if event["confidence"] > 1:
@@ -221,7 +239,16 @@ def _validate_predictions(document):
         raise HarnessError("GP output requires at least one decoded note or percussion event.")
     if any(note["onsetRaw"] > tempo.quarter_at(duration_seconds) for note in notes) or any(event["onsetRaw"] > tempo.quarter_at(duration_seconds) for event in percussion):
         raise HarnessError("A prediction falls after the declared audio duration.")
-    return tuning, capo, tempo, tempo.quarter_at(duration_seconds), notes, percussion
+    positions, rhythm_counts = _rhythmic_positions([note["onsetRaw"] for note in notes] + [event["onsetRaw"] for event in percussion])
+    for note in notes:
+        note["onset"], note["rhythmGrid"] = positions[note["onsetRaw"]]
+        note["duration"] = _quantize(note["durationRaw"], note["rhythmGrid"])
+        note["durationQuantized"] = note["duration"]
+        note["duration"] = max(note["rhythmGrid"], note["duration"])
+        note["end"] = note["onset"] + note["duration"]
+    for event in percussion:
+        event["onset"], event["rhythmGrid"] = positions[event["onsetRaw"]]
+    return tuning, capo, tempo, tempo.quarter_at(duration_seconds), notes, percussion, rhythm_counts
 
 
 def _resolve_notes(notes, tuning, capo, audio_end):
@@ -229,11 +256,11 @@ def _resolve_notes(notes, tuning, capo, audio_end):
     unresolved = []
     shortened = []
     for note in notes:
-        if note["durationQuantized"] < GRID:
+        if note["durationQuantized"] < note["rhythmGrid"]:
             shortened.append({
                 "id": note["id"], "reason": "minimum_notated_duration",
                 "fromDurationQuarter": _rational(note["durationQuantized"]),
-                "toDurationQuarter": _rational(GRID),
+                "toDurationQuarter": _rational(note["rhythmGrid"]),
             })
     dropped = []
     by_attack = {}
@@ -249,12 +276,14 @@ def _resolve_notes(notes, tuning, capo, audio_end):
     resolved = sorted(by_attack.values(), key=lambda item: (item["onset"], -item["string"], item["voice"], item["id"]))
     for note in resolved:
         if note["end"] > audio_end:
+            available = max(Fraction(0), audio_end - note["onset"])
+            bounded = max(note["rhythmGrid"], available // note["rhythmGrid"] * note["rhythmGrid"])
             shortened.append({
                 "id": note["id"], "reason": "clamped_to_audio_end",
                 "fromDurationQuarter": _rational(note["duration"]),
-                "toDurationQuarter": _rational(max(GRID, audio_end - note["onset"])),
+                "toDurationQuarter": _rational(bounded),
             })
-            note["end"] = max(note["onset"] + GRID, audio_end)
+            note["end"] = note["onset"] + bounded
             note["duration"] = note["end"] - note["onset"]
         if note["harmonic"] is None:
             derived = note["soundingPitchMidi"] - tuning[6 - note["string"]] - capo
@@ -456,12 +485,19 @@ RHYTHM_PALETTE = _rhythm_palette()
 
 
 def _split_duration(duration):
-    result = []
-    remaining = duration
-    for value, notation in RHYTHM_PALETTE:
-        while value <= remaining:
-            result.append((value, notation))
-            remaining -= value
+    def decompose(palette):
+        result = []
+        remaining = duration
+        for value, notation in palette:
+            while value <= remaining:
+                result.append((value, notation))
+                remaining -= value
+        return result, remaining
+
+    result, remaining = decompose([item for item in RHYTHM_PALETTE if item[1][2] is None])
+    if not remaining:
+        return result
+    result, remaining = decompose(RHYTHM_PALETTE)
     if remaining:
         result.append((remaining, ("Quarter", 0, (remaining.denominator, remaining.numerator))))
     return result
@@ -646,6 +682,7 @@ class _ScoreWriter:
             for event in self.percussion:
                 if measure["start"] <= event["onset"] < measure["end"]:
                     boundaries.add(event["onset"])
+                    boundaries.add(min(measure["end"], event["onset"] + PERCUSSION_DURATION))
         points = sorted(boundaries)
         beats = []
         for left, right in zip(points, points[1:]):
@@ -827,7 +864,7 @@ def _atomic_bytes(path, content):
             temporary.unlink()
 
 
-def write_gp_outputs(template_path, predictions, full_path, single_path):
+def write_gp_outputs(template_path, predictions, full_path, single_path, *, profile=DraftProfile()):
     template_path = Path(template_path).resolve()
     if not template_path.is_file():
         raise HarnessError(f"GP output template does not exist: {template_path}")
@@ -835,10 +872,11 @@ def write_gp_outputs(template_path, predictions, full_path, single_path):
     template_hash = hashlib.sha256(template_raw).hexdigest()
     if Path(full_path).absolute() == Path(single_path).absolute():
         raise HarnessError("Full-voice and single-voice GP outputs require different paths.")
-    tuning, capo, tempo, audio_end, raw_notes, raw_percussion = _validate_predictions(predictions)
+    cleaned, cleanup = clean_hypotheses(predictions, profile)
+    tuning, capo, tempo, audio_end, raw_notes, raw_percussion, rhythm_counts = _validate_predictions(cleaned)
     notes, reconciled, unresolved, shortened, dropped_notes = _resolve_notes(raw_notes, tuning, capo, audio_end)
     percussion, dropped_percussion = _resolve_percussion(raw_percussion)
-    content_end = max(audio_end, max([note["onset"] + GRID for note in notes] + [event["onset"] + GRID for event in percussion], default=GRID))
+    content_end = max(audio_end, max([note["onset"] + note["rhythmGrid"] for note in notes] + [event["onset"] + PERCUSSION_DURATION for event in percussion], default=GRID))
     measures = _measures(predictions["metadata"], tempo, content_end)
     full, full_report = _build_variant(template_raw, notes, percussion, measures, tuning, capo, tempo, simplified=False)
     simple_notes = _simplified_notes(notes, percussion)
@@ -856,9 +894,17 @@ def write_gp_outputs(template_path, predictions, full_path, single_path):
         "kind": "gp-output-report",
         "templateSha256": template_hash,
         "templateModified": False,
-        "gridQuarter": _rational(GRID),
-        "sourceHypotheses": {"notes": len(raw_notes), "percussion": len(raw_percussion)},
+        "finestCandidateQuarterGrid": _rational(GRID),
+        "sourceHypotheses": {"notes": len(predictions["notes"]), "percussion": len(predictions["percussion"])},
+        "cleanedHypotheses": {"notes": len(raw_notes), "percussion": len(raw_percussion)},
         "resolvedHypotheses": {"notes": len(notes), "percussion": len(percussion)},
+        "draftCleanup": cleanup,
+        "rhythmicGridPolicy": {
+            "candidateQuarterGrids": [_rational(value[0]) for value in RHYTHM_GRIDS],
+            "complexityPenalties": {value[2]: value[1] for value in RHYTHM_GRIDS},
+            "selectedUniqueOnsetsByGrid": rhythm_counts,
+            "percussionDurationQuarter": _rational(PERCUSSION_DURATION),
+        },
         "pitchFretReconciliations": reconciled,
         "unresolvedPitchFretConflicts": unresolved,
         "shortenedSustainHypotheses": shortened,
