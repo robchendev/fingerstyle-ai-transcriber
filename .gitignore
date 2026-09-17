@@ -1,6 +1,7 @@
 # Dataset privacy must survive a future public code repository.
 # Ignoring paths does not remove dataset metadata already tracked in history.
 /data/
+/docs/SESSION_HANDOFF.md
 .venv/
 .tools/
 __pycache__/
