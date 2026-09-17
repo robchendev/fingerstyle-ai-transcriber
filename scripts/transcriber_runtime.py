@@ -23,9 +23,12 @@ SCHEMA_VERSION = 1
 _PRIOR_NAMES = frozenset({"harmonic_sparsity", "percussion_sparsity"})
 _NOTE_ONSET_STATS = ("note_onset_positive", "note_onset_negative")
 _PERCUSSION_STATS = ("percussion_positive", "percussion_negative")
+_TECHNIQUE_STATS = ("technique_positive", "technique_negative")
+_TECHNIQUE_STRING_STATS = ("technique_strings_positive", "technique_strings_negative")
 _LOSS_STAT_KEYS = (
     *_NOTE_ONSET_STATS, "fret", "pitch", "voice", "duration_log", "harmonic_positive",
     "harmonic_kind", "harmonic_node", *_PERCUSSION_STATS, "harmonic_sparsity", "percussion_sparsity",
+    *_TECHNIQUE_STATS, "technique_direction", *_TECHNIQUE_STRING_STATS,
 )
 _CHECKPOINT_KEYS = {
     "schema_version", "run_id", "identity", "training_config", "runtime", "model_state",
@@ -548,7 +551,14 @@ def _objective(stats, weights, sparsity_weight):
                 loss += sum(stats[key]["sum"] * _stat_weight(key, weights) for key in percussion) / sum(
                     stats[key]["count"] * _stat_weight(key, weights) for key in percussion
                 )
-        elif value["count"] and name not in (*_NOTE_ONSET_STATS, *_PERCUSSION_STATS):
+        elif name in ("technique_positive", "technique_strings_positive"):
+            group = _TECHNIQUE_STATS if name == "technique_positive" else _TECHNIQUE_STRING_STATS
+            observed = [key for key in group if stats[key]["count"]]
+            if observed:
+                loss += sum(stats[key]["sum"] * _stat_weight(key, weights) for key in observed) / sum(
+                    stats[key]["count"] * _stat_weight(key, weights) for key in observed
+                )
+        elif value["count"] and name not in (*_NOTE_ONSET_STATS, *_PERCUSSION_STATS, *_TECHNIQUE_STATS, *_TECHNIQUE_STRING_STATS):
             weight = sparsity_weight if name in _PRIOR_NAMES else _stat_weight(name, weights)
             loss += weight * value["sum"] / value["count"]
     return _finite(loss, "aggregated loss")
@@ -632,6 +642,37 @@ def _metric_counts(outputs, batch, counts):
                 count["tp"] += int((emitted & labelled).sum().item())
                 count["emitted"] += int((emitted & emission_mask).sum().item())
                 count["positions"] += int(emission_mask.sum().item())
+    if "technique" in targets:
+        target = targets["technique"]
+        mask = _mask(target, masks["technique"], valid)
+        prediction = _prediction(outputs, "technique")
+        if prediction.shape != target.shape:
+            raise ValueError("Invalid binary output shape for technique")
+        emitted, positive = prediction >= 0, target > .5
+        count = counts["technique_frame"]
+        count["count"] += int(mask.sum().item())
+        count["tp"] += int((emitted & positive & mask).sum().item())
+        count["fp"] += int((emitted & ~positive & mask).sum().item())
+        count["fn"] += int((~emitted & positive & mask).sum().item())
+        count["tn"] += int((~emitted & ~positive & mask).sum().item())
+        direction_mask = _mask(targets["technique_direction"], masks["technique_direction"], valid)
+        direction = _prediction(outputs, "technique_direction")
+        if direction.shape[:-1] != targets["technique_direction"].shape:
+            raise ValueError("Invalid categorical output shape for technique_direction")
+        counts["technique_direction"]["correct"] += int(((direction.argmax(-1) == targets["technique_direction"]) & direction_mask).sum().item())
+        counts["technique_direction"]["count"] += int(direction_mask.sum().item())
+        string_target = targets["technique_strings"]
+        string_mask = _mask(string_target, masks["technique_strings"], valid)
+        string_prediction = _prediction(outputs, "technique_strings")
+        if string_prediction.shape != string_target.shape:
+            raise ValueError("Invalid binary output shape for technique_strings")
+        emitted, positive = string_prediction >= 0, string_target > .5
+        count = counts["technique_strings"]
+        count["count"] += int(string_mask.sum().item())
+        count["tp"] += int((emitted & positive & string_mask).sum().item())
+        count["fp"] += int((emitted & ~positive & string_mask).sum().item())
+        count["fn"] += int((~emitted & positive & string_mask).sum().item())
+        count["tn"] += int((~emitted & ~positive & string_mask).sum().item())
 
 
 def _divide(numerator, denominator):
@@ -679,6 +720,20 @@ def _metrics(counts):
         "recall": _divide(tp, tp + fn) if available else None,
         "f1": _divide(2 * tp, 2 * tp + fp + fn) if available else None,
     }
+    for name in ("technique_frame", "technique_strings"):
+        value = counts[name]
+        tp, fp, fn, tn = (value[key] for key in ("tp", "fp", "fn", "tn"))
+        result[name] = {
+            "available": bool(value["count"]), "count": value["count"],
+            "true_positive": tp, "false_positive": fp, "false_negative": fn, "true_negative": tn,
+            "precision": _divide(tp, tp + fp), "recall": _divide(tp, tp + fn),
+            "f1": _divide(2 * tp, 2 * tp + fp + fn),
+        }
+    direction = counts["technique_direction"]
+    result["technique_direction_accuracy"] = {
+        "available": bool(direction["count"]), "count": direction["count"],
+        "correct": direction["correct"], "accuracy": _divide(direction["correct"], direction["count"]),
+    }
     return result
 
 
@@ -710,6 +765,7 @@ def evaluate_model(model, loader, device, *, sparsity_weight=0.02, progress=None
     counts = {
         name: {"count": 0, "sum": 0.0, "correct": 0, "tp": 0, "fp": 0, "fn": 0, "tn": 0, "emitted": 0, "positions": 0}
         for name in ("note_onset", "fret", "pitch", "voice", "duration", "harmonic_presence", "percussion", "percussion_frame")
+        + ("technique_frame", "technique_direction", "technique_strings")
     }
     batches = frames = windows = 0
     started = last_log = time.perf_counter()

@@ -12,7 +12,7 @@ from scripts.transcriber_model import (
 )
 
 
-def synthetic_outputs(batch=2, frames=5, *, requires_grad=False):
+def synthetic_outputs(batch=2, frames=5, *, requires_grad=False, architecture_version=1):
     shapes = {
         "note_onset_logits": (6,),
         "fret_logits": (6, 37),
@@ -24,10 +24,16 @@ def synthetic_outputs(batch=2, frames=5, *, requires_grad=False):
         "harmonic_node_logits": (6, 6),
         "percussion_logits": (3,),
     }
+    if architecture_version >= 2:
+        shapes.update({
+            "technique_logits": (4,),
+            "technique_direction_logits": (4, 2),
+            "technique_strings_logits": (4, 6),
+        })
     return {name: torch.zeros(batch, frames, *shape, requires_grad=requires_grad) for name, shape in shapes.items()}
 
 
-def synthetic_targets(batch=2, frames=5):
+def synthetic_targets(batch=2, frames=5, *, architecture_version=1):
     names = ("note_onset", "fret", "pitch", "voice", "duration_log", "harmonic",
              "harmonic_kind", "harmonic_node", "percussion")
     categorical = ("fret", "pitch", "voice", "harmonic_kind", "harmonic_node")
@@ -37,14 +43,21 @@ def synthetic_targets(batch=2, frames=5):
                          dtype=torch.long if name in categorical else torch.float32)
         for name in names
     }
+    if architecture_version >= 2:
+        targets["technique"] = torch.full((batch, frames, 4), float("nan"))
+        targets["technique_direction"] = torch.full((batch, frames, 4), -999, dtype=torch.long)
+        targets["technique_strings"] = torch.full((batch, frames, 4, 6), float("nan"))
     masks = {name: torch.zeros_like(value, dtype=torch.bool) for name, value in targets.items()}
     return targets, masks, torch.ones(batch, frames, dtype=torch.bool)
 
 
-def event_outputs(frames):
-    outputs = {name: value[0] for name, value in synthetic_outputs(1, frames).items()}
+def event_outputs(frames, *, architecture_version=1):
+    outputs = {name: value[0] for name, value in synthetic_outputs(1, frames, architecture_version=architecture_version).items()}
     for name in ("note_onset_logits", "harmonic_logits", "percussion_logits"):
         outputs[name].fill_(-12)
+    if "technique_logits" in outputs:
+        outputs["technique_logits"].fill_(-12)
+        outputs["technique_strings_logits"].fill_(-12)
     outputs["duration_log"].fill_(math.log1p(1))
     return outputs
 
@@ -67,18 +80,18 @@ class ModelTests(unittest.TestCase):
     def test_config_is_validated_frozen_and_serializable(self):
         config = ModelConfig()
         self.assertEqual(asdict(config), {
-            "n_mels": 96, "conditioning_dim": 12, "hidden_size": 128,
+            "architecture_version": 1, "n_mels": 96, "conditioning_dim": 12, "hidden_size": 128,
             "recurrent_layers": 2, "max_fret": 36, "max_voices": 4, "dropout": .1,
         })
         self.assertEqual(ModelConfig(**json.loads(json.dumps(asdict(config)))), config)
         with self.assertRaises(FrozenInstanceError):
             config.max_fret = 10
-        for options in ({"n_mels": 0}, {"conditioning_dim": 11}, {"hidden_size": 0},
+        for options in ({"architecture_version": 0}, {"architecture_version": 3}, {"n_mels": 0}, {"conditioning_dim": 11}, {"hidden_size": 0},
                         {"recurrent_layers": -1}, {"max_fret": -1}, {"max_fret": 128},
                         {"max_voices": 0}, {"dropout": 1}, {"dropout": -1}, {"dropout": float("nan")}):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 ModelConfig(**options)
-        for options in ({"n_mels": True}, {"max_fret": 2.5}, {"dropout": "0.1"}):
+        for options in ({"architecture_version": True}, {"n_mels": True}, {"max_fret": 2.5}, {"dropout": "0.1"}):
             with self.subTest(options=options), self.assertRaises(TypeError):
                 ModelConfig(**options)
         with self.assertRaises(TypeError):
@@ -130,6 +143,31 @@ class ModelTests(unittest.TestCase):
             original, restored = model(features, conditioning), clone(features, conditioning)
         for name in original:
             self.assertTrue(torch.equal(original[name], restored[name]), name)
+
+    def test_v2_adds_technique_heads_without_changing_v1_state_contract(self):
+        config = ModelConfig(architecture_version=2, hidden_size=8, recurrent_layers=1, dropout=0)
+        model = FingerstyleTranscriber(config)
+        self.assertEqual(model.head_shapes["technique_logits"], (4,))
+        self.assertEqual(model.head_shapes["technique_direction_logits"], (4, 2))
+        self.assertEqual(model.head_shapes["technique_strings_logits"], (4, 6))
+        lengths = torch.tensor([5, 3])
+        outputs = model(torch.zeros(2, 5, 96), torch.zeros(2, 5, 12), lengths)
+        targets, masks, valid = synthetic_targets(2, 5, architecture_version=2)
+        valid[1, 3:] = False
+        targets["technique"].zero_()
+        masks["technique"].fill_(True)
+        targets["technique"][0, 1, 0] = 1
+        targets["technique_direction"][0, 1, 0] = 1
+        masks["technique_direction"][0, 1, 0] = True
+        targets["technique_strings"][0, 1, 0] = torch.tensor([1., 0., 1., 0., 0., 1.])
+        masks["technique_strings"][0, 1, 0] = True
+        loss, stats = masked_loss(outputs, targets, masks, valid)
+        self.assertTrue(torch.isfinite(loss))
+        self.assertEqual(stats["technique_positive"]["count"], 1)
+        self.assertEqual(stats["technique_negative"]["count"], 31)
+        self.assertEqual(stats["technique_direction"]["count"], 1)
+        self.assertEqual(stats["technique_strings_positive"]["count"], 3)
+        self.assertEqual(stats["technique_strings_negative"]["count"], 3)
 
     def test_padding_does_not_change_real_frames(self):
         model = FingerstyleTranscriber(ModelConfig(n_mels=9, hidden_size=8, recurrent_layers=1, dropout=0)).eval()
@@ -492,6 +530,17 @@ class EventDecoderTests(unittest.TestCase):
             self.assertNotIn("string", item)
             self.assertNotIn("fret", item)
         json.dumps(decoded, allow_nan=False)
+
+    def test_v2_decodes_strum_direction_and_complete_string_membership(self):
+        outputs = event_outputs(3, architecture_version=2)
+        outputs["technique_logits"][1, 0] = 8
+        outputs["technique_direction_logits"][1, 0, 1] = 8
+        outputs["technique_strings_logits"][1, 0, [0, 2, 5]] = 8
+        decoded = self.decode(outputs, [0, .02, .04])
+        self.assertEqual(decoded["techniques"][0]["technique"], "brush")
+        self.assertEqual(decoded["techniques"][0]["direction"], "Up")
+        self.assertEqual(decoded["techniques"][0]["strings"], [6, 4, 1])
+        self.assertEqual(set(decoded["techniques"][0]["stringMembershipConfidence"]), {"1", "2", "3", "4", "5", "6"})
 
     def test_plateaus_repeated_attacks_and_late_audio_are_not_truncated(self):
         outputs = event_outputs(14)

@@ -35,7 +35,7 @@ def default_config():
     from .transcriber_model import ModelConfig
     from .transcriber_runtime import TrainingConfig
     return {
-        "schemaVersion": 1, "features": asdict(FeatureConfig()), "model": asdict(ModelConfig()),
+        "schemaVersion": 1, "features": asdict(FeatureConfig()), "model": asdict(ModelConfig(architecture_version=2)),
         "training": asdict(TrainingConfig()),
         "data": {"manifest": "data\\releases\\dataset-v1\\manifest.json", "batch_size": 4, "num_workers": 0, "num_threads": 4, "cache": "cache\\transcriber"},
     }
@@ -94,7 +94,7 @@ def run_identity(dataset, config, features, model, training, device):
     settings = asdict(training)
     settings.pop("epochs", None)
     settings.pop("max_steps", None)
-    modules = ("transcriber.py", "transcriber_audio.py", "transcriber_data.py", "transcriber_model.py", "transcriber_runtime.py", "transcriber_events.py", "dataset_release.py", "training_windows.py", "score_alignment.py", "dataset_io.py", "canonical_events.py", "gp_events.py", "inspect_gp_files.py", "settings.py")
+    modules = ("transcriber.py", "transcriber_audio.py", "transcriber_data.py", "transcriber_model.py", "transcriber_runtime.py", "transcriber_events.py", "technique_supervision.py", "dataset_release.py", "training_windows.py", "score_alignment.py", "dataset_io.py", "canonical_events.py", "gp_events.py", "inspect_gp_files.py", "settings.py")
     return {
         "schemaVersion": 1, "manifest_sha256": dataset.manifest_sha256,
         "features": asdict(features), "model": asdict(model), "training": settings,
@@ -255,7 +255,7 @@ def evaluate_decoded_events(args):
     config = default_config()
     torch.set_num_threads(config["data"]["num_threads"])
     dataset = make_dataset(config, FeatureConfig(**identity["features"]), ModelConfig(**identity["model"]), args.split, args.data_root, args.manifest)
-    report = evaluate_events(model, dataset, device, tolerances=args.tolerances, onset_threshold=args.onset_threshold, percussion_threshold=args.percussion_threshold, progress=log_progress)
+    report = evaluate_events(model, dataset, device, tolerances=args.tolerances, onset_threshold=args.onset_threshold, percussion_threshold=args.percussion_threshold, technique_threshold=getattr(args, "technique_threshold", .5), progress=log_progress)
     if sha256(Path(args.checkpoint)) != checkpoint_hash:
         raise HarnessError("Checkpoint changed during event evaluation.")
     if implementation != {path.name: sha256(path) for path in Path(__file__).parent.glob("*.py")}:
@@ -351,7 +351,7 @@ def infer(args):
         raise HarnessError("Input audio is silent; no transcription hypotheses were published.")
     if sha256(audio_path) != audio_hash:
         raise HarnessError("Audio changed during inference.")
-    events = decode_events(timeline.finish(), torch.tensor(frame_times), tuning=metadata["openStringMidi"], capo=metadata["capoFret"], onset_threshold=args.onset_threshold, percussion_threshold=args.percussion_threshold)
+    events = decode_events(timeline.finish(), torch.tensor(frame_times), tuning=metadata["openStringMidi"], capo=metadata["capoFret"], onset_threshold=args.onset_threshold, percussion_threshold=args.percussion_threshold, technique_threshold=getattr(args, "technique_threshold", .5))
     report = {
         "schemaVersion": 1, "kind": "fingerstyle-transcription-hypotheses", "visibility": "private", "distributionAuthorized": False,
         "audioSha256": audio_hash, "checkpointSha256": sha256(Path(args.checkpoint)),
@@ -385,9 +385,19 @@ def export_gp(args):
         chord_tolerance_seconds=args.chord_tolerance,
         same_string_gap_seconds=args.same_string_gap,
     )
+    arranger = arranger_identity = None
+    if args.fingering_arranger:
+        from .fingering_arranger import load_arranger
+
+        arranger, arranger_checkpoint = load_arranger(args.fingering_arranger)
+        arranger_identity = {
+            "checkpointSha256": sha256(args.fingering_arranger),
+            "manifestSha256": arranger_checkpoint["manifestSha256"],
+        }
     report = write_gp_outputs(
         args.template, predictions, full_path, single_path, profile=profile,
         beat_evidence=beat_evidence, include_unsupported_tail=args.include_beat_unsupported_tail,
+        arranger=arranger,
     )
     if sha256(predictions_path) != before:
         raise HarnessError("Prediction hypotheses changed during GP export.")
@@ -396,6 +406,7 @@ def export_gp(args):
         predictionsSha256=before,
         fullOutputSha256=sha256(full_path),
         singleOutputSha256=sha256(single_path),
+        fingeringArranger=arranger_identity,
     )
     report_path = private_output(args.report, args.data_root)
     publish_json(report_path, report)
@@ -450,6 +461,7 @@ def main(argv=None):
                 command.add_argument("--tolerances", nargs="+", type=float, default=[.05, .1, .2])
                 command.add_argument("--onset-threshold", type=float, default=.5)
                 command.add_argument("--percussion-threshold", type=float, default=.5)
+                command.add_argument("--technique-threshold", type=float, default=.5)
     inference = commands.add_parser("infer")
     inference.add_argument("--data-root", default=str(ROOT))
     inference.add_argument("--checkpoint", required=True)
@@ -459,6 +471,7 @@ def main(argv=None):
     inference.add_argument("--device", default="auto")
     inference.add_argument("--onset-threshold", type=float, default=.5)
     inference.add_argument("--percussion-threshold", type=float, default=.5)
+    inference.add_argument("--technique-threshold", type=float, default=.5)
     beats = commands.add_parser("analyze-beats")
     beats.add_argument("--data-root", default=str(ROOT))
     beats.add_argument("--audio", required=True)
@@ -470,6 +483,7 @@ def main(argv=None):
     export.add_argument("--predictions", required=True)
     export.add_argument("--template", required=True)
     export.add_argument("--beat-evidence", help="Private analyze-beats output for beat-anchored constrained rhythm inference.")
+    export.add_argument("--fingering-arranger", help="Optional trained symbolic arranger checkpoint; training is a separate human-owner command.")
     export.add_argument("--full-output", default="runs/transcription.full-voices.gp")
     export.add_argument("--single-output", default="runs/transcription.single-voice.gp")
     export.add_argument("--report", default="runs/gp-output.json")

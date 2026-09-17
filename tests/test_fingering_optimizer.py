@@ -85,6 +85,14 @@ class FingeringOptimizerTests(unittest.TestCase):
         with self.assertRaises(HarnessError):
             optimize_fingerings({"metadata": {}, "notes": []})
 
+    def test_impossible_string_arranger_score_cannot_drop_only_playable_position(self):
+        value = note(40, 6, 0, .99)
+        value["arrangerStringLogits"] = [0, 0, 0, 0, 0, 25]
+        result, report = optimize_fingerings(self.document([value]))
+        self.assertEqual([(item["string"], item["fret"]) for item in result["notes"]], [(6, 4)])
+        # This synthetic document's tuning has string 6 at MIDI35 plus capo1.
+        self.assertEqual(report["removedCount"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -26,6 +26,7 @@ from .gp_normalization import (
 )
 from .transcriber_audio import HarnessError
 from .transcriber_model import HARMONIC_FRETS, HARMONIC_TYPES, PERCUSSION_TYPES
+from .technique_supervision import TECHNIQUE_DIRECTIONS, TECHNIQUE_TYPES
 
 
 GRID = Fraction(1, 8)
@@ -274,13 +275,32 @@ def _validate_predictions(document):
         if event["confidence"] > 1:
             raise HarnessError("Percussion confidence must be from zero through one.")
         percussion.append(event)
+    techniques = []
+    for index, value in enumerate(document.get("techniques", [])):
+        required = {"onsetSeconds", "technique", "direction", "strings", "confidence"}
+        if not isinstance(value, dict) or not required <= set(value) or value["technique"] not in TECHNIQUE_TYPES:
+            raise HarnessError("Every acoustic technique prediction requires onset, type, direction, strings, and confidence.")
+        if value["direction"] not in TECHNIQUE_DIRECTIONS or not isinstance(value["strings"], list) or any(type(string) is not int or not 1 <= string <= 6 for string in value["strings"]):
+            raise HarnessError("Technique direction or string membership is invalid.")
+        score_onset = value.get("scoreOnsetQuarter")
+        structured_flags.append(score_onset is not None)
+        onset_raw = Fraction(*score_onset) if score_onset is not None else tempo.quarter_at(value["onsetSeconds"])
+        techniques.append({
+            "id": f"technique-{index}",
+            "onsetRaw": onset_raw,
+            "onset": onset_raw,
+            "technique": value["technique"],
+            "direction": value["direction"],
+            "strings": sorted(set(value["strings"]), reverse=True),
+            "confidence": _finite(value["confidence"], "Technique confidence", minimum=0),
+        })
     if not notes and not percussion:
         raise HarnessError("GP output requires at least one decoded note or percussion event.")
     if any(structured_flags) and not all(structured_flags):
         raise HarnessError("Every event must use the same structured or nominal score-time coordinate system.")
     structured = all(structured_flags)
     if structured:
-        rhythm_counts = {"constrained-24-tick": len({note["onsetRaw"] for note in notes} | {event["onsetRaw"] for event in percussion})}
+        rhythm_counts = {"constrained-24-tick": len({note["onsetRaw"] for note in notes} | {event["onsetRaw"] for event in percussion} | {event["onsetRaw"] for event in techniques})}
         for note in notes:
             note["onset"] = note["onsetRaw"]
             note["rhythmGrid"] = Fraction(1, TICKS_PER_QUARTER)
@@ -290,6 +310,8 @@ def _validate_predictions(document):
         for event in percussion:
             event["onset"] = event["onsetRaw"]
             event["rhythmGrid"] = Fraction(1, TICKS_PER_QUARTER)
+        for event in techniques:
+            event["onset"] = event["onsetRaw"]
         declared_end = document.get("scoreAudioEndQuarter")
         if not isinstance(declared_end, list) or len(declared_end) != 2:
             raise HarnessError("Structured timing requires a rational score audio end.")
@@ -297,7 +319,7 @@ def _validate_predictions(document):
         if score_end <= 0 or score_end.denominator > TICKS_PER_QUARTER or TICKS_PER_QUARTER % score_end.denominator:
             raise HarnessError("Structured score audio end must be positive.")
     else:
-        positions, rhythm_counts = _rhythmic_positions([note["onsetRaw"] for note in notes] + [event["onsetRaw"] for event in percussion])
+        positions, rhythm_counts = _rhythmic_positions([note["onsetRaw"] for note in notes] + [event["onsetRaw"] for event in percussion] + [event["onsetRaw"] for event in techniques])
         for note in notes:
             note["onset"], note["rhythmGrid"] = positions[note["onsetRaw"]]
             note["duration"] = _quantize(note["durationRaw"], note["rhythmGrid"])
@@ -306,8 +328,10 @@ def _validate_predictions(document):
             note["end"] = note["onset"] + note["duration"]
         for event in percussion:
             event["onset"], event["rhythmGrid"] = positions[event["onsetRaw"]]
+        for event in techniques:
+            event["onset"], _ = positions[event["onsetRaw"]]
         score_end = tempo.quarter_at(duration_seconds)
-    return tuning, capo, tempo, score_end, notes, percussion, rhythm_counts, structured
+    return tuning, capo, tempo, score_end, notes, percussion, techniques, rhythm_counts, structured
 
 
 def _resolve_notes(notes, tuning, capo, audio_end):
@@ -633,13 +657,14 @@ def _template_invariant(root):
 
 
 class _ScoreWriter:
-    def __init__(self, root, tuning, capo, measures, notes, percussion, key_count, spellings, *, simplified):
+    def __init__(self, root, tuning, capo, measures, notes, percussion, techniques, key_count, spellings, *, simplified):
         self.root = root
         self.tuning = tuning
         self.capo = capo
         self.measures = measures
         self.notes = notes
         self.percussion = percussion
+        self.techniques = techniques
         self.key_count = key_count
         self.spellings = spellings
         self.simplified = simplified
@@ -658,6 +683,14 @@ class _ScoreWriter:
                 return (0 if boundary else 1 + 100 * active, voice)
 
             self.percussion_voices[event["id"]] = min(voices, key=host_cost)
+        self.technique_voices = {}
+        for event in techniques:
+            def technique_host_cost(voice):
+                at_onset = [note for note in notes if note["voice"] == voice and note["onset"] == event["onset"]]
+                overlap = len(set(event["strings"]) & {note["string"] for note in at_onset})
+                return (-overlap, voice)
+
+            self.technique_voices[event["id"]] = min(voices, key=technique_host_cost)
         masters = root.findall("./MasterBars/MasterBar")
         bars = root.findall("./Bars/Bar")
         if not masters or not bars:
@@ -726,7 +759,7 @@ class _ScoreWriter:
         self.root.find("Notes").append(node)
         return identifier
 
-    def beat(self, notation, active, carriers, text, voice, start, stop):
+    def beat(self, notation, active, carriers, text, techniques, voice, start, stop):
         identifier = self.identifier("Beats")
         beat = ET.Element("Beat", id=identifier)
         ET.SubElement(beat, "Dynamic").text = "MF"
@@ -735,6 +768,7 @@ class _ScoreWriter:
         ET.SubElement(beat, "ConcertPitchStemOrientation").text = "Undefined"
         if text:
             ET.SubElement(beat, "FreeText").text = text
+        self.apply_techniques(beat, techniques)
         note_ids = [self.pitched_note(note, start, stop) for note in sorted(active, key=lambda item: -item["string"])]
         note_ids.extend(self.percussion_note(event, string) for event, string in carriers)
         if note_ids:
@@ -770,12 +804,42 @@ class _ScoreWriter:
                 carriers.append((event, string))
         return carriers, " ".join(text)
 
+    def technique_content(self, onset, voice):
+        return [
+            event for event in self.techniques
+            if event["onset"] == onset and self.technique_voices[event["id"]] == voice
+        ]
+
+    @staticmethod
+    def apply_techniques(beat, events):
+        if not events:
+            return
+        properties = beat.find("Properties")
+        if properties is None:
+            properties = ET.SubElement(beat, "Properties")
+        for event in events:
+            technique, direction = event["technique"], event["direction"]
+            if technique == "arpeggio":
+                _set_text(beat, "Arpeggio", direction)
+                continue
+            name, child, value = {
+                "brush": ("Brush", "Direction", direction),
+                "pick_stroke": ("PickStroke", "Direction", direction),
+                "rasgueado": ("Rasgueado", "Rasgueado", "ami_2"),
+            }[technique]
+            prop = ET.SubElement(properties, "Property", name=name)
+            ET.SubElement(prop, child).text = value
+
     def voice_beats(self, measure, voice):
         notes = [note for note in self.notes if note["voice"] == voice and note["onset"] < measure["end"] and note["end"] > measure["start"]]
         boundaries = {measure["start"], measure["end"]}
         for note in notes:
             boundaries.update((max(measure["start"], note["onset"]), min(measure["end"], note["end"])))
         hosted = [event for event in self.percussion if self.percussion_voices[event["id"]] == voice]
+        hosted_techniques = [event for event in self.techniques if self.technique_voices[event["id"]] == voice]
+        for event in hosted_techniques:
+            if measure["start"] <= event["onset"] < measure["end"]:
+                boundaries.add(event["onset"])
         if hosted:
             for event in hosted:
                 if measure["start"] <= event["onset"] < measure["end"]:
@@ -793,19 +857,20 @@ class _ScoreWriter:
         for left, right in zip(points, points[1:]):
             active = [note for note in notes if note["onset"] <= left < note["end"]]
             carriers, text = self.percussion_content(left, voice)
+            techniques = self.technique_content(left, voice)
             cursor = left
             for duration, notation in _split_duration(right - left):
                 stop = cursor + duration
                 local_carriers = carriers if cursor == left else []
                 local_text = text if cursor == left else ""
-                beats.append(self.beat(notation, active, local_carriers, local_text, voice, cursor, stop))
+                beats.append(self.beat(notation, active, local_carriers, local_text, techniques if cursor == left else [], voice, cursor, stop))
                 cursor = stop
         return beats
 
     def build(self):
         master_parent = self.root.find("MasterBars")
         bar_parent = self.root.find("Bars")
-        voices_used = {note["voice"] for note in self.notes} | set(self.percussion_voices.values())
+        voices_used = {note["voice"] for note in self.notes} | set(self.percussion_voices.values()) | set(self.technique_voices.values())
         for measure in self.measures:
             master = deepcopy(self.master_prototype)
             for tag in ("Repeat", "AlternateEndings", "Directions", "Section", "Fermatas", "TripletFeel", "DoubleBar", "XProperties"):
@@ -832,6 +897,9 @@ class _ScoreWriter:
                 ) and all(
                     self.percussion_voices[event["id"]] != voice or not measure["start"] <= event["onset"] < measure["end"]
                     for event in self.percussion
+                ) and all(
+                    self.technique_voices[event["id"]] != voice or not measure["start"] <= event["onset"] < measure["end"]
+                    for event in self.techniques
                 ):
                     continue
                 beat_ids = self.voice_beats(measure, voice)
@@ -927,7 +995,7 @@ def _multivoice(root, enabled):
         node.text = ("1" if enabled else "0") + suffix
 
 
-def _build_variant(template_raw, notes, percussion, measures, tuning, capo, tempo, *, simplified, notated_tempo_changes=None, initial_tempo=None):
+def _build_variant(template_raw, notes, percussion, techniques, measures, tuning, capo, tempo, *, simplified, notated_tempo_changes=None, initial_tempo=None):
     root, payloads, comment = _parse_archive(template_raw)
     before = _template_invariant(root)
     offsets = _prototype_pitch_offsets(root)
@@ -935,7 +1003,7 @@ def _build_variant(template_raw, notes, percussion, measures, tuning, capo, temp
     if preference not in ("Sharps", "Flats"):
         preference = "Sharps"
     key_count, spellings, accidental_count = _select_key(notes, measures, preference, offsets["TransposedPitch"])
-    writer = _ScoreWriter(root, tuning, capo, measures, notes, percussion, key_count, spellings, simplified=simplified)
+    writer = _ScoreWriter(root, tuning, capo, measures, notes, percussion, techniques, key_count, spellings, simplified=simplified)
     fallbacks = writer.build()
     _tempo_automations(root, tempo, measures, notated_tempo_changes, initial_tempo)
     _instrument(root, tuning, capo, max(24, max((note["fret"] for note in notes), default=0)))
@@ -979,7 +1047,7 @@ def _atomic_bytes(path, content):
             temporary.unlink()
 
 
-def write_gp_outputs(template_path, predictions, full_path, single_path, *, profile=DraftProfile(), beat_evidence=None, include_unsupported_tail=False):
+def write_gp_outputs(template_path, predictions, full_path, single_path, *, profile=DraftProfile(), beat_evidence=None, include_unsupported_tail=False, arranger=None):
     template_path = Path(template_path).resolve()
     if not template_path.is_file():
         raise HarnessError(f"GP output template does not exist: {template_path}")
@@ -995,6 +1063,12 @@ def write_gp_outputs(template_path, predictions, full_path, single_path, *, prof
         from .rhythm_inference import infer_notated_timing
 
         cleaned, rhythm_inference = infer_notated_timing(cleaned, beat_evidence, include_unsupported_tail=include_unsupported_tail)
+    arranger_applied = False
+    if arranger is not None:
+        from .fingering_arranger import apply_arranger
+
+        cleaned = apply_arranger(arranger, cleaned)
+        arranger_applied = True
     from .fingering_optimizer import optimize_fingerings
 
     cleaned, fingering_optimization = optimize_fingerings(cleaned)
@@ -1003,16 +1077,16 @@ def write_gp_outputs(template_path, predictions, full_path, single_path, *, prof
         from .voice_optimizer import optimize_voices
 
         cleaned, voice_optimization = optimize_voices(cleaned)
-    tuning, capo, tempo, audio_end, raw_notes, raw_percussion, rhythm_counts, structured = _validate_predictions(cleaned)
+    tuning, capo, tempo, audio_end, raw_notes, raw_percussion, raw_techniques, rhythm_counts, structured = _validate_predictions(cleaned)
     notes, reconciled, unresolved, shortened, dropped_notes = _resolve_notes(raw_notes, tuning, capo, audio_end)
     percussion, dropped_percussion = _resolve_percussion(raw_percussion)
-    content_end = max(audio_end, max([note["onset"] + note["rhythmGrid"] for note in notes] + [event["onset"] + PERCUSSION_DURATION for event in percussion], default=GRID))
+    content_end = max(audio_end, max([note["onset"] + note["rhythmGrid"] for note in notes] + [event["onset"] + PERCUSSION_DURATION for event in percussion] + [event["onset"] + GRID for event in raw_techniques], default=GRID))
     measures = _measures(cleaned, tempo, content_end)
     notated_tempo_changes = cleaned.get("notatedTempoChanges")
     initial_tempo = cleaned.get("notatedInitialTempo")
-    full, full_report = _build_variant(template_raw, notes, percussion, measures, tuning, capo, tempo, simplified=False, notated_tempo_changes=notated_tempo_changes, initial_tempo=initial_tempo)
+    full, full_report = _build_variant(template_raw, notes, percussion, raw_techniques, measures, tuning, capo, tempo, simplified=False, notated_tempo_changes=notated_tempo_changes, initial_tempo=initial_tempo)
     simple_notes = _simplified_notes(notes, percussion)
-    single, single_report = _build_variant(template_raw, simple_notes, percussion, measures, tuning, capo, tempo, simplified=True, notated_tempo_changes=notated_tempo_changes, initial_tempo=initial_tempo)
+    single, single_report = _build_variant(template_raw, simple_notes, percussion, raw_techniques, measures, tuning, capo, tempo, simplified=True, notated_tempo_changes=notated_tempo_changes, initial_tempo=initial_tempo)
     if hashlib.sha256(template_path.read_bytes()).hexdigest() != template_hash:
         raise HarnessError("GP template changed while outputs were generated.")
     report = {
@@ -1024,9 +1098,11 @@ def write_gp_outputs(template_path, predictions, full_path, single_path, *, prof
         "sourceHypotheses": {"notes": len(predictions["notes"]), "percussion": len(predictions["percussion"])},
         "cleanedHypotheses": {"notes": len(raw_notes), "percussion": len(raw_percussion)},
         "resolvedHypotheses": {"notes": len(notes), "percussion": len(percussion)},
+        "techniqueHypotheses": len(raw_techniques),
         "draftCleanup": cleanup,
         "rhythmInference": rhythm_inference,
         "fingeringOptimization": fingering_optimization,
+        "fingeringArrangerApplied": arranger_applied,
         "voiceOptimization": voice_optimization,
         "rhythmicGridPolicy": {
             "mode": "beat-anchored-constrained" if structured else "nominal-tempo-fallback",

@@ -35,11 +35,15 @@ WEIGHTS = {
     "note_onset": 1.0, "fret": 1.0, "pitch": 1.0, "voice": 0.25,
     "duration_log": 0.25, "harmonic_positive": 0.5, "harmonic_kind": 0.25,
     "harmonic_node": 0.25, "percussion_positive": 5.0, "percussion_negative": 1.0,
+    "technique_positive": 4.0, "technique_negative": 1.0, "technique_direction": 0.5,
+    "technique_strings_positive": 2.0, "technique_strings_negative": 1.0,
 }
 STAT_KEYS = (
     "note_onset_positive", "note_onset_negative", "fret", "pitch", "voice", "duration_log",
     "harmonic_positive", "harmonic_kind", "harmonic_node", "percussion_positive",
     "percussion_negative", "harmonic_sparsity", "percussion_sparsity",
+    "technique_positive", "technique_negative", "technique_direction",
+    "technique_strings_positive", "technique_strings_negative",
 )
 
 
@@ -1126,6 +1130,11 @@ class RuntimeTests(unittest.TestCase):
             "percussion_negative": {"sum": 27.0, "count": 9},
             "harmonic_sparsity": {"sum": 4.0, "count": 8},
             "percussion_sparsity": {"sum": 6.0, "count": 30},
+            "technique_positive": {"sum": 0.0, "count": 0},
+            "technique_negative": {"sum": 0.0, "count": 0},
+            "technique_direction": {"sum": 0.0, "count": 0},
+            "technique_strings_positive": {"sum": 0.0, "count": 0},
+            "technique_strings_negative": {"sum": 0.0, "count": 0},
         }
         parsed = runtime._stats(stats, weights)
         self.assertAlmostEqual(runtime._objective(parsed, weights, 0.02), 1.5 + 0.5 + 37 / 14 + 0.02 * (0.5 + 0.2))

@@ -3,6 +3,7 @@
 from collections import defaultdict
 from copy import deepcopy
 from fractions import Fraction
+import math
 
 from .transcriber_audio import HarnessError
 
@@ -95,13 +96,23 @@ def _optimize_group(group, tuning, capo, onset, recent, previous_position):
         objective.append(round(1000 * note["confidence"]) * dropped[index])
         for candidate_index, (string, fret) in enumerate(candidates[index]):
             model_prior = abs(string - note["string"]) * 4 + abs(fret - note["fret"])
+            learned = 0
+            logits = note.get("arrangerStringLogits")
+            if logits is not None:
+                if not isinstance(logits, list) or len(logits) != 6 or any(type(value) not in (int, float) or not math.isfinite(value) for value in logits):
+                    raise HarnessError("Arranger string logits must contain six finite numeric values.")
+                feasible_logits = [
+                    logits[6 - candidate_string]
+                    for candidate_string, _ in candidates[index]
+                ]
+                learned = min(200, round((max(feasible_logits) - logits[6 - string]) * 20))
             ease = (8 + fret + max(0, fret - 7) * 2) if fret else 0
             hand = abs(fret - previous_position) * 3 if fret and previous_position is not None else 0
             continuity = 0
             prior = recent.get(note["soundingPitchMidi"])
             if prior is not None and onset - prior["onset"] <= Fraction(3, 2):
                 continuity = abs(string - prior["string"]) * 80 + abs(fret - prior["fret"]) * 20
-            objective.append((model_prior + ease + hand + continuity) * selected[index, candidate_index])
+            objective.append((learned + model_prior + ease + hand + continuity) * selected[index, candidate_index])
     model.minimize(sum(objective))
     solver = cp_model.CpSolver()
     solver.parameters.max_deterministic_time = 5

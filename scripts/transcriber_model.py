@@ -19,6 +19,8 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
+from .technique_supervision import TECHNIQUE_DIRECTIONS, TECHNIQUE_TYPES
+
 
 PERCUSSION_TYPES = ("wrist_thump", "thumb_slap", "percussive_hit")
 HARMONIC_TYPES = ("Natural", "Artificial", "Tap", "Pinch")
@@ -37,13 +39,20 @@ LOSS_WEIGHTS = {
     "harmonic_node": 0.25,
     "percussion_positive": 5.0,
     "percussion_negative": 1.0,
+    "technique_positive": 4.0,
+    "technique_negative": 1.0,
+    "technique_direction": 0.5,
+    "technique_strings_positive": 2.0,
+    "technique_strings_negative": 1.0,
 }
 LOSS_STAT_KEYS = (
     "note_onset_positive", "note_onset_negative", "fret", "pitch", "voice",
     "duration_log", "harmonic_positive", "harmonic_kind", "harmonic_node",
     "percussion_positive", "percussion_negative", "harmonic_sparsity", "percussion_sparsity",
+    "technique_positive", "technique_negative", "technique_direction",
+    "technique_strings_positive", "technique_strings_negative",
 )
-_HEADS = {
+_BASE_HEADS = {
     "note_onset": "note_onset_logits",
     "fret": "fret_logits",
     "pitch": "pitch_logits",
@@ -54,7 +63,13 @@ _HEADS = {
     "harmonic_node": "harmonic_node_logits",
     "percussion": "percussion_logits",
 }
-_CATEGORICAL = ("fret", "pitch", "voice", "harmonic_kind", "harmonic_node")
+_TECHNIQUE_HEADS = {
+    "technique": "technique_logits",
+    "technique_direction": "technique_direction_logits",
+    "technique_strings": "technique_strings_logits",
+}
+_HEADS = {**_BASE_HEADS, **_TECHNIQUE_HEADS}
+_CATEGORICAL = ("fret", "pitch", "voice", "harmonic_kind", "harmonic_node", "technique_direction")
 
 
 class LossStat(TypedDict):
@@ -94,6 +109,7 @@ def _tensor(name: str, value: Tensor, shape: tuple[int, ...], *, dtype: torch.dt
 
 @dataclass(frozen=True)
 class ModelConfig:
+    architecture_version: int = 1
     n_mels: int = 96
     conditioning_dim: int = 12
     hidden_size: int = 128
@@ -103,8 +119,10 @@ class ModelConfig:
     dropout: float = 0.1
 
     def __post_init__(self) -> None:
-        for name in ("n_mels", "hidden_size", "recurrent_layers", "max_voices"):
+        for name in ("architecture_version", "n_mels", "hidden_size", "recurrent_layers", "max_voices"):
             _integer(name, getattr(self, name), 1)
+        if self.architecture_version not in (1, 2):
+            raise ValueError("architecture_version must be 1 or 2")
         _integer("conditioning_dim", self.conditioning_dim, 12, 12)
         _integer("max_fret", self.max_fret, 0, 127)
         _real("dropout", self.dropout, 0, 1)
@@ -149,6 +167,12 @@ class FingerstyleTranscriber(nn.Module):
             "harmonic_node_logits": (6, len(HARMONIC_FRETS)),
             "percussion_logits": (len(PERCUSSION_TYPES),),
         }
+        if config.architecture_version >= 2:
+            self.head_shapes.update({
+                "technique_logits": (len(TECHNIQUE_TYPES),),
+                "technique_direction_logits": (len(TECHNIQUE_TYPES), len(TECHNIQUE_DIRECTIONS)),
+                "technique_strings_logits": (len(TECHNIQUE_TYPES), 6),
+            })
         self.heads = nn.ModuleDict({
             name: nn.Linear(2 * config.hidden_size, math.prod(shape))
             for name, shape in self.head_shapes.items()
@@ -193,7 +217,11 @@ class FingerstyleTranscriber(nn.Module):
 def _validate_outputs(outputs: Mapping[str, Tensor], *, batched: bool) -> tuple[int, ...]:
     if not isinstance(outputs, Mapping):
         raise TypeError("outputs must be a mapping of head names to tensors")
-    missing = set(_HEADS.values()) - outputs.keys()
+    heads = dict(_BASE_HEADS)
+    present_technique = set(_TECHNIQUE_HEADS.values()) & outputs.keys()
+    if present_technique:
+        heads.update(_TECHNIQUE_HEADS)
+    missing = set(heads.values()) - outputs.keys()
     if missing:
         raise ValueError(f"outputs missing heads: {sorted(missing)}")
     onset = outputs["note_onset_logits"]
@@ -212,6 +240,12 @@ def _validate_outputs(outputs: Mapping[str, Tensor], *, batched: bool) -> tuple[
         "harmonic_node_logits": (6, len(HARMONIC_FRETS)),
         "percussion_logits": (len(PERCUSSION_TYPES),),
     }
+    if present_technique:
+        shapes.update({
+            "technique_logits": (len(TECHNIQUE_TYPES),),
+            "technique_direction_logits": (len(TECHNIQUE_TYPES), len(TECHNIQUE_DIRECTIONS)),
+            "technique_strings_logits": (len(TECHNIQUE_TYPES), 6),
+        })
     for name in ("fret_logits", "voice_logits"):
         value = outputs[name]
         if not isinstance(value, Tensor):
@@ -250,17 +284,30 @@ def masked_loss(outputs: Mapping[str, Tensor], targets: Mapping[str, Tensor], ma
     _tensor("valid_frames", valid_frames, prefix, dtype=torch.bool, device=reference.device)
     if not isinstance(targets, Mapping) or not isinstance(masks, Mapping):
         raise TypeError("targets and masks must be mappings")
+    active_heads = dict(_BASE_HEADS)
+    if "technique_logits" in outputs:
+        active_heads.update(_TECHNIQUE_HEADS)
     for label, mapping in (("targets", targets), ("masks", masks)):
-        missing = set(_HEADS) - mapping.keys()
+        missing = set(active_heads) - mapping.keys()
         if missing:
             raise ValueError(f"{label} missing keys: {sorted(missing)}")
     effective = {}
-    for name in _HEADS:
-        shape = prefix + (3 if name == "percussion" else 6,)
+    for name in active_heads:
+        if name == "percussion":
+            tail = (len(PERCUSSION_TYPES),)
+        elif name in ("technique", "technique_direction"):
+            tail = (len(TECHNIQUE_TYPES),)
+        elif name == "technique_strings":
+            tail = (len(TECHNIQUE_TYPES), 6)
+        else:
+            tail = (6,)
+        shape = prefix + tail
         _tensor(f"targets[{name}]", targets[name], shape, device=reference.device,
                 dtype=torch.long if name in _CATEGORICAL else None, floating=name not in _CATEGORICAL)
         _tensor(f"masks[{name}]", masks[name], shape, dtype=torch.bool, device=reference.device)
-        effective[name] = masks[name] & valid_frames[:, :, None]
+        effective[name] = masks[name] & valid_frames.reshape(
+            *valid_frames.shape, *((1,) * (masks[name].ndim - 2))
+        )
         selected = targets[name][effective[name]]
         if not torch.isfinite(selected).all().item():
             raise ValueError(f"supervised {name} targets must be finite")
@@ -278,7 +325,7 @@ def masked_loss(outputs: Mapping[str, Tensor], targets: Mapping[str, Tensor], ma
 
     # Empty slices keep every head connected to a differentiable zero without
     # computing any loss on unknown targets, or overflowing a full-logit sum.
-    zero = sum(outputs[name].reshape(-1)[:0].sum() for name in _HEADS.values())
+    zero = sum(outputs[name].reshape(-1)[:0].sum() for name in active_heads.values())
     stats: dict[str, LossStat] = {name: {"sum": 0.0, "count": 0} for name in LOSS_STAT_KEYS}
 
     def term(name: str, values: Tensor) -> Tensor:
@@ -301,6 +348,8 @@ def masked_loss(outputs: Mapping[str, Tensor], targets: Mapping[str, Tensor], ma
     if onset_means:
         loss = loss + LOSS_WEIGHTS["note_onset"] * sum(onset_means) / len(onset_means)
     for name in _CATEGORICAL:
+        if name not in active_heads:
+            continue
         mask = effective[name]
         if mask.any().item():
             values = F.cross_entropy(outputs[_HEADS[name]][mask], targets[name][mask], reduction="none")
@@ -344,6 +393,34 @@ def masked_loss(outputs: Mapping[str, Tensor], targets: Mapping[str, Tensor], ma
             prior_classes = positive_classes & ~negative_classes
             prior_mask = valid_frames[:, :, None] & prior_classes[None, None, :]
         loss = loss + sparsity_weight * term(f"{name}_sparsity", predictions[prior_mask].sigmoid())
+    if "technique" in active_heads:
+        predictions = outputs["technique_logits"]
+        components = []
+        for value, suffix in ((1, "positive"), (0, "negative")):
+            selected = effective["technique"] & (targets["technique"] == value)
+            if not selected.any().item():
+                continue
+            values = F.binary_cross_entropy_with_logits(predictions[selected], targets["technique"][selected], reduction="none")
+            numerator, count = values.sum(), values.numel()
+            name = f"technique_{suffix}"
+            stats[name] = {"sum": float(numerator.detach().item()), "count": count}
+            components.append((numerator, count, LOSS_WEIGHTS[name]))
+        if components:
+            loss = loss + sum(total * weight for total, _, weight in components) / sum(count * weight for _, count, weight in components)
+        selected = effective["technique_strings"]
+        string_predictions = outputs["technique_strings_logits"]
+        string_components = []
+        for value, suffix in ((1, "positive"), (0, "negative")):
+            mask = selected & (targets["technique_strings"] == value)
+            if not mask.any().item():
+                continue
+            values = F.binary_cross_entropy_with_logits(string_predictions[mask], targets["technique_strings"][mask], reduction="none")
+            numerator, count = values.sum(), values.numel()
+            name = f"technique_strings_{suffix}"
+            stats[name] = {"sum": float(numerator.detach().item()), "count": count}
+            string_components.append((numerator, count, LOSS_WEIGHTS[name]))
+        if string_components:
+            loss = loss + sum(total * weight for total, _, weight in string_components) / sum(count * weight for _, count, weight in string_components)
     return loss, stats
 
 
@@ -376,6 +453,7 @@ def _temporal_peaks(scores: list[float], seconds: list[float], threshold: float,
 def decode_events(outputs: Mapping[str, Tensor], frame_seconds: Tensor | Sequence[float], *,
                   tuning: Sequence[int], capo: int, onset_threshold: float = 0.5,
                   percussion_threshold: float = 0.5, harmonic_threshold: float = 0.5,
+                  technique_threshold: float = 0.5,
                   min_gap_seconds: float = 0.04, max_duration_quarter: float = 64) -> dict:
     """Decode the complete unbatched timeline into hypotheses, never GP output.
 
@@ -385,7 +463,7 @@ def decode_events(outputs: Mapping[str, Tensor], frame_seconds: Tensor | Sequenc
     Below-threshold harmonic/percussion scores are not confirmed absence.
     """
     for name, value in (("onset_threshold", onset_threshold), ("percussion_threshold", percussion_threshold),
-                        ("harmonic_threshold", harmonic_threshold)):
+                        ("harmonic_threshold", harmonic_threshold), ("technique_threshold", technique_threshold)):
         _real(name, value, 0, 1)
     _real("min_gap_seconds", min_gap_seconds, 0)
     _real("max_duration_quarter", max_duration_quarter, 0)
@@ -417,7 +495,7 @@ def decode_events(outputs: Mapping[str, Tensor], frame_seconds: Tensor | Sequenc
     onsets = values["note_onset_logits"].sigmoid()
     harmonics = values["harmonic_logits"].sigmoid()
     percussion = values["percussion_logits"].sigmoid()
-    categories = {name: values[_HEADS[name]].argmax(-1) for name in _CATEGORICAL}
+    categories = {name: values[_HEADS[name]].argmax(-1) for name in _CATEGORICAL if _HEADS[name] in values}
     notes = []
     duration_limit_log = math.log1p(max_duration_quarter)
     for axis in range(6):
@@ -465,11 +543,33 @@ def decode_events(outputs: Mapping[str, Tensor], frame_seconds: Tensor | Sequenc
                 "confidence": float(percussion[frame, axis]),
                 "presenceCalibration": PRESENCE_CALIBRATION,
             })
+    techniques = []
+    if "technique_logits" in values:
+        technique_scores = values["technique_logits"].sigmoid()
+        membership = values["technique_strings_logits"].sigmoid()
+        directions = categories["technique_direction"]
+        for axis, technique in enumerate(TECHNIQUE_TYPES):
+            for frame in _temporal_peaks(technique_scores[:, axis].tolist(), seconds, technique_threshold, min_gap_seconds):
+                strings = [6 - string_axis for string_axis in range(6) if float(membership[frame, axis, string_axis]) >= .5]
+                techniques.append({
+                    "technique": technique,
+                    "direction": TECHNIQUE_DIRECTIONS[int(directions[frame, axis])],
+                    "strings": sorted(strings, reverse=True),
+                    "onsetSeconds": float(seconds[frame]),
+                    "confidence": float(technique_scores[frame, axis]),
+                    "stringMembershipConfidence": {
+                        str(6 - string_axis): float(membership[frame, axis, string_axis])
+                        for string_axis in range(6)
+                    },
+                    "presenceCalibration": PRESENCE_CALIBRATION,
+                })
     notes.sort(key=lambda note: (note["onsetSeconds"], -note["string"]))
     gestures.sort(key=lambda gesture: (gesture["onsetSeconds"], PERCUSSION_TYPES.index(gesture["technique"])))
+    techniques.sort(key=lambda event: (event["onsetSeconds"], TECHNIQUE_TYPES.index(event["technique"])))
     return {
         "notes": notes,
         "percussion": gestures,
+        **({"techniques": techniques} if "technique_logits" in values else {}),
         "policy": {
             "output": "musical-event-hypotheses-only; no notation writer",
             "stringAxis": "physical-6-to-1",

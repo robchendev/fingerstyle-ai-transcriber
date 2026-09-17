@@ -130,6 +130,10 @@ def summarize_counts(counts):
 def checkpoint_event_score(report):
     metrics = report["metricsByToleranceSeconds"]["0.1"]
     selected = [metrics[name] for name in ("string_fret_pitch_onset", "wrist_thump", "thumb_slap", "percussive_hit") if metrics[name]["has_negative_coverage"]]
+    technique_metric = None
+    if "technique_string_set" in metrics and metrics["technique_string_set"]["has_negative_coverage"]:
+        technique_metric = metrics["technique_string_set"]
+        selected.append(technique_metric)
     tp = sum(value["true_positive"] for value in selected)
     fp = sum(value["false_positive"] for value in selected)
     fn = sum(value["false_negative"] for value in selected)
@@ -137,7 +141,10 @@ def checkpoint_event_score(report):
         raise HarnessError("Decoded checkpoint selection requires scorable validation events, not only unknown or empty labels.")
     return {
         "score": 2 * tp / (2 * tp + fp + fn),
-        "metric": "joint-note-and-covered-percussion-micro-f1@100ms",
+        "metric": (
+            "joint-note-covered-percussion-and-technique-string-set-micro-f1@100ms"
+            if technique_metric else "joint-note-and-covered-percussion-micro-f1@100ms"
+        ),
         "windows": report["windowVisits"],
     }
 
@@ -154,8 +161,9 @@ def _spans(windows):
 
 
 @torch.no_grad()
-def evaluate_events(model, dataset, device, *, tolerances=(.05, .1, .2), onset_threshold=.5, percussion_threshold=.5, progress=None):
+def evaluate_events(model, dataset, device, *, tolerances=(.05, .1, .2), onset_threshold=.5, percussion_threshold=.5, technique_threshold=.5, progress=None):
     from .transcriber_model import PERCUSSION_TYPES, decode_events
+    from .technique_supervision import TECHNIQUE_TYPES
 
     tolerances = tuple(tolerances)
     if not tolerances or len(set(tolerances)) != len(tolerances) or any(not math.isfinite(value) or value <= 0 for value in tolerances):
@@ -185,7 +193,7 @@ def evaluate_events(model, dataset, device, *, tolerances=(.05, .1, .2), onset_t
                 [max(left, a), min(right, b)] for left, right in percussion_coverage for a, b in scoring
                 if max(left, a) < min(right, b)
             ])
-            predictions = {"notes": [], "percussion": []}
+            predictions = {"notes": [], "percussion": [], "techniques": []}
             spans = _spans(windows)
             for span_index, span in enumerate(spans):
                 begin, end = span["start"] / rate, span["stop"] / rate
@@ -201,15 +209,32 @@ def evaluate_events(model, dataset, device, *, tolerances=(.05, .1, .2), onset_t
                     outputs = model(features[None].to(device), conditioning[None].to(device), torch.tensor([len(features)], dtype=torch.long))
                     timeline.add({name: value[0] for name, value in outputs.items()}, local_times, window["stopSampleExclusive"] / rate)
                 instrument = data.labels["conditioning"]["instrument"]
-                decoded = decode_events(timeline.finish(), torch.tensor(times), tuning=instrument["openStringMidi"], capo=instrument["capoFret"], onset_threshold=onset_threshold, percussion_threshold=percussion_threshold)
+                decoded = decode_events(timeline.finish(), torch.tensor(times), tuning=instrument["openStringMidi"], capo=instrument["capoFret"], onset_threshold=onset_threshold, percussion_threshold=percussion_threshold, technique_threshold=technique_threshold)
                 for kind in predictions:
-                    predictions[kind].extend(decoded[kind])
+                    predictions[kind].extend(decoded.get(kind, []))
                 if progress is not None:
                     progress(f"Event evaluation: {row['id']} span {span_index + 1}/{len(spans)}")
             clock = ScoreClock(data.labels, data.normalization)
             projected_notes, projected_gestures = projected_targets(data.labels, record["candidate"], clock)
             notes = [{**note, "onsetSeconds": note["proposedOnsetClipSeconds"]} for note in projected_notes if note["proposedOnsetClipSeconds"] is not None]
             gestures = [{**gesture, "onsetSeconds": gesture["proposedOnsetClipSeconds"]} for gesture in projected_gestures if gesture["proposedOnsetClipSeconds"] is not None]
+            technique_truth = []
+            for event in record.get("techniques", []):
+                onset = event["proposedOnsetClipSeconds"]
+                if onset is None:
+                    continue
+                for technique in event["techniques"]:
+                    technique_truth.append({
+                        "technique": technique,
+                        "onsetSeconds": onset,
+                        "direction": event["directions"].get(technique),
+                        "directionKnown": event["directionMasks"].get(technique, False),
+                        "stringSet": tuple(sorted(event["stringsByTechnique"][technique])),
+                    })
+            resolved_attack_times = [
+                note["onsetSeconds"] for note in notes
+                if note["onsetTimingKnownInScore"] and note["sourceLabelMask"].get("attack")
+            ]
             scored = {}
             for tolerance in tolerances:
                 comparisons = {}
@@ -234,6 +259,49 @@ def evaluate_events(model, dataset, device, *, tolerances=(.05, .1, .2), onset_t
                         return inside(event["onsetSeconds"], percussion_coverage) and not any(abs(gesture["onsetSeconds"] - event["onsetSeconds"]) <= tolerance for gesture in outside)
 
                     comparisons[technique] = event_counts(truth, guessed, tolerance, ("technique",), known_percussion_negative, has_negative_coverage=bool(percussion_coverage))
+                if predictions["techniques"] or technique_truth:
+                    technique_complete = record.get("techniqueAnnotationsComplete") is True
+
+                    def known_technique_negative(event):
+                        return inside(event["onsetSeconds"], scoring) and any(
+                            abs(onset - event["onsetSeconds"]) <= tolerance
+                            for onset in resolved_attack_times
+                        )
+
+                    truth = [event for event in technique_truth if inside(event["onsetSeconds"], scoring)]
+                    guessed = [event for event in predictions["techniques"] if inside(event["onsetSeconds"], scoring)]
+                    comparisons["technique_onset"] = event_counts(
+                        truth, guessed, tolerance, ("technique",), known_technique_negative,
+                        has_negative_coverage=technique_complete,
+                    )
+                    direction_truth = [event for event in truth if event["directionKnown"]]
+                    direction_guessed = [event for event in guessed if event.get("direction") in ("Down", "Up")]
+                    unknown_direction = [event for event in truth if not event["directionKnown"]]
+
+                    def known_direction_negative(event):
+                        return known_technique_negative(event) and not any(
+                            unknown["technique"] == event["technique"]
+                            and abs(unknown["onsetSeconds"] - event["onsetSeconds"]) <= tolerance
+                            for unknown in unknown_direction
+                        )
+
+                    comparisons["technique_direction"] = event_counts(
+                        direction_truth, direction_guessed, tolerance, ("technique", "direction"),
+                        known_direction_negative, has_negative_coverage=technique_complete,
+                    )
+                    string_truth = [{**event, "strings": event["stringSet"]} for event in truth]
+                    string_guessed = [{**event, "strings": tuple(sorted(set(event.get("strings", []))))} for event in guessed]
+                    comparisons["technique_string_set"] = event_counts(
+                        string_truth, string_guessed, tolerance, ("technique", "strings"),
+                        known_technique_negative, has_negative_coverage=technique_complete,
+                    )
+                    for technique in TECHNIQUE_TYPES:
+                        expected = [event for event in truth if event["technique"] == technique]
+                        actual = [event for event in guessed if event["technique"] == technique]
+                        comparisons[f"technique_{technique}"] = event_counts(
+                            expected, actual, tolerance, ("technique",), known_technique_negative,
+                            has_negative_coverage=technique_complete,
+                        )
                 tolerance_key = f"{tolerance:g}"
                 scored[tolerance_key] = {key: summarize_counts(value) for key, value in comparisons.items()}
                 for name, counts in comparisons.items():
@@ -256,6 +324,6 @@ def evaluate_events(model, dataset, device, *, tolerances=(.05, .1, .2), onset_t
         "recordings": records,
         "windowVisits": len(dataset.windows),
         "metricsByToleranceSeconds": {key: {name: summarize_counts(value) for name, value in groups.items()} for key, groups in totals.items()},
-        "settings": {"onsetThreshold": onset_threshold, "percussionThreshold": percussion_threshold, "tolerancesSeconds": tolerances, "windowBoundaryGuardSeconds": .5},
+        "settings": {"onsetThreshold": onset_threshold, "percussionThreshold": percussion_threshold, "techniqueThreshold": technique_threshold, "tolerancesSeconds": tolerances, "windowBoundaryGuardSeconds": .5},
         "policy": "Window logits are stitched before decoding; gaps remain separate. Canonical event IDs are scored once, not once per overlapping window. Metrics are masked string-specific event metrics, not complete-score quality. Unmatched predictions in unresolved annotation coverage are censored. Percussion precision/F1 require explicit negative annotation coverage; otherwise only known-positive recall and emission counts are available. No acoustic-release correctness is inferred from notated durations.",
     }

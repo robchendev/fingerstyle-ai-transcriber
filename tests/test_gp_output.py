@@ -174,6 +174,23 @@ class GpOutputTests(unittest.TestCase):
             )
             self.assertTrue(gp_root(full).findall("./Notes/Note/Properties/Property[@name='Harmonic']"))
 
+    def test_acoustic_technique_hypotheses_serialize_native_gp_marks(self):
+        document = hypotheses()
+        document["techniques"] = [
+            {"onsetSeconds": .5, "technique": "brush", "direction": "Down", "strings": [1, 2, 6], "confidence": .95},
+            {"onsetSeconds": 1., "technique": "arpeggio", "direction": "Up", "strings": [1, 2], "confidence": .9},
+        ]
+        with TemporaryDirectory(dir=ROOT) as directory:
+            directory = Path(directory)
+            template = directory / "template.gpt"
+            full, single = directory / "full.gp", directory / "single.gp"
+            template.write_bytes(archive_bytes(output_template()))
+            report = write_gp_outputs(template, document, full, single)
+            root = gp_root(full)
+            self.assertEqual(root.findtext("./Beats/Beat/Properties/Property[@name='Brush']/Direction"), "Down")
+            self.assertEqual(root.findtext("./Beats/Beat/Arpeggio"), "Up")
+            self.assertEqual(report["techniqueHypotheses"], 2)
+
     def test_beat_evidence_drives_constrained_score_timing(self):
         document = hypotheses()
         beat_evidence = {

@@ -1,6 +1,7 @@
 """Load approved private windows and preserve canonical supervision."""
 
 from dataclasses import asdict
+from copy import deepcopy
 import hashlib
 import json
 from pathlib import Path
@@ -86,10 +87,16 @@ def training_conditioning(record, clip_times):
 
 def encode_targets(window, canonical, frame_times, model_config, *, negative_onsets_allowed):
     from .transcriber_model import HARMONIC_FRETS, HARMONIC_TYPES, PERCUSSION_TYPES
+    from .technique_supervision import TECHNIQUE_DIRECTIONS, TECHNIQUE_TYPES
 
     count = len(frame_times)
     targets = {name: torch.zeros((count, 6), dtype=torch.long if name in {"fret", "pitch", "voice", "harmonic_kind", "harmonic_node"} else torch.float32) for name in ("note_onset", "fret", "pitch", "voice", "duration_log", "harmonic", "harmonic_kind", "harmonic_node")}
     targets["percussion"] = torch.zeros((count, len(PERCUSSION_TYPES)))
+    architecture_version = getattr(model_config, "architecture_version", 1)
+    if architecture_version >= 2:
+        targets["technique"] = torch.zeros((count, len(TECHNIQUE_TYPES)))
+        targets["technique_direction"] = torch.zeros((count, len(TECHNIQUE_TYPES)), dtype=torch.long)
+        targets["technique_strings"] = torch.zeros((count, len(TECHNIQUE_TYPES), 6))
     masks = {name: torch.zeros_like(value, dtype=torch.bool) for name, value in targets.items()}
     hop = frame_times[1] - frame_times[0] if count > 1 else .02
     valid_interior = (frame_times >= .5) & (frame_times < frame_times[-1] - .5)
@@ -156,6 +163,41 @@ def encode_targets(window, canonical, frame_times, model_config, *, negative_ons
             if node in HARMONIC_FRETS:
                 targets["harmonic_node"][index, string] = HARMONIC_FRETS.index(node)
                 masks["harmonic_node"][index, string] = True
+    if architecture_version >= 2:
+        attack_frames = {index for index, _ in events}
+        for index in attack_frames:
+                masks["technique"][index] = True
+        technique_events = window["targets"].get("techniques", [])
+        if not isinstance(technique_events, list):
+                raise HarnessError("Technique targets must be a list.")
+        positives = []
+        for event in technique_events:
+                if not event["supervisionMask"]["onset"] or not event["supervisionMask"]["technique"]:
+                    continue
+                index = int(np.argmin(np.abs(frame_times - event["onsetWindowSeconds"])))
+                if not 0 <= event["onsetWindowSeconds"] <= frame_times[-1] + hop:
+                    raise HarnessError("A supervised technique lies outside its window.")
+                for technique in event["techniques"]:
+                    if technique not in TECHNIQUE_TYPES:
+                        raise HarnessError(f"Unsupported supervised technique: {technique}")
+                    axis = TECHNIQUE_TYPES.index(technique)
+                    masks["technique"][max(0, index - radius):min(count, index + radius + 1), axis] = False
+                    positives.append((index, axis, technique, event))
+        for index, axis, technique, event in positives:
+                targets["technique"][index, axis] = 1
+                masks["technique"][index, axis] = True
+                if event["supervisionMask"]["direction"].get(technique):
+                    direction = event["directions"][technique]
+                    if direction not in TECHNIQUE_DIRECTIONS:
+                        raise HarnessError(f"Unsupported technique direction: {direction}")
+                    targets["technique_direction"][index, axis] = TECHNIQUE_DIRECTIONS.index(direction)
+                    masks["technique_direction"][index, axis] = True
+                if event["supervisionMask"]["strings"]:
+                    masks["technique_strings"][index, axis] = True
+                    for string_number in event["stringsByTechnique"][technique]:
+                        if type(string_number) is not int or not 1 <= string_number <= 6:
+                            raise HarnessError("Technique membership requires physical strings one through six.")
+                        targets["technique_strings"][index, axis, 6 - string_number] = 1
     percussion_events = []
     for gesture in window["targets"]["gestures"]:
         source = source_gestures[gesture["sourceGestureId"]]
@@ -190,7 +232,7 @@ class TrainingDataset(Dataset):
     def check_unchanged(self):
         for path, original in self._guards.items():
             if self._stat(path) != original:
-                raise HarnessError("A bound dataset file changed during use; stop and revalidate the release.")
+                raise HarnessError(f"A bound dataset file changed during use; stop and revalidate the release: {path}")
 
     def __len__(self):
         return len(self.windows)
@@ -230,7 +272,15 @@ class TrainingDataset(Dataset):
         features, times = self._features(record, window)
         clip_times = times + window["startSample"] / record["row"]["sampleRate"]
         conditioning = training_conditioning(record, clip_times)
-        targets, masks, collisions = encode_targets(window, record["data"].labels, times, self.model_config, negative_onsets_allowed=record["negativeAllowed"])
+        local_window = window
+        if self.model_config.architecture_version >= 2:
+            from .technique_supervision import techniques_in_window
+
+            local_window = deepcopy(window)
+            local_window["targets"]["techniques"] = techniques_in_window(
+                record["techniques"], window["startSample"], window["stopSampleExclusive"], record["row"]["sampleRate"],
+            )
+        targets, masks, collisions = encode_targets(local_window, record["data"].labels, times, self.model_config, negative_onsets_allowed=record["negativeAllowed"])
         return {
             "features": features, "conditioning": conditioning, "targets": targets, "masks": masks,
             "metadata": {"windowId": window["windowId"], "stringFrameCollisionsMasked": collisions},
@@ -266,6 +316,12 @@ class TrainingDataset(Dataset):
                 "data": data, "candidate": payload["candidate"], "row": row, "negativeAllowed": negative_onset_coverage(labels),
                 "percussionAnnotationsComplete": payload["approval"].get("percussionAnnotationsComplete") is True,
             }
+            if model_config.architecture_version >= 2:
+                from .score_alignment import ScoreClock
+                from .technique_supervision import projected_techniques
+
+                record["techniques"] = projected_techniques(labels, payload["candidate"], ScoreClock(labels, payload["normalization"]))
+                record["techniqueAnnotationsComplete"] = True
             self.records.append(record)
             self.windows.extend((record, window) for window in payload["windows"])
         if len(self.windows) != manifest["counts"]["windowsBySplit"][split]:

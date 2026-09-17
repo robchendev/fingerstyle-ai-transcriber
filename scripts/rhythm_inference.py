@@ -285,7 +285,8 @@ def _optimize_onsets(document, mapper):
         from ortools.sat.python import cp_model
     except (ImportError, ModuleNotFoundError) as error:
         raise HarnessError("OR-Tools is required for constrained rhythm inference.") from error
-    times = sorted({float(event["onsetSeconds"]) for kind in ("notes", "percussion") for event in document[kind]})
+    kinds = tuple(kind for kind in ("notes", "percussion", "techniques") if kind in document)
+    times = sorted({float(event["onsetSeconds"]) for kind in kinds for event in document[kind]})
     model = cp_model.CpModel()
     variables = []
     costs = []
@@ -330,7 +331,7 @@ def _optimize_onsets(document, mapper):
     result = deepcopy(document)
     timing_errors = []
     complexities = {}
-    for kind in ("notes", "percussion"):
+    for kind in kinds:
         for event in result[kind]:
             tick = selected[float(event["onsetSeconds"])]
             quarter = Fraction(tick, TICKS_PER_QUARTER)
@@ -411,7 +412,7 @@ def infer_notated_timing(document, evidence, *, include_unsupported_tail=False):
     beat_supported_end = float(mapper.anchor_seconds[-1])
     bounded = deepcopy(document)
     unsupported = {}
-    for kind in ("notes", "percussion"):
+    for kind in tuple(kind for kind in ("notes", "percussion", "techniques") if kind in document):
         unsupported[kind] = sum(event["onsetSeconds"] > beat_supported_end for event in document[kind])
         if not include_unsupported_tail:
             bounded[kind] = [event for event in document[kind] if event["onsetSeconds"] <= beat_supported_end]

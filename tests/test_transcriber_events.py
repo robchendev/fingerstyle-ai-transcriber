@@ -84,6 +84,25 @@ class EventEvaluationTests(unittest.TestCase):
         self.assertIsNone(metrics["f1"])
         self.assertEqual(metrics["unscorable_predictions"], 1)
 
+    def test_v2_checkpoint_score_requires_complete_technique_string_set(self):
+        counts = {
+            "true_positive": 2, "false_positive": 1, "false_negative": 1,
+            "reference_events": 3, "predicted_events": 3, "unscorable_predictions": 0,
+            "absolute_onset_error_sum": 0., "has_negative_coverage": True,
+        }
+        empty = {**counts, "true_positive": 0, "false_positive": 0, "false_negative": 0, "reference_events": 0, "predicted_events": 0}
+        metrics = {
+            "string_fret_pitch_onset": summarize_counts(counts),
+            "wrist_thump": summarize_counts(empty),
+            "thumb_slap": summarize_counts(empty),
+            "percussive_hit": summarize_counts(empty),
+            "technique_string_set": summarize_counts(counts),
+            "technique_onset": summarize_counts({**counts, "true_positive": 3, "false_positive": 0, "false_negative": 0}),
+        }
+        result = checkpoint_event_score({"metricsByToleranceSeconds": {"0.1": metrics}, "windowVisits": 4})
+        self.assertEqual(result["score"], 2 / 3)
+        self.assertIn("technique-string-set", result["metric"])
+
     def test_stitching_interpolates_shifted_windows_and_refuses_gaps(self):
         times = np.arange(10) * .1
         combined = OutputTimeline(times)
