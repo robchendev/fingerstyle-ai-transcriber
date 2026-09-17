@@ -31,6 +31,7 @@ from .transcriber_model import HARMONIC_FRETS, HARMONIC_TYPES, PERCUSSION_TYPES
 GRID = Fraction(1, 8)
 RHYTHM_GRIDS = ((Fraction(1, 4), 0.0, "sixteenth"), (Fraction(1, 8), 0.02, "thirty-second"))
 PERCUSSION_DURATION = Fraction(1, 4)
+SINGLE_VOICE_BRIDGE_QUARTER = Fraction(2)
 MAX_FRET = 36
 MAX_MEASURES = 4096
 KEY_ORDER = (0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6, 7, -7)
@@ -468,7 +469,10 @@ def _simplified_notes(notes, percussion):
         next_position = positions[next_index] if next_index < len(positions) else None
         end = max(note["end"] for note in group)
         if next_position is not None:
-            end = min(end, next_position)
+            if next_position - position <= SINGLE_VOICE_BRIDGE_QUARTER:
+                end = next_position
+            else:
+                end = min(end, next_position)
         end = max(position + GRID, end)
         for note in group:
             result.append({**deepcopy(note), "voice": 0, "end": end, "duration": end - position})
@@ -776,9 +780,14 @@ class _ScoreWriter:
             for event in hosted:
                 if measure["start"] <= event["onset"] < measure["end"]:
                     boundaries.add(event["onset"])
+            for event in hosted:
+                if measure["start"] <= event["onset"] < measure["end"]:
                     active = any(note["onset"] <= event["onset"] < note["end"] for note in notes)
                     if not active:
-                        boundaries.add(min(measure["end"], event["onset"] + PERCUSSION_DURATION))
+                        later = min((value for value in boundaries if value > event["onset"]), default=measure["end"])
+                        maximum = SINGLE_VOICE_BRIDGE_QUARTER if self.simplified else PERCUSSION_DURATION
+                        if later - event["onset"] > maximum:
+                            boundaries.add(event["onset"] + maximum)
         points = sorted(boundaries)
         beats = []
         for left, right in zip(points, points[1:]):

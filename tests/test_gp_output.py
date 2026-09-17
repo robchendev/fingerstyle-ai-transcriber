@@ -262,6 +262,48 @@ class GpOutputTests(unittest.TestCase):
             wrist = [event for event in score["scoreEvents"] if event["text"] == "O"]
             self.assertEqual([(event["voiceIndex"], event["offsetQuarter"]) for event in wrist], [(1, [1, 1])])
 
+    def test_single_voice_bridges_short_note_and_percussion_gaps_without_rests(self):
+        document = hypotheses()
+        document["audioDurationSeconds"] = 2
+        document["notes"] = [
+            {
+                "onsetSeconds": 0,
+                "string": 1,
+                "fret": 0,
+                "soundingPitchMidi": 64,
+                "voiceIndex": 0,
+                "notatedDurationQuarter": .25,
+                "harmonic": None,
+                "confidence": .99,
+                "uncertainty": [],
+            },
+            {
+                "onsetSeconds": .5,
+                "string": 2,
+                "fret": 1,
+                "soundingPitchMidi": 60,
+                "voiceIndex": 0,
+                "notatedDurationQuarter": .25,
+                "harmonic": None,
+                "confidence": .99,
+                "uncertainty": [],
+            },
+        ]
+        document["percussion"] = [{"onsetSeconds": .25, "technique": "thumb_slap", "confidence": .99}]
+        with TemporaryDirectory(dir=ROOT) as directory:
+            directory = Path(directory)
+            template = directory / "template.gpt"
+            full, single = directory / "full.gp", directory / "single.gp"
+            template.write_bytes(archive_bytes(output_template()))
+            write_gp_outputs(template, document, full, single)
+            score = decode_score(gp_root(single), [40, 45, 50, 55, 59, 64], 0)
+            events = score["scoreEvents"][:3]
+            self.assertEqual([(event["offsetQuarter"], event["notatedDurationQuarter"], event["isRest"]) for event in events], [
+                ([0, 1], [1, 2], False),
+                ([1, 2], [1, 2], False),
+                ([1, 1], [1, 4], False),
+            ])
+
     def test_duration_is_bounded_by_audio_and_same_string_reattacks_are_reported(self):
         document = hypotheses()
         document["audioDurationSeconds"] = 2
