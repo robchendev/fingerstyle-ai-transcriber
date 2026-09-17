@@ -23,6 +23,7 @@ def hypotheses():
     return {
         "schemaVersion": 1,
         "kind": "fingerstyle-transcription-hypotheses",
+        "audioSha256": "audio",
         "audioDurationSeconds": 5.0,
         "metadata": {
             "openStringMidi": [40, 45, 50, 55, 59, 64],
@@ -171,6 +172,52 @@ class GpOutputTests(unittest.TestCase):
                 profile=DraftProfile(note_threshold=.5, include_harmonics=True, harmonic_threshold=.5),
             )
             self.assertTrue(gp_root(full).findall("./Notes/Note/Properties/Property[@name='Harmonic']"))
+
+    def test_beat_evidence_drives_constrained_score_timing(self):
+        document = hypotheses()
+        beat_evidence = {
+            "kind": "audio-beat-evidence",
+            "audioSha256": "audio",
+            "beatSeconds": [0, .5, 1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5],
+            "downbeatSeconds": [0, 2, 4],
+        }
+        with TemporaryDirectory(dir=ROOT) as directory:
+            directory = Path(directory)
+            template = directory / "template.gpt"
+            full, single = directory / "full.gp", directory / "single.gp"
+            template.write_bytes(archive_bytes(output_template()))
+            report = write_gp_outputs(template, document, full, single, beat_evidence=beat_evidence)
+            self.assertEqual(report["rhythmicGridPolicy"]["mode"], "beat-anchored-constrained")
+            self.assertEqual(report["rhythmInference"]["onsetOptimization"]["status"], "optimal")
+            self.assertTrue(report["rhythmInference"]["durationOptimization"]["changedCount"])
+            self.assertFalse(report["rhythmInference"]["rawHypothesesModified"])
+            different = dict(beat_evidence, audioSha256="different")
+            with self.assertRaisesRegex(HarnessError, "different audio"):
+                write_gp_outputs(template, document, directory / "other.gp", directory / "other-single.gp", beat_evidence=different)
+
+    def test_pickup_creates_a_short_first_measure_and_mixed_timing_fails(self):
+        document = hypotheses()
+        document["notes"][0]["onsetSeconds"] = 0
+        beat_evidence = {
+            "kind": "audio-beat-evidence",
+            "audioSha256": "audio",
+            "beatSeconds": [0, .5, 1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5],
+            "downbeatSeconds": [.5, 2.5, 4.5],
+        }
+        with TemporaryDirectory(dir=ROOT) as directory:
+            directory = Path(directory)
+            template = directory / "template.gpt"
+            full, single = directory / "full.gp", directory / "single.gp"
+            template.write_bytes(archive_bytes(output_template()))
+            write_gp_outputs(template, document, full, single, beat_evidence=beat_evidence)
+            decoded = decode_score(gp_root(full), [40, 45, 50, 55, 59, 64], 0)
+            self.assertTrue(decoded["measures"][0]["inferredPickup"])
+            self.assertEqual(decoded["measures"][0]["durationQuarter"], [1, 1])
+            mixed = hypotheses()
+            mixed["notes"][0]["scoreOnsetQuarter"] = [0, 1]
+            mixed["notes"][0]["scoreDurationQuarter"] = [1, 1]
+            with self.assertRaisesRegex(HarnessError, "same structured"):
+                write_gp_outputs(template, mixed, directory / "mixed.gp", directory / "mixed-single.gp")
 
     def test_duration_is_bounded_by_audio_and_same_string_reattacks_are_reported(self):
         document = hypotheses()

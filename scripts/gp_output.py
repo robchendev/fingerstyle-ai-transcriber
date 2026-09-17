@@ -5,6 +5,7 @@ from collections import defaultdict
 from copy import deepcopy
 from fractions import Fraction
 import hashlib
+import json
 import math
 from pathlib import Path
 import tempfile
@@ -12,6 +13,7 @@ import xml.etree.ElementTree as ET
 
 from .gp_events import HARMONIC_OFFSETS, NOTE_VALUES, TEMPO_BEAT_UNITS, decode_score
 from .draft_cleanup import DraftProfile, clean_hypotheses
+from .rhythm_inference import TICKS_PER_QUARTER
 from .gp_normalization import (
     GPIF_ENTRY,
     NormalizationError,
@@ -198,18 +200,41 @@ def _validate_predictions(document):
     if not isinstance(document.get("notes"), list) or not isinstance(document.get("percussion"), list):
         raise HarnessError("Prediction notes and percussion must be lists.")
     notes = []
+    structured_flags = []
     for index, value in enumerate(document.get("notes", [])):
         required = {"onsetSeconds", "string", "fret", "soundingPitchMidi", "voiceIndex", "notatedDurationQuarter", "harmonic", "confidence"}
         if not isinstance(value, dict) or not required <= set(value):
             raise HarnessError("Every predicted note requires time, string, fret, pitch, voice, duration, harmonic, and confidence fields.")
+        if _finite(value["onsetSeconds"], "Note onset", minimum=0) > duration_seconds:
+            raise HarnessError("A note prediction falls after the declared audio duration.")
         harmonic = value.get("harmonic")
         if harmonic is not None:
             if not isinstance(harmonic, dict) or harmonic.get("type") not in HARMONIC_TYPES or harmonic.get("fret") not in HARMONIC_FRETS:
                 raise HarnessError("Predicted harmonics require a supported type and node.")
+        score_onset = value.get("scoreOnsetQuarter")
+        score_duration = value.get("scoreDurationQuarter")
+        structured_flags.append(score_onset is not None)
+        if (score_onset is None) != (score_duration is None):
+            raise HarnessError("Structured note timing requires both score onset and score duration.")
+        if score_onset is not None:
+            try:
+                onset_raw = Fraction(*score_onset)
+                duration_raw = Fraction(*score_duration)
+            except (TypeError, ValueError, ZeroDivisionError) as error:
+                raise HarnessError("Structured note timing requires rational pairs.") from error
+            if (
+                onset_raw < 0 or duration_raw <= 0
+                or onset_raw.denominator > TICKS_PER_QUARTER or TICKS_PER_QUARTER % onset_raw.denominator
+                or duration_raw.denominator > TICKS_PER_QUARTER or TICKS_PER_QUARTER % duration_raw.denominator
+            ):
+                raise HarnessError("Structured note timing is outside the supported 24-tick quarter grid.")
+        else:
+            onset_raw = tempo.quarter_at(value["onsetSeconds"])
+            duration_raw = _fraction(_finite(value["notatedDurationQuarter"], "Note duration", minimum=0))
         note = {
             "id": f"note-{index}",
-            "onsetRaw": tempo.quarter_at(value["onsetSeconds"]),
-            "durationRaw": _fraction(_finite(value["notatedDurationQuarter"], "Note duration", minimum=0)),
+            "onsetRaw": onset_raw,
+            "durationRaw": duration_raw,
             "string": _integer(value["string"], "Note string", 1, 6),
             "fret": _integer(value["fret"], "Note fret", 0, MAX_FRET),
             "soundingPitchMidi": _integer(value["soundingPitchMidi"], "Sounding pitch", 0, 127),
@@ -226,10 +251,23 @@ def _validate_predictions(document):
         required = {"onsetSeconds", "technique", "confidence"}
         if not isinstance(value, dict) or not required <= set(value) or value.get("technique") not in PERCUSSION_TYPES:
             raise HarnessError("Every percussion prediction requires a supported technique.")
+        if _finite(value["onsetSeconds"], "Percussion onset", minimum=0) > duration_seconds:
+            raise HarnessError("A percussion prediction falls after the declared audio duration.")
+        score_onset = value.get("scoreOnsetQuarter")
+        structured_flags.append(score_onset is not None)
+        if score_onset is not None:
+            try:
+                onset_raw = Fraction(*score_onset)
+            except (TypeError, ValueError, ZeroDivisionError) as error:
+                raise HarnessError("Structured percussion timing requires a rational score onset.") from error
+            if onset_raw < 0 or onset_raw.denominator > TICKS_PER_QUARTER or TICKS_PER_QUARTER % onset_raw.denominator:
+                raise HarnessError("Structured percussion timing is outside the supported 24-tick quarter grid.")
+        else:
+            onset_raw = tempo.quarter_at(value["onsetSeconds"])
         event = {
             "id": f"percussion-{index}",
             "technique": value["technique"],
-            "onsetRaw": tempo.quarter_at(value["onsetSeconds"]),
+            "onsetRaw": onset_raw,
             "confidence": _finite(value["confidence"], "Percussion confidence", minimum=0),
         }
         if event["confidence"] > 1:
@@ -237,18 +275,38 @@ def _validate_predictions(document):
         percussion.append(event)
     if not notes and not percussion:
         raise HarnessError("GP output requires at least one decoded note or percussion event.")
-    if any(note["onsetRaw"] > tempo.quarter_at(duration_seconds) for note in notes) or any(event["onsetRaw"] > tempo.quarter_at(duration_seconds) for event in percussion):
-        raise HarnessError("A prediction falls after the declared audio duration.")
-    positions, rhythm_counts = _rhythmic_positions([note["onsetRaw"] for note in notes] + [event["onsetRaw"] for event in percussion])
-    for note in notes:
-        note["onset"], note["rhythmGrid"] = positions[note["onsetRaw"]]
-        note["duration"] = _quantize(note["durationRaw"], note["rhythmGrid"])
-        note["durationQuantized"] = note["duration"]
-        note["duration"] = max(note["rhythmGrid"], note["duration"])
-        note["end"] = note["onset"] + note["duration"]
-    for event in percussion:
-        event["onset"], event["rhythmGrid"] = positions[event["onsetRaw"]]
-    return tuning, capo, tempo, tempo.quarter_at(duration_seconds), notes, percussion, rhythm_counts
+    if any(structured_flags) and not all(structured_flags):
+        raise HarnessError("Every event must use the same structured or nominal score-time coordinate system.")
+    structured = all(structured_flags)
+    if structured:
+        rhythm_counts = {"constrained-24-tick": len({note["onsetRaw"] for note in notes} | {event["onsetRaw"] for event in percussion})}
+        for note in notes:
+            note["onset"] = note["onsetRaw"]
+            note["rhythmGrid"] = Fraction(1, TICKS_PER_QUARTER)
+            note["duration"] = note["durationRaw"]
+            note["durationQuantized"] = note["duration"]
+            note["end"] = note["onset"] + note["duration"]
+        for event in percussion:
+            event["onset"] = event["onsetRaw"]
+            event["rhythmGrid"] = Fraction(1, TICKS_PER_QUARTER)
+        declared_end = document.get("scoreAudioEndQuarter")
+        if not isinstance(declared_end, list) or len(declared_end) != 2:
+            raise HarnessError("Structured timing requires a rational score audio end.")
+        score_end = Fraction(*declared_end)
+        if score_end <= 0 or score_end.denominator > TICKS_PER_QUARTER or TICKS_PER_QUARTER % score_end.denominator:
+            raise HarnessError("Structured score audio end must be positive.")
+    else:
+        positions, rhythm_counts = _rhythmic_positions([note["onsetRaw"] for note in notes] + [event["onsetRaw"] for event in percussion])
+        for note in notes:
+            note["onset"], note["rhythmGrid"] = positions[note["onsetRaw"]]
+            note["duration"] = _quantize(note["durationRaw"], note["rhythmGrid"])
+            note["durationQuantized"] = note["duration"]
+            note["duration"] = max(note["rhythmGrid"], note["duration"])
+            note["end"] = note["onset"] + note["duration"]
+        for event in percussion:
+            event["onset"], event["rhythmGrid"] = positions[event["onsetRaw"]]
+        score_end = tempo.quarter_at(duration_seconds)
+    return tuning, capo, tempo, score_end, notes, percussion, rhythm_counts, structured
 
 
 def _resolve_notes(notes, tuning, capo, audio_end):
@@ -342,20 +400,42 @@ def _resolve_percussion(percussion):
     return sorted(selected.values(), key=lambda item: (item["onset"], PERCUSSION_TYPES.index(item["technique"]))), dropped
 
 
-def _meter_changes(metadata, tempo):
+def _meter_changes(document, tempo):
+    metadata = document["metadata"]
     changes = [(Fraction(0), metadata["timeSignature"])]
-    for event in metadata.get("timeSignatureChanges", []):
-        raw = tempo.quarter_at(event["timeSeconds"])
-        quantized = _quantize(raw)
+    structured = document.get("notatedTimeSignatureChanges")
+    events = structured if structured is not None else metadata.get("timeSignatureChanges", [])
+    for event in events:
+        if structured is not None:
+            raw = Fraction(*event["scoreQuarter"])
+            previous_start, previous_meter = changes[-1]
+            measure = _meter_duration(previous_meter)
+            pickup = Fraction(*document.get("pickupDurationQuarter", [0, 1])) if len(changes) == 1 else Fraction(0)
+            base = previous_start + pickup
+            quantized = base + max(1, round((raw - base) / measure)) * measure
+        else:
+            quantized = _quantize(tempo.quarter_at(event["timeSeconds"]))
         changes.append((quantized, event["timeSignature"]))
     return changes
 
 
-def _measures(metadata, tempo, content_end):
-    changes = _meter_changes(metadata, tempo)
+def _measures(document, tempo, content_end):
+    changes = _meter_changes(document, tempo)
     result = []
     cursor = Fraction(0)
+    pickup_value = document.get("pickupDurationQuarter", [0, 1])
+    try:
+        pickup = Fraction(*pickup_value)
+    except (TypeError, ValueError, ZeroDivisionError) as error:
+        raise HarnessError("Pickup duration must be a rational pair.") from error
+    if not 0 <= pickup < _meter_duration(changes[0][1]):
+        raise HarnessError("Pickup duration must be shorter than the initial measure.")
+    if pickup:
+        result.append({"index": 0, "start": cursor, "end": pickup, "meter": changes[0][1], "pickup": True})
+        cursor = pickup
     for index, (change, meter) in enumerate(changes):
+        if index == 0:
+            change = cursor
         if change != cursor:
             raise HarnessError("Each time-signature change must fall on the next generated measure boundary.")
         stop = changes[index + 1][0] if index + 1 < len(changes) else None
@@ -738,7 +818,7 @@ class _ScoreWriter:
         return self.fallbacks
 
 
-def _tempo_automations(root, tempo, measures):
+def _tempo_automations(root, tempo, measures, notated_changes=None, initial_tempo=None):
     parent = root.find("./MasterTrack/Automations")
     if parent is None:
         master = root.find("MasterTrack")
@@ -749,8 +829,15 @@ def _tempo_automations(root, tempo, measures):
         if node.tag == "Automation" and node.findtext("Type") == "Tempo":
             parent.remove(node)
     reverse_units = {value: key for key, value in TEMPO_BEAT_UNITS.items()}
-    for event, quarter in zip(tempo.events, tempo.quarters):
-        if event["beatUnit"] not in reverse_units:
+    events = [(initial_tempo or tempo.events[0], Fraction(0))]
+    if notated_changes is None:
+        events.extend(zip(tempo.events[1:], tempo.quarters[1:]))
+    else:
+        events.extend((event, Fraction(*event["scoreQuarter"])) for event in notated_changes)
+    for event, quarter in events:
+        beat_unit = event["beatUnit"]
+        beat_unit = Fraction(*beat_unit) if isinstance(beat_unit, list) else beat_unit
+        if beat_unit not in reverse_units:
             raise HarnessError("The GP writer supports tempo beat units 1/8, 1/4, dotted 1/4, 1/2, and dotted 1/2.")
         index = bisect_right([measure["start"] for measure in measures], quarter) - 1
         if index < 0:
@@ -768,7 +855,7 @@ def _tempo_automations(root, tempo, measures):
             ("Bar", index),
             ("Position", f"{float(position):.12g}"),
             ("Visible", "true"),
-            ("Value", f"{float(event['bpm']):.12g} {reverse_units[event['beatUnit']]}"),
+            ("Value", f"{float(event['bpm']):.12g} {reverse_units[beat_unit]}"),
         ):
             ET.SubElement(node, tag).text = str(value)
 
@@ -812,7 +899,7 @@ def _multivoice(root, enabled):
         node.text = ("1" if enabled else "0") + suffix
 
 
-def _build_variant(template_raw, notes, percussion, measures, tuning, capo, tempo, *, simplified):
+def _build_variant(template_raw, notes, percussion, measures, tuning, capo, tempo, *, simplified, notated_tempo_changes=None, initial_tempo=None):
     root, payloads, comment = _parse_archive(template_raw)
     before = _template_invariant(root)
     offsets = _prototype_pitch_offsets(root)
@@ -822,7 +909,7 @@ def _build_variant(template_raw, notes, percussion, measures, tuning, capo, temp
     key_count, spellings, accidental_count = _select_key(notes, measures, preference, offsets["TransposedPitch"])
     writer = _ScoreWriter(root, tuning, capo, measures, notes, percussion, key_count, spellings, simplified=simplified)
     fallbacks = writer.build()
-    _tempo_automations(root, tempo, measures)
+    _tempo_automations(root, tempo, measures, notated_tempo_changes, initial_tempo)
     _instrument(root, tuning, capo, max(24, max((note["fret"] for note in notes), default=0)))
     _systems_layout(root, len(measures))
     _multivoice(root, not simplified and any(note["voice"] > 0 for note in notes))
@@ -864,7 +951,7 @@ def _atomic_bytes(path, content):
             temporary.unlink()
 
 
-def write_gp_outputs(template_path, predictions, full_path, single_path, *, profile=DraftProfile()):
+def write_gp_outputs(template_path, predictions, full_path, single_path, *, profile=DraftProfile(), beat_evidence=None, include_unsupported_tail=False):
     template_path = Path(template_path).resolve()
     if not template_path.is_file():
         raise HarnessError(f"GP output template does not exist: {template_path}")
@@ -873,23 +960,26 @@ def write_gp_outputs(template_path, predictions, full_path, single_path, *, prof
     if Path(full_path).absolute() == Path(single_path).absolute():
         raise HarnessError("Full-voice and single-voice GP outputs require different paths.")
     cleaned, cleanup = clean_hypotheses(predictions, profile)
-    tuning, capo, tempo, audio_end, raw_notes, raw_percussion, rhythm_counts = _validate_predictions(cleaned)
+    rhythm_inference = None
+    if beat_evidence is not None:
+        if beat_evidence.get("audioSha256") != predictions.get("audioSha256"):
+            raise HarnessError("Beat evidence and transcription hypotheses reference different audio.")
+        from .rhythm_inference import infer_notated_timing
+
+        cleaned, rhythm_inference = infer_notated_timing(cleaned, beat_evidence, include_unsupported_tail=include_unsupported_tail)
+    tuning, capo, tempo, audio_end, raw_notes, raw_percussion, rhythm_counts, structured = _validate_predictions(cleaned)
     notes, reconciled, unresolved, shortened, dropped_notes = _resolve_notes(raw_notes, tuning, capo, audio_end)
     percussion, dropped_percussion = _resolve_percussion(raw_percussion)
     content_end = max(audio_end, max([note["onset"] + note["rhythmGrid"] for note in notes] + [event["onset"] + PERCUSSION_DURATION for event in percussion], default=GRID))
-    measures = _measures(predictions["metadata"], tempo, content_end)
-    full, full_report = _build_variant(template_raw, notes, percussion, measures, tuning, capo, tempo, simplified=False)
+    measures = _measures(cleaned, tempo, content_end)
+    notated_tempo_changes = cleaned.get("notatedTempoChanges")
+    initial_tempo = cleaned.get("notatedInitialTempo")
+    full, full_report = _build_variant(template_raw, notes, percussion, measures, tuning, capo, tempo, simplified=False, notated_tempo_changes=notated_tempo_changes, initial_tempo=initial_tempo)
     simple_notes = _simplified_notes(notes, percussion)
-    single, single_report = _build_variant(template_raw, simple_notes, percussion, measures, tuning, capo, tempo, simplified=True)
+    single, single_report = _build_variant(template_raw, simple_notes, percussion, measures, tuning, capo, tempo, simplified=True, notated_tempo_changes=notated_tempo_changes, initial_tempo=initial_tempo)
     if hashlib.sha256(template_path.read_bytes()).hexdigest() != template_hash:
         raise HarnessError("GP template changed while outputs were generated.")
-    _atomic_bytes(full_path, full)
-    try:
-        _atomic_bytes(single_path, single)
-    except Exception:
-        Path(full_path).unlink(missing_ok=True)
-        raise
-    return {
+    report = {
         "schemaVersion": 1,
         "kind": "gp-output-report",
         "templateSha256": template_hash,
@@ -899,8 +989,10 @@ def write_gp_outputs(template_path, predictions, full_path, single_path, *, prof
         "cleanedHypotheses": {"notes": len(raw_notes), "percussion": len(raw_percussion)},
         "resolvedHypotheses": {"notes": len(notes), "percussion": len(percussion)},
         "draftCleanup": cleanup,
+        "rhythmInference": rhythm_inference,
         "rhythmicGridPolicy": {
-            "candidateQuarterGrids": [_rational(value[0]) for value in RHYTHM_GRIDS],
+            "mode": "beat-anchored-constrained" if structured else "nominal-tempo-fallback",
+            "candidateQuarterGrids": [_rational(value[0]) for value in RHYTHM_GRIDS] if not structured else None,
             "complexityPenalties": {value[2]: value[1] for value in RHYTHM_GRIDS},
             "selectedUniqueOnsetsByGrid": rhythm_counts,
             "percussionDurationQuarter": _rational(PERCUSSION_DURATION),
@@ -924,3 +1016,14 @@ def write_gp_outputs(template_path, predictions, full_path, single_path, *, prof
         "linearPerformanceOrder": True,
         "trainingPerformed": False,
     }
+    try:
+        json.dumps(report, allow_nan=False)
+    except (TypeError, ValueError) as error:
+        raise HarnessError(f"GP output report is not safely serializable: {error}") from error
+    _atomic_bytes(full_path, full)
+    try:
+        _atomic_bytes(single_path, single)
+    except Exception:
+        Path(full_path).unlink(missing_ok=True)
+        raise
+    return report

@@ -138,6 +138,22 @@ class HarnessCommandTests(unittest.TestCase):
         self.assertEqual(profile.chord_tolerance_seconds, .04)
         self.assertEqual(profile.same_string_gap_seconds, .08)
 
+    def test_analyze_beats_cli_publishes_private_evidence(self):
+        report = {"beatCount": 10, "downbeatCount": 3}
+        with TemporaryDirectory(dir=ROOT) as directory:
+            root = Path(directory)
+            audio = root / "audio.flac"
+            checkpoint = root / "beat.ckpt"
+            audio.write_bytes(b"audio")
+            checkpoint.write_bytes(b"checkpoint")
+            with patch("scripts.beat_tracking.track_beats", return_value=report) as track:
+                self.assertEqual(transcriber.main([
+                    "analyze-beats", "--data-root", str(root), "--audio", str(audio),
+                    "--checkpoint", str(checkpoint), "--output", "runs\\beats.json",
+                ]), 0)
+            track.assert_called_once_with(audio.resolve(), checkpoint.resolve(), device="cpu")
+            self.assertEqual(read_json(root / "runs" / "beats.json"), report)
+
     def test_whole_audio_stitching_has_no_uncovered_or_duplicated_frame_positions(self):
         class ConstantModel(torch.nn.Module):
             def forward(self, features, conditioning, lengths):

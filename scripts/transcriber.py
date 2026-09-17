@@ -371,6 +371,7 @@ def export_gp(args):
 
     predictions_path = Path(args.predictions).resolve()
     predictions = read_json(predictions_path)
+    beat_evidence = read_json(Path(args.beat_evidence).resolve()) if args.beat_evidence else None
     full_path = private_output(args.full_output, args.data_root)
     single_path = private_output(args.single_output, args.data_root)
     if full_path.suffix.lower() != ".gp" or single_path.suffix.lower() != ".gp" or full_path == single_path:
@@ -384,7 +385,10 @@ def export_gp(args):
         chord_tolerance_seconds=args.chord_tolerance,
         same_string_gap_seconds=args.same_string_gap,
     )
-    report = write_gp_outputs(args.template, predictions, full_path, single_path, profile=profile)
+    report = write_gp_outputs(
+        args.template, predictions, full_path, single_path, profile=profile,
+        beat_evidence=beat_evidence, include_unsupported_tail=args.include_beat_unsupported_tail,
+    )
     if sha256(predictions_path) != before:
         raise HarnessError("Prediction hypotheses changed during GP export.")
     report.update(
@@ -401,6 +405,22 @@ def export_gp(args):
         "measures": report["fullVoices"]["measureCount"],
         "report": str(report_path),
     })
+    return report
+
+
+def analyze_beats(args):
+    from .beat_tracking import track_beats
+
+    audio = Path(args.audio).resolve()
+    checkpoint = Path(args.checkpoint).resolve()
+    audio_hash = sha256(audio)
+    checkpoint_hash = sha256(checkpoint)
+    report = track_beats(audio, checkpoint, device=args.device)
+    if sha256(audio) != audio_hash or sha256(checkpoint) != checkpoint_hash:
+        raise HarnessError("Beat-analysis inputs changed before publication.")
+    output = private_output(args.output, args.data_root)
+    publish_json(output, report)
+    print({"beats": report["beatCount"], "downbeats": report["downbeatCount"], "output": str(output)})
     return report
 
 
@@ -439,10 +459,17 @@ def main(argv=None):
     inference.add_argument("--device", default="auto")
     inference.add_argument("--onset-threshold", type=float, default=.5)
     inference.add_argument("--percussion-threshold", type=float, default=.5)
+    beats = commands.add_parser("analyze-beats")
+    beats.add_argument("--data-root", default=str(ROOT))
+    beats.add_argument("--audio", required=True)
+    beats.add_argument("--checkpoint", required=True, help="Local Beat This! checkpoint; remote downloads are never automatic.")
+    beats.add_argument("--output", default="runs/beat-evidence.json")
+    beats.add_argument("--device", default="cpu")
     export = commands.add_parser("export-gp")
     export.add_argument("--data-root", default=str(ROOT))
     export.add_argument("--predictions", required=True)
     export.add_argument("--template", required=True)
+    export.add_argument("--beat-evidence", help="Private analyze-beats output for beat-anchored constrained rhythm inference.")
     export.add_argument("--full-output", default="runs/transcription.full-voices.gp")
     export.add_argument("--single-output", default="runs/transcription.single-voice.gp")
     export.add_argument("--report", default="runs/gp-output.json")
@@ -452,13 +479,14 @@ def main(argv=None):
     export.add_argument("--include-harmonics", action="store_true", help="Export consistency-gated harmonic guesses; disabled by default because the positive-only harmonic head is uncalibrated.")
     export.add_argument("--chord-tolerance", type=float, default=.04)
     export.add_argument("--same-string-gap", type=float, default=.08)
+    export.add_argument("--include-beat-unsupported-tail", action="store_true", help="Keep attacks after the final detected beat using extrapolated timing; raw JSON always retains them.")
     args = parser.parse_args(argv)
     try:
         if args.command == "config":
             publish_json(private_output(args.output), default_config())
             print("Generic configuration written under the private runs directory.")
         else:
-            {"preflight": preflight, "train": train, "evaluate": evaluate, "evaluate-events": evaluate_decoded_events, "infer": infer, "export-gp": export_gp}[args.command](args)
+            {"preflight": preflight, "train": train, "evaluate": evaluate, "evaluate-events": evaluate_decoded_events, "infer": infer, "analyze-beats": analyze_beats, "export-gp": export_gp}[args.command](args)
     except (HarnessError, OSError, ValueError, RuntimeError) as error:
         print(f"Transcriber error: {error}", file=sys.stderr)
         return 1

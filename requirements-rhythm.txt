@@ -1,0 +1,4 @@
+# Beat This! is installed separately with --no-deps because available torchaudio wheels do not match torch 2.14.
+einops==0.8.2
+rotary-embedding-torch==0.9.1
+ortools==9.15.6755
