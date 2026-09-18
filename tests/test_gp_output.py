@@ -188,6 +188,12 @@ class GpOutputTests(unittest.TestCase):
             report = write_gp_outputs(template, document, full, single)
             root = gp_root(full)
             self.assertEqual(root.findtext("./Beats/Beat/Properties/Property[@name='Brush']/Direction"), "Down")
+            brush = next(
+                beat for beat in root.findall("./Beats/Beat")
+                if beat.find("./Properties/Property[@name='Brush']") is not None
+            )
+            self.assertEqual(brush.findtext("./XProperties/XProperty[@id='687935489']/Int"), "30")
+            self.assertEqual(brush.findtext("./XProperties/XProperty[@id='687935490']/Float"), "0")
             self.assertEqual(root.findtext("./Beats/Beat/Arpeggio"), "Up")
             self.assertEqual(report["techniqueHypotheses"], 2)
 

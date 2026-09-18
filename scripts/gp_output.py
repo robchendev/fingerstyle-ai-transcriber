@@ -33,6 +33,9 @@ GRID = Fraction(1, 8)
 RHYTHM_GRIDS = ((Fraction(1, 4), 0.0, "sixteenth"), (Fraction(1, 8), 0.02, "thirty-second"))
 PERCUSSION_DURATION = Fraction(1, 4)
 SINGLE_VOICE_BRIDGE_QUARTER = Fraction(2)
+INSTANT_BRUSH_DURATION_TICKS = 30
+BRUSH_DURATION_XPROPERTY = "687935489"
+BRUSH_START_XPROPERTY = "687935490"
 MAX_FRET = 36
 MAX_MEASURES = 4096
 KEY_ORDER = (0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6, 7, -7)
@@ -829,6 +832,14 @@ class _ScoreWriter:
             }[technique]
             prop = ET.SubElement(properties, "Property", name=name)
             ET.SubElement(prop, child).text = value
+            if technique == "brush":
+                xproperties = beat.find("XProperties")
+                if xproperties is None:
+                    xproperties = ET.SubElement(beat, "XProperties")
+                duration = ET.SubElement(xproperties, "XProperty", id=BRUSH_DURATION_XPROPERTY)
+                ET.SubElement(duration, "Int").text = str(INSTANT_BRUSH_DURATION_TICKS)
+                start = ET.SubElement(xproperties, "XProperty", id=BRUSH_START_XPROPERTY)
+                ET.SubElement(start, "Float").text = "0" if direction == "Down" else "1"
 
     def voice_beats(self, measure, voice):
         notes = [note for note in self.notes if note["voice"] == voice and note["onset"] < measure["end"] and note["end"] > measure["start"]]
