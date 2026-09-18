@@ -10,6 +10,8 @@ from .transcriber_audio import HarnessError
 
 MAX_FRET = 24
 MAX_FRETTED_SPAN = 5
+MAX_RAPID_POSITION_SHIFT = 5
+RAPID_SHIFT_WINDOW_QUARTER = Fraction(1)
 
 
 def _onset(note):
@@ -47,7 +49,7 @@ def _deduplicate(group):
     return [(value[1], value[2]) for value in by_pitch.values()], removed
 
 
-def _optimize_group(group, tuning, capo, onset, recent, previous_position):
+def _optimize_group(group, tuning, capo, onset, recent, previous_position, previous_position_onset):
     try:
         from ortools.sat.python import cp_model
     except (ImportError, ModuleNotFoundError) as error:
@@ -56,8 +58,18 @@ def _optimize_group(group, tuning, capo, onset, recent, previous_position):
     candidates = {}
     for index, note in unique:
         values = _candidates(note["soundingPitchMidi"], tuning, capo)
+        unrestricted = bool(values)
+        if note.get("harmonic") is None and previous_position is not None and previous_position_onset is not None and onset - previous_position_onset <= RAPID_SHIFT_WINDOW_QUARTER:
+            values = [
+                (string, fret) for string, fret in values
+                if fret == 0 or abs(fret - previous_position) <= MAX_RAPID_POSITION_SHIFT
+            ]
         if not values:
-            removed.append({"index": index, "reason": "pitch_has_no_playable_string", "pitch": note["soundingPitchMidi"]})
+            removed.append({
+                "index": index,
+                "reason": "rapid_position_shift_unplayable" if unrestricted else "pitch_has_no_playable_string",
+                "pitch": note["soundingPitchMidi"],
+            })
         else:
             candidates[index] = values
     playable = [(index, note) for index, note in unique if index in candidates]
@@ -152,8 +164,11 @@ def optimize_fingerings(document):
     keep = set(range(len(result["notes"])))
     recent = {}
     previous_position = None
+    previous_position_onset = None
     for onset, group in sorted(groups.items()):
-        assignments, local_removed, status = _optimize_group(group, tuning, capo, onset, recent, previous_position)
+        assignments, local_removed, status = _optimize_group(
+            group, tuning, capo, onset, recent, previous_position, previous_position_onset,
+        )
         statuses[status] += 1
         for value in local_removed:
             keep.discard(value["index"])
@@ -176,6 +191,7 @@ def optimize_fingerings(document):
         fretted = [fret for _, fret in assignments.values() if fret]
         if fretted:
             previous_position = sorted(fretted)[len(fretted) // 2]
+            previous_position_onset = onset
         by_fret = defaultdict(list)
         for index, (string, fret) in assignments.items():
             if fret:
@@ -196,6 +212,8 @@ def optimize_fingerings(document):
         "solver": "OR-Tools CP-SAT",
         "maximumFret": MAX_FRET,
         "maximumFrettedChordSpan": MAX_FRETTED_SPAN,
+        "maximumRapidPositionShift": MAX_RAPID_POSITION_SHIFT,
+        "rapidShiftWindowQuarter": [RAPID_SHIFT_WINDOW_QUARTER.numerator, RAPID_SHIFT_WINDOW_QUARTER.denominator],
         "repeatedPitchContinuityQuarter": [3, 2],
         "sourceNoteCount": len(document["notes"]),
         "retainedNoteCount": len(result["notes"]),

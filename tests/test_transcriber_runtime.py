@@ -37,7 +37,8 @@ WEIGHTS = {
     "harmonic_node": 0.25, "percussion_positive": 5.0, "percussion_negative": 1.0,
     "technique_positive": 4.0, "technique_negative": 1.0, "technique_direction": 0.5,
     "technique_strings_positive": 2.0, "technique_strings_negative": 1.0,
-    "connection": 1.0, "note_technique_positive": 2.0, "note_technique_negative": 1.0,
+    "connection_positive": 2.0, "connection_negative": 1.0,
+    "note_technique_positive": 2.0, "note_technique_negative": 1.0,
     "bend_curve": 0.5,
 }
 STAT_KEYS = (
@@ -46,7 +47,8 @@ STAT_KEYS = (
     "percussion_negative", "harmonic_sparsity", "percussion_sparsity",
     "technique_positive", "technique_negative", "technique_direction",
     "technique_strings_positive", "technique_strings_negative",
-    "connection", "note_technique_positive", "note_technique_negative",
+    "connection_positive", "connection_negative",
+    "note_technique_positive", "note_technique_negative",
     "bend_curve",
 )
 
@@ -1139,7 +1141,8 @@ class RuntimeTests(unittest.TestCase):
             "technique_direction": {"sum": 0.0, "count": 0},
             "technique_strings_positive": {"sum": 0.0, "count": 0},
             "technique_strings_negative": {"sum": 0.0, "count": 0},
-            "connection": {"sum": 0.0, "count": 0},
+            "connection_positive": {"sum": 0.0, "count": 0},
+            "connection_negative": {"sum": 0.0, "count": 0},
             "note_technique_positive": {"sum": 0.0, "count": 0},
             "note_technique_negative": {"sum": 0.0, "count": 0},
             "bend_curve": {"sum": 0.0, "count": 0},

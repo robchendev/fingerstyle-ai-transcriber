@@ -45,7 +45,8 @@ LOSS_WEIGHTS = {
     "technique_direction": 0.5,
     "technique_strings_positive": 2.0,
     "technique_strings_negative": 1.0,
-    "connection": 1.0,
+    "connection_positive": 2.0,
+    "connection_negative": 1.0,
     "note_technique_positive": 2.0,
     "note_technique_negative": 1.0,
     "bend_curve": 0.5,
@@ -56,7 +57,8 @@ LOSS_STAT_KEYS = (
     "percussion_positive", "percussion_negative", "harmonic_sparsity", "percussion_sparsity",
     "technique_positive", "technique_negative", "technique_direction",
     "technique_strings_positive", "technique_strings_negative",
-    "connection", "note_technique_positive", "note_technique_negative",
+    "connection_positive", "connection_negative",
+    "note_technique_positive", "note_technique_negative",
     "bend_curve",
 )
 _BASE_HEADS = {
@@ -384,7 +386,7 @@ def masked_loss(outputs: Mapping[str, Tensor], targets: Mapping[str, Tensor], ma
     if onset_means:
         loss = loss + LOSS_WEIGHTS["note_onset"] * sum(onset_means) / len(onset_means)
     for name in _CATEGORICAL:
-        if name not in active_heads:
+        if name not in active_heads or name == "connection":
             continue
         mask = effective[name]
         if mask.any().item():
@@ -458,6 +460,20 @@ def masked_loss(outputs: Mapping[str, Tensor], targets: Mapping[str, Tensor], ma
         if string_components:
             loss = loss + sum(total * weight for total, _, weight in string_components) / sum(count * weight for _, count, weight in string_components)
     if "connection" in active_heads:
+        connection_components = []
+        for positive, suffix in ((True, "positive"), (False, "negative")):
+            selected = effective["connection"] & ((targets["connection"] != 0) if positive else (targets["connection"] == 0))
+            if not selected.any().item():
+                continue
+            values = F.cross_entropy(outputs["connection_logits"][selected], targets["connection"][selected], reduction="none")
+            numerator, count = values.sum(), values.numel()
+            name = f"connection_{suffix}"
+            stats[name] = {"sum": float(numerator.detach()), "count": count}
+            connection_components.append((numerator / count, LOSS_WEIGHTS[name]))
+        if connection_components:
+            loss = loss + sum(mean * weight for mean, weight in connection_components) / sum(
+                weight for _, weight in connection_components
+            )
         components = []
         for value, suffix in ((1, "positive"), (0, "negative")):
             selected = effective["note_technique"] & (targets["note_technique"] == value)
@@ -467,9 +483,9 @@ def masked_loss(outputs: Mapping[str, Tensor], targets: Mapping[str, Tensor], ma
             numerator, count = values.sum(), values.numel()
             name = f"note_technique_{suffix}"
             stats[name] = {"sum": float(numerator.detach()), "count": count}
-            components.append((numerator, count, LOSS_WEIGHTS[name]))
+            components.append((numerator / count, LOSS_WEIGHTS[name]))
         if components:
-            loss = loss + sum(total * weight for total, _, weight in components) / sum(count * weight for _, count, weight in components)
+            loss = loss + sum(mean * weight for mean, weight in components) / sum(weight for _, weight in components)
         mask = effective["bend_curve"]
         if mask.any().item():
             values = F.smooth_l1_loss(outputs["bend_curve"][mask], targets["bend_curve"][mask], reduction="none")

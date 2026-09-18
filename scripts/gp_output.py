@@ -33,7 +33,7 @@ GRID = Fraction(1, 8)
 RHYTHM_GRIDS = ((Fraction(1, 4), 0.0, "sixteenth"), (Fraction(1, 8), 0.02, "thirty-second"))
 PERCUSSION_DURATION = Fraction(1, 4)
 SINGLE_VOICE_BRIDGE_QUARTER = Fraction(2)
-INSTANT_BRUSH_DURATION_TICKS = 30
+INSTANT_BRUSH_DURATION_TICKS = 0
 BRUSH_DURATION_XPROPERTY = "687935489"
 BRUSH_START_XPROPERTY = "687935490"
 MAX_FRET = 36
@@ -931,7 +931,7 @@ class _ScoreWriter:
                 duration = ET.SubElement(xproperties, "XProperty", id=BRUSH_DURATION_XPROPERTY)
                 ET.SubElement(duration, "Int").text = str(INSTANT_BRUSH_DURATION_TICKS)
                 start = ET.SubElement(xproperties, "XProperty", id=BRUSH_START_XPROPERTY)
-                ET.SubElement(start, "Float").text = "0" if direction == "Down" else "1"
+                ET.SubElement(start, "Float").text = "0"
 
     def voice_beats(self, measure, voice):
         notes = [note for note in self.notes if note["voice"] == voice and note["onset"] < measure["end"] and note["end"] > measure["start"]]
@@ -1176,6 +1176,11 @@ def write_gp_outputs(template_path, predictions, full_path, single_path, *, prof
             completer, cleaned, threshold=completion_threshold,
             technique_threshold=completion_technique_threshold,
         )
+    paired_brush_completion = None
+    if rhythm_inference is not None:
+        from .symbolic_completer import complete_pre_downbeat_brush_pairs
+
+        cleaned, paired_brush_completion = complete_pre_downbeat_brush_pairs(cleaned)
     cleaned = _bind_connection_origins(cleaned)
     arranger_applied = False
     if arranger is not None:
@@ -1218,6 +1223,7 @@ def write_gp_outputs(template_path, predictions, full_path, single_path, *, prof
         "fingeringOptimization": fingering_optimization,
         "fingeringArrangerApplied": arranger_applied,
         "symbolicCompletion": completion,
+        "pairedBrushCompletion": paired_brush_completion,
         "voiceOptimization": voice_optimization,
         "rhythmicGridPolicy": {
             "mode": "beat-anchored-constrained" if structured else "nominal-tempo-fallback",

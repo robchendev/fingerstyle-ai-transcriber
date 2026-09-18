@@ -27,12 +27,13 @@ _NOTE_ONSET_STATS = ("note_onset_positive", "note_onset_negative")
 _PERCUSSION_STATS = ("percussion_positive", "percussion_negative")
 _TECHNIQUE_STATS = ("technique_positive", "technique_negative")
 _TECHNIQUE_STRING_STATS = ("technique_strings_positive", "technique_strings_negative")
+_CONNECTION_STATS = ("connection_positive", "connection_negative")
 _NOTE_TECHNIQUE_STATS = ("note_technique_positive", "note_technique_negative")
 _LOSS_STAT_KEYS = (
     *_NOTE_ONSET_STATS, "fret", "pitch", "voice", "duration_log", "harmonic_positive",
     "harmonic_kind", "harmonic_node", *_PERCUSSION_STATS, "harmonic_sparsity", "percussion_sparsity",
     *_TECHNIQUE_STATS, "technique_direction", *_TECHNIQUE_STRING_STATS,
-    "connection", *_NOTE_TECHNIQUE_STATS,
+    *_CONNECTION_STATS, *_NOTE_TECHNIQUE_STATS,
     "bend_curve",
 )
 _CHECKPOINT_KEYS = {
@@ -556,18 +557,25 @@ def _objective(stats, weights, sparsity_weight):
                 loss += sum(stats[key]["sum"] * _stat_weight(key, weights) for key in percussion) / sum(
                     stats[key]["count"] * _stat_weight(key, weights) for key in percussion
                 )
-        elif name in ("technique_positive", "technique_strings_positive", "note_technique_positive"):
+        elif name in ("technique_positive", "technique_strings_positive"):
             group = (
                 _TECHNIQUE_STATS if name == "technique_positive"
-                else _TECHNIQUE_STRING_STATS if name == "technique_strings_positive"
-                else _NOTE_TECHNIQUE_STATS
+                else _TECHNIQUE_STRING_STATS
             )
             observed = [key for key in group if stats[key]["count"]]
             if observed:
                 loss += sum(stats[key]["sum"] * _stat_weight(key, weights) for key in observed) / sum(
                     stats[key]["count"] * _stat_weight(key, weights) for key in observed
                 )
-        elif value["count"] and name not in (*_NOTE_ONSET_STATS, *_PERCUSSION_STATS, *_TECHNIQUE_STATS, *_TECHNIQUE_STRING_STATS, *_NOTE_TECHNIQUE_STATS):
+        elif name in ("connection_positive", "note_technique_positive"):
+            group = _CONNECTION_STATS if name == "connection_positive" else _NOTE_TECHNIQUE_STATS
+            observed = [key for key in group if stats[key]["count"]]
+            if observed:
+                loss += sum(
+                    stats[key]["sum"] / stats[key]["count"] * _stat_weight(key, weights)
+                    for key in observed
+                ) / sum(_stat_weight(key, weights) for key in observed)
+        elif value["count"] and name not in (*_NOTE_ONSET_STATS, *_PERCUSSION_STATS, *_TECHNIQUE_STATS, *_TECHNIQUE_STRING_STATS, *_CONNECTION_STATS, *_NOTE_TECHNIQUE_STATS):
             weight = sparsity_weight if name in _PRIOR_NAMES else _stat_weight(name, weights)
             loss += weight * value["sum"] / value["count"]
     return _finite(loss, "aggregated loss")

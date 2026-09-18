@@ -1,7 +1,7 @@
 from copy import deepcopy
 import unittest
 
-from scripts.fingering_optimizer import MAX_FRETTED_SPAN, optimize_fingerings
+from scripts.fingering_optimizer import MAX_FRETTED_SPAN, MAX_RAPID_POSITION_SHIFT, optimize_fingerings
 from scripts.transcriber_audio import HarnessError
 
 
@@ -92,6 +92,17 @@ class FingeringOptimizerTests(unittest.TestCase):
         self.assertEqual([(item["string"], item["fret"]) for item in result["notes"]], [(6, 4)])
         # This synthetic document's tuning has string 6 at MIDI35 plus capo1.
         self.assertEqual(report["removedCount"], 0)
+
+    def test_rapid_position_shift_revoices_nearby_pitch_and_drops_unreachable_outlier(self):
+        opening = note(56, 3, 1)
+        nearby = {**note(63, 3, 8), "scoreOnsetQuarter": [1, 1], "onsetSeconds": .5}
+        outlier = {**note(76, 1, 11), "scoreOnsetQuarter": [1, 1], "onsetSeconds": .5}
+        result, report = optimize_fingerings(self.document([opening, nearby, outlier]))
+        selected = {item["soundingPitchMidi"]: (item["string"], item["fret"]) for item in result["notes"]}
+        self.assertEqual(selected[63], (2, 3))
+        self.assertNotIn(76, selected)
+        self.assertTrue(any(item["reason"] == "rapid_position_shift_unplayable" for item in report["removed"]))
+        self.assertEqual(report["maximumRapidPositionShift"], MAX_RAPID_POSITION_SHIFT)
 
 
 if __name__ == "__main__":

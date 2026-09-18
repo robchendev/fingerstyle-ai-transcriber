@@ -199,10 +199,32 @@ class ModelTests(unittest.TestCase):
         masks["bend_curve"][0, 1, 0] = True
         loss, stats = masked_loss(outputs, targets, masks, valid)
         self.assertTrue(torch.isfinite(loss))
-        self.assertEqual(stats["connection"]["count"], 1)
+        self.assertEqual(stats["connection_positive"]["count"], 1)
+        self.assertEqual(stats["connection_negative"]["count"], 0)
         self.assertEqual(stats["note_technique_positive"]["count"], 2)
         self.assertEqual(stats["note_technique_negative"]["count"], 2)
         self.assertEqual(stats["bend_curve"]["count"], 7)
+
+    def test_v3_loss_balances_legato_positives_against_many_negatives(self):
+        outputs = synthetic_outputs(1, 20, requires_grad=True, architecture_version=3)
+        targets, masks, valid = synthetic_targets(1, 20, architecture_version=2)
+        targets["connection"] = torch.zeros(1, 20, 6, dtype=torch.long)
+        masks["connection"] = torch.ones_like(targets["connection"], dtype=torch.bool)
+        targets["connection"][0, 0, 0] = 1
+        targets["note_technique"] = torch.zeros(1, 20, 6, 4)
+        masks["note_technique"] = torch.ones_like(targets["note_technique"], dtype=torch.bool)
+        targets["note_technique"][0, 0, 0, 0] = 1
+        targets["bend_curve"] = torch.zeros(1, 20, 6, 7)
+        masks["bend_curve"] = torch.zeros_like(targets["bend_curve"], dtype=torch.bool)
+        loss, stats = masked_loss(outputs, targets, masks, valid)
+        self.assertAlmostEqual(loss.item(), math.log(10) + math.log(2), places=6)
+        self.assertEqual(stats["connection_positive"]["count"], 1)
+        self.assertEqual(stats["connection_negative"]["count"], 119)
+        self.assertEqual(stats["note_technique_positive"]["count"], 1)
+        self.assertEqual(stats["note_technique_negative"]["count"], 479)
+        loss.backward()
+        self.assertLess(outputs["connection_logits"].grad[0, 0, 0, 1], 0)
+        self.assertLess(outputs["note_technique_logits"].grad[0, 0, 0, 0], 0)
 
     def test_padding_does_not_change_real_frames(self):
         model = FingerstyleTranscriber(ModelConfig(n_mels=9, hidden_size=8, recurrent_layers=1, dropout=0)).eval()
