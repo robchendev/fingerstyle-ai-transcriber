@@ -1,0 +1,5 @@
+av==18.1.0
+numpy>=2,<3
+mediapipe==1.0.1
+requests>=2.34,<3
+scipy>=1.14,<2
