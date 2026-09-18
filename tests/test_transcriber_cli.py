@@ -141,6 +141,28 @@ class HarnessCommandTests(unittest.TestCase):
         self.assertEqual(report["sourceArchitectureVersion"], 2)
         self.assertEqual(report["targetArchitectureVersion"], 3)
 
+    def test_v4_initialization_resets_corrected_heads_from_v2_and_v3(self):
+        from dataclasses import replace
+        from scripts.transcriber_model import FingerstyleTranscriber, ModelConfig
+
+        target_config = ModelConfig(architecture_version=4, hidden_size=4, recurrent_layers=1, n_mels=4)
+        for version in (2, 3):
+            source_config = replace(target_config, architecture_version=version)
+            source = FingerstyleTranscriber(source_config)
+            target = FingerstyleTranscriber(target_config)
+            corrected_before = target.heads["connection_logits"].weight.detach().clone()
+            checkpoint = {
+                "identity": {"model": asdict(source_config), "manifest_sha256": "manifest"},
+                "global_step": 100, "model_state": source.state_dict(),
+            }
+            with patch("scripts.transcriber_runtime.load_checkpoint", return_value=checkpoint), patch.object(transcriber, "sha256", return_value="hash"):
+                report = transcriber.initialize_model(target, target_config, "source.pt", "manifest")
+            self.assertEqual(report["targetArchitectureVersion"], 4)
+            self.assertEqual(report["sourceArchitectureVersion"], version)
+            self.assertFalse(report["optimizerStateImported"])
+            torch.testing.assert_close(target.conv1.weight, source.conv1.weight)
+            torch.testing.assert_close(target.heads["connection_logits"].weight, corrected_before)
+
     def test_event_evaluation_records_explicitly_selected_release_without_training(self):
         with TemporaryDirectory(dir=ROOT) as directory:
             root = Path(directory).resolve()
@@ -195,7 +217,7 @@ class HarnessCommandTests(unittest.TestCase):
         self.assertEqual(profile.connection_threshold, .8)
         self.assertEqual(profile.note_technique_threshold, .8)
         self.assertEqual(profile.chord_tolerance_seconds, .04)
-        self.assertEqual(profile.same_string_gap_seconds, .08)
+        self.assertEqual(profile.same_string_gap_seconds, 0.)
 
     def test_analyze_beats_cli_publishes_private_evidence(self):
         report = {"beatCount": 10, "downbeatCount": 3}
@@ -212,6 +234,48 @@ class HarnessCommandTests(unittest.TestCase):
                 ]), 0)
             track.assert_called_once_with(audio.resolve(), checkpoint.resolve(), device="cpu")
             self.assertEqual(read_json(root / "runs" / "beats.json"), report)
+
+    def test_hand_evidence_sidecar_is_bound_and_does_not_mutate_raw_predictions(self):
+        from copy import deepcopy
+        from scripts.dataset_io import sha256
+
+        with TemporaryDirectory(dir=ROOT) as directory:
+            root = Path(directory)
+            predictions = root / "predictions.json"
+            beats = root / "beats.json"
+            hints = root / "hints.json"
+            source = {"notes": [], "percussion": [], "audioSha256": "0" * 64}
+            publish_json(predictions, source)
+            publish_json(beats, {"audioSha256": "0" * 64})
+            observations = [{"scoreOnsetQuarter": [4, 1], "minimumFret": 6, "maximumFret": 10, "confidence": .9, "source": "visual-pilot:001"}]
+            evidence = {
+                "schemaVersion": 1, "kind": "hand-position-evidence", "audioSha256": "0" * 64,
+                "beatEvidenceSha256": sha256(beats), "evidenceType": "visual", "observations": observations,
+            }
+            publish_json(hints, evidence)
+            arguments = [
+                "export-gp", "--data-root", str(root), "--predictions", str(predictions),
+                "--beat-evidence", str(beats), "--hand-position-evidence", str(hints),
+                "--template", "template.gpt", "--full-output", "runs\\full.gp",
+                "--single-output", "runs\\single.gp",
+            ]
+            def fake_write(template, document, full, single, **kwargs):
+                self.assertEqual(document["handPositionEvidence"], observations)
+                full.parent.mkdir()
+                full.write_bytes(b"synthetic")
+                single.write_bytes(b"synthetic")
+                return {"fullVoices": {"measureCount": 1}, "singleVoice": {}}
+            original = deepcopy(source)
+            with patch("scripts.gp_output.write_gp_outputs", side_effect=fake_write), patch("sys.stdout", new=StringIO()):
+                self.assertEqual(transcriber.main(arguments), 0)
+            self.assertEqual(read_json(predictions), original)
+            saved = read_json(root / "runs" / "gp-output.json")
+            self.assertEqual(saved["handPositionEvidenceInput"]["evidenceType"], "visual")
+            evidence["audioSha256"] = "1" * 64
+            publish_json(hints, evidence)
+            with patch("scripts.gp_output.write_gp_outputs") as write, patch("sys.stderr", new=StringIO()):
+                self.assertEqual(transcriber.main(arguments), 1)
+                write.assert_not_called()
 
     def test_whole_audio_stitching_has_no_uncovered_or_duplicated_frame_positions(self):
         class ConstantModel(torch.nn.Module):

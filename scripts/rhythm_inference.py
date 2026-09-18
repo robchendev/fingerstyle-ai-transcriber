@@ -15,9 +15,9 @@ from .transcriber_audio import HarnessError
 
 TICKS_PER_QUARTER = 24
 GRID_STEPS = (24, 12, 8, 6, 4, 3)
-SUBDIVISION_COST = {24: 0, 12: 20, 8: 70, 6: 55, 4: 150, 3: 220}
+SUBDIVISION_COST = {24: 0, 12: 4, 8: 16, 6: 8, 4: 24, 3: 12}
 DURATION_VALUES = (
-    Fraction(1, 4), Fraction(1, 2), Fraction(3, 4), Fraction(1),
+    Fraction(1, 8), Fraction(1, 4), Fraction(1, 2), Fraction(3, 4), Fraction(1),
     Fraction(3, 2), Fraction(2), Fraction(3), Fraction(4),
     Fraction(6), Fraction(8), Fraction(12), Fraction(16),
 )
@@ -291,7 +291,7 @@ def _optimize_onsets(document, mapper):
     variables = []
     costs = []
     regimes = {}
-    triplet_selections = defaultdict(list)
+    triplet_selections = defaultdict(lambda: defaultdict(list))
     for index, seconds in enumerate(times):
         candidates = _candidate_ticks(mapper, seconds)
         tick = model.new_int_var_from_domain(cp_model.Domain.from_values([value[0] for value in candidates]), f"tick_{index}")
@@ -307,20 +307,30 @@ def _optimize_onsets(document, mapper):
             regime = regimes[beat]
             if position in (4, 8, 16, 20):
                 model.add(regime == 1).only_enforce_if(choice)
-                triplet_selections[beat].append(choice)
+                triplet_selections[beat][candidate_tick].append(choice)
             elif position not in (0,):
                 model.add(regime == 0).only_enforce_if(choice)
         variables.append(tick)
         costs.append(cost)
     for beat, regime in regimes.items():
-        selections = triplet_selections.get(beat, [])
-        if selections:
-            model.add(sum(selections) >= 2 * regime)
+        positions = triplet_selections.get(beat, {})
+        if positions:
+            distinct = []
+            for position, choices in positions.items():
+                used = model.new_bool_var(f"triplet_position_{position}")
+                model.add_max_equality(used, choices)
+                distinct.append(used)
+            model.add(sum(distinct) >= 2 * regime)
         else:
             model.add(regime == 0)
     for left, right in zip(variables, variables[1:]):
         model.add(right >= left)
-    model.minimize(sum(costs) + 100 * sum(regimes.values()))
+    by_time = dict(zip(times, variables))
+    for string in range(1, 7):
+        reattacks = sorted({float(note["onsetSeconds"]) for note in document["notes"] if note["string"] == string})
+        for left, right in zip(reattacks, reattacks[1:]):
+            model.add(by_time[right] > by_time[left])
+    model.minimize(sum(costs) + 8 * sum(regimes.values()))
     solver = cp_model.CpSolver()
     solver.parameters.max_deterministic_time = 30
     solver.parameters.num_search_workers = 1
@@ -352,6 +362,7 @@ def _optimize_onsets(document, mapper):
         "tripletBeatCount": sum(solver.value(value) for value in regimes.values()),
         "ticksPerQuarter": TICKS_PER_QUARTER,
         "candidateStepsTicks": list(GRID_STEPS),
+        "reattackPolicy": "Distinct same-string acoustic attacks cannot collapse onto one score position.",
     }
 
 
@@ -378,7 +389,7 @@ def _optimize_durations(document):
             def cost(duration):
                 difference = abs(math.log1p(float(duration)) - math.log1p(float(predicted)))
                 endpoint = onset + duration
-                metric = 0 if endpoint.denominator == 1 else 8 if (endpoint * 2).denominator == 1 else 20
+                metric = 0 if endpoint.denominator == 1 else 1 if (endpoint * 2).denominator == 1 else 2
                 long_tie = max(0, math.ceil(float(duration) / 4) - 1) * 3
                 return difference * 100 + metric + long_tie
 
@@ -424,6 +435,10 @@ def infer_notated_timing(document, evidence, *, include_unsupported_tail=False):
     raw_end = mapper.quarter_at(score_end_seconds)
     end = Fraction(math.ceil(float(raw_end) * TICKS_PER_QUARTER), TICKS_PER_QUARTER)
     durations["scoreAudioEndQuarter"] = [end.numerator, end.denominator]
+    durations["scoreTimeAnchors"] = [
+        {"scoreQuarter": float(quarter), "audioSeconds": float(seconds)}
+        for quarter, seconds in zip(mapper.anchor_quarters, mapper.anchor_seconds)
+    ]
     durations["notatedTimeSignatureChanges"] = [{
         "scoreQuarter": list(_round_score_position(mapper.quarter_at(event["timeSeconds"]))),
         "timeSignature": event["timeSignature"],
@@ -462,3 +477,25 @@ def infer_notated_timing(document, evidence, *, include_unsupported_tail=False):
 def _round_score_position(value):
     result = Fraction(round(float(value) * TICKS_PER_QUARTER), TICKS_PER_QUARTER)
     return result.numerator, result.denominator
+
+
+def score_seconds_at(document, quarter):
+    anchors = document.get("scoreTimeAnchors")
+    if not isinstance(anchors, list) or len(anchors) < 2:
+        raise HarnessError("Missing score/audio anchors for a newly inferred score position; run beat-based rhythm inference.")
+    if any(not isinstance(point, dict) or not {"scoreQuarter", "audioSeconds"} <= point.keys() for point in anchors):
+        raise HarnessError("Score/audio anchors require scoreQuarter and audioSeconds.")
+    quarters = [_finite(point["scoreQuarter"], "Score anchor") for point in anchors]
+    seconds = [_finite(point["audioSeconds"], "Audio anchor") for point in anchors]
+    if any(a >= b for a, b in zip(quarters, quarters[1:])) or any(a >= b for a, b in zip(seconds, seconds[1:])):
+        raise HarnessError("Score/audio anchors must be strictly increasing.")
+    value = float(quarter)
+    if value < quarters[0]:
+        time = seconds[0] + (value - quarters[0]) * (seconds[1] - seconds[0]) / (quarters[1] - quarters[0])
+    elif value > quarters[-1]:
+        time = seconds[-1] + (value - quarters[-1]) * (seconds[-1] - seconds[-2]) / (quarters[-1] - quarters[-2])
+    else:
+        time = float(np.interp(value, quarters, seconds))
+    if time < 0:
+        raise HarnessError("Inferred score position precedes the supplied audio.")
+    return time

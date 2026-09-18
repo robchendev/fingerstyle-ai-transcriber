@@ -9,7 +9,7 @@ This module neither trains a model nor writes notation or downloads weights.
 
 from bisect import bisect_left
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import math
 from numbers import Integral, Real
 from typing import TypedDict
@@ -20,7 +20,10 @@ from torch.nn import functional as F
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 from .technique_supervision import TECHNIQUE_DIRECTIONS, TECHNIQUE_TYPES
-from .connection_supervision import BEND_FIELDS, CONNECTION_TYPES, NOTE_TECHNIQUE_TYPES
+from .connection_supervision import (
+    BEND_FIELDS, CONNECTION_TYPES, GRACE_MODES, NOTE_TECHNIQUE_TYPES,
+    RELATION_TYPES, SUPERVISION_VERSION, V4_NOTE_TECHNIQUE_TYPES, vocabularies,
+)
 
 
 PERCUSSION_TYPES = ("wrist_thump", "thumb_slap", "percussive_hit")
@@ -50,6 +53,11 @@ LOSS_WEIGHTS = {
     "note_technique_positive": 2.0,
     "note_technique_negative": 1.0,
     "bend_curve": 0.5,
+    "grace_positive": 2.0,
+    "grace_negative": 1.0,
+    "grace_fret": 1.0,
+    "grace_mode": 0.5,
+    "grace_transition": 1.0,
 }
 LOSS_STAT_KEYS = (
     "note_onset_positive", "note_onset_negative", "fret", "pitch", "voice",
@@ -60,6 +68,7 @@ LOSS_STAT_KEYS = (
     "connection_positive", "connection_negative",
     "note_technique_positive", "note_technique_negative",
     "bend_curve",
+    "grace_positive", "grace_negative", "grace_fret", "grace_mode", "grace_transition",
 )
 _BASE_HEADS = {
     "note_onset": "note_onset_logits",
@@ -82,8 +91,13 @@ _CONNECTION_HEADS = {
     "note_technique": "note_technique_logits",
     "bend_curve": "bend_curve",
 }
-_HEADS = {**_BASE_HEADS, **_TECHNIQUE_HEADS, **_CONNECTION_HEADS}
-_CATEGORICAL = ("fret", "pitch", "voice", "harmonic_kind", "harmonic_node", "technique_direction", "connection")
+_GRACE_HEADS = {
+    "grace": "grace_logits", "grace_fret": "grace_fret_logits",
+    "grace_mode": "grace_mode_logits", "grace_transition": "grace_transition_logits",
+}
+_HEADS = {**_BASE_HEADS, **_TECHNIQUE_HEADS, **_CONNECTION_HEADS, **_GRACE_HEADS}
+_CATEGORICAL = ("fret", "pitch", "voice", "harmonic_kind", "harmonic_node", "technique_direction", "connection",
+                "grace_fret", "grace_mode", "grace_transition")
 
 
 class LossStat(TypedDict):
@@ -135,8 +149,8 @@ class ModelConfig:
     def __post_init__(self) -> None:
         for name in ("architecture_version", "n_mels", "hidden_size", "recurrent_layers", "max_voices"):
             _integer(name, getattr(self, name), 1)
-        if self.architecture_version not in (1, 2, 3):
-            raise ValueError("architecture_version must be 1, 2, or 3")
+        if self.architecture_version not in (1, 2, 3, 4):
+            raise ValueError("architecture_version must be 1, 2, 3, or 4")
         _integer("conditioning_dim", self.conditioning_dim, 12, 12)
         _integer("max_fret", self.max_fret, 0, 127)
         _real("dropout", self.dropout, 0, 1)
@@ -188,10 +202,17 @@ class FingerstyleTranscriber(nn.Module):
                 "technique_strings_logits": (len(TECHNIQUE_TYPES), 6),
             })
         if config.architecture_version >= 3:
+            connections, note_techniques = vocabularies(config.architecture_version)
             self.head_shapes.update({
-                "connection_logits": (6, len(CONNECTION_TYPES)),
-                "note_technique_logits": (6, len(NOTE_TECHNIQUE_TYPES)),
+                "connection_logits": (6, len(connections)),
+                "note_technique_logits": (6, len(note_techniques)),
                 "bend_curve": (6, len(BEND_FIELDS)),
+            })
+        if config.architecture_version == 4:
+            self.head_shapes.update({
+                "grace_logits": (6,), "grace_fret_logits": (6, config.max_fret + 1),
+                "grace_mode_logits": (6, len(GRACE_MODES)),
+                "grace_transition_logits": (6, len(RELATION_TYPES)),
             })
         self.heads = nn.ModuleDict({
             name: nn.Linear(2 * config.hidden_size, math.prod(shape))
@@ -234,6 +255,37 @@ class FingerstyleTranscriber(nn.Module):
         return outputs
 
 
+def initialize_v4_from_model(model, source):
+    """Explicit transfer, never resume or reinterpret v3 slide-class rows."""
+    if not isinstance(model, FingerstyleTranscriber) or not isinstance(source, FingerstyleTranscriber):
+        raise TypeError("Transfer requires FingerstyleTranscriber model instances.")
+    if model.config.architecture_version != 4 or source.config.architecture_version not in (2, 3):
+        raise ValueError("Corrected transfer supports architecture v2/v3 to a fresh v4 model only.")
+    expected, actual = asdict(model.config), asdict(source.config)
+    expected.pop("architecture_version")
+    actual.pop("architecture_version")
+    if expected != actual:
+        raise ValueError("Transfer requires identical non-version model configuration.")
+    reset = ("heads.connection_logits.", "heads.note_technique_logits.", "heads.bend_curve.", "heads.grace")
+    state = model.state_dict()
+    copied = []
+    for name, value in source.state_dict().items():
+        if name.startswith(reset):
+            continue
+        if name not in state or state[name].shape != value.shape:
+            raise ValueError(f"Incompatible transfer parameter: {name}")
+        state[name] = value
+        copied.append(name)
+    model.load_state_dict(state, strict=True)
+    return {
+        "sourceArchitectureVersion": source.config.architecture_version,
+        "targetArchitectureVersion": 4, "supervisionVersion": SUPERVISION_VERSION,
+        "copiedParameters": copied,
+        "resetHeads": ["connection_logits", "note_technique_logits", "bend_curve", *_GRACE_HEADS.values()],
+        "optimizerTransferred": False,
+    }
+
+
 def _validate_outputs(outputs: Mapping[str, Tensor], *, batched: bool) -> tuple[int, ...]:
     if not isinstance(outputs, Mapping):
         raise TypeError("outputs must be a mapping of head names to tensors")
@@ -244,6 +296,10 @@ def _validate_outputs(outputs: Mapping[str, Tensor], *, batched: bool) -> tuple[
     present_connection = set(_CONNECTION_HEADS.values()) & outputs.keys()
     if present_connection:
         heads.update(_CONNECTION_HEADS)
+    present_grace = set(_GRACE_HEADS.values()) & outputs.keys()
+    if present_grace:
+        heads.update(_CONNECTION_HEADS)
+        heads.update(_GRACE_HEADS)
     missing = set(heads.values()) - outputs.keys()
     if missing:
         raise ValueError(f"outputs missing heads: {sorted(missing)}")
@@ -270,10 +326,17 @@ def _validate_outputs(outputs: Mapping[str, Tensor], *, batched: bool) -> tuple[
             "technique_strings_logits": (len(TECHNIQUE_TYPES), 6),
         })
     if present_connection:
+        connections, note_techniques = vocabularies(4 if present_grace else 3)
         shapes.update({
-            "connection_logits": (6, len(CONNECTION_TYPES)),
-            "note_technique_logits": (6, len(NOTE_TECHNIQUE_TYPES)),
+            "connection_logits": (6, len(connections)),
+            "note_technique_logits": (6, len(note_techniques)),
             "bend_curve": (6, len(BEND_FIELDS)),
+        })
+    if present_grace:
+        shapes.update({
+            "grace_logits": (6,), "grace_fret_logits": (6, outputs["fret_logits"].shape[-1]),
+            "grace_mode_logits": (6, len(GRACE_MODES)),
+            "grace_transition_logits": (6, len(RELATION_TYPES)),
         })
     for name in ("fret_logits", "voice_logits"):
         value = outputs[name]
@@ -318,6 +381,8 @@ def masked_loss(outputs: Mapping[str, Tensor], targets: Mapping[str, Tensor], ma
         active_heads.update(_TECHNIQUE_HEADS)
     if "connection_logits" in outputs:
         active_heads.update(_CONNECTION_HEADS)
+    if "grace_logits" in outputs:
+        active_heads.update(_GRACE_HEADS)
     for label, mapping in (("targets", targets), ("masks", masks)):
         missing = set(active_heads) - mapping.keys()
         if missing:
@@ -331,7 +396,7 @@ def masked_loss(outputs: Mapping[str, Tensor], targets: Mapping[str, Tensor], ma
         elif name == "technique_strings":
             tail = (len(TECHNIQUE_TYPES), 6)
         elif name == "note_technique":
-            tail = (6, len(NOTE_TECHNIQUE_TYPES))
+            tail = tuple(outputs["note_technique_logits"].shape[-2:])
         elif name == "bend_curve":
             tail = (6, len(BEND_FIELDS))
         else:
@@ -490,6 +555,16 @@ def masked_loss(outputs: Mapping[str, Tensor], targets: Mapping[str, Tensor], ma
         if mask.any().item():
             values = F.smooth_l1_loss(outputs["bend_curve"][mask], targets["bend_curve"][mask], reduction="none")
             loss = loss + LOSS_WEIGHTS["bend_curve"] * term("bend_curve", values)
+    if "grace" in active_heads:
+        components = []
+        for value, suffix in ((1, "positive"), (0, "negative")):
+            mask = effective["grace"] & (targets["grace"] == value)
+            if mask.any().item():
+                name = f"grace_{suffix}"
+                values = F.binary_cross_entropy_with_logits(outputs["grace_logits"][mask], targets["grace"][mask], reduction="none")
+                components.append((term(name, values), LOSS_WEIGHTS[name]))
+        if components:
+            loss = loss + sum(mean * weight for mean, weight in components) / sum(weight for _, weight in components)
     return loss, stats
 
 
@@ -523,6 +598,7 @@ def decode_events(outputs: Mapping[str, Tensor], frame_seconds: Tensor | Sequenc
                   tuning: Sequence[int], capo: int, onset_threshold: float = 0.5,
                   percussion_threshold: float = 0.5, harmonic_threshold: float = 0.5,
                   technique_threshold: float = 0.5,
+                  connection_threshold: float = 0.5, grace_threshold: float = 0.5,
                   min_gap_seconds: float = 0.04, max_duration_quarter: float = 64) -> dict:
     """Decode the complete unbatched timeline into hypotheses, never GP output.
 
@@ -532,7 +608,8 @@ def decode_events(outputs: Mapping[str, Tensor], frame_seconds: Tensor | Sequenc
     Below-threshold harmonic/percussion scores are not confirmed absence.
     """
     for name, value in (("onset_threshold", onset_threshold), ("percussion_threshold", percussion_threshold),
-                        ("harmonic_threshold", harmonic_threshold), ("technique_threshold", technique_threshold)):
+                        ("harmonic_threshold", harmonic_threshold), ("technique_threshold", technique_threshold),
+                        ("connection_threshold", connection_threshold), ("grace_threshold", grace_threshold)):
         _real(name, value, 0, 1)
     _real("min_gap_seconds", min_gap_seconds, 0)
     _real("max_duration_quarter", max_duration_quarter, 0)
@@ -565,6 +642,8 @@ def decode_events(outputs: Mapping[str, Tensor], frame_seconds: Tensor | Sequenc
     harmonics = values["harmonic_logits"].sigmoid()
     percussion = values["percussion_logits"].sigmoid()
     categories = {name: values[_HEADS[name]].argmax(-1) for name in _CATEGORICAL if _HEADS[name] in values}
+    version4 = "grace_logits" in values
+    connections, note_techniques = vocabularies(4 if version4 else 3)
     notes = []
     duration_limit_log = math.log1p(max_duration_quarter)
 
@@ -606,17 +685,41 @@ def decode_events(outputs: Mapping[str, Tensor], frame_seconds: Tensor | Sequenc
         if "connection_logits" in values:
             connection_scores = values["connection_logits"][frame, axis].softmax(-1)
             connection_index = int(categories["connection"][frame, axis])
-            result["connection"] = CONNECTION_TYPES[connection_index]
+            result["connection"] = connections[connection_index]
             result["connectionConfidence"] = float(connection_scores[connection_index])
+            if version4 and connection_index and result["connectionConfidence"] < connection_threshold:
+                result["connection"] = "none"
             technique_scores = values["note_technique_logits"][frame, axis].sigmoid()
             result["noteTechniques"] = {
                 name: float(technique_scores[index])
-                for index, name in enumerate(NOTE_TECHNIQUE_TYPES)
+                for index, name in enumerate(note_techniques)
             }
             result["bendCurve"] = {
                 field: float(values["bend_curve"][frame, axis, index].clamp(0, 1) * 100)
                 for index, field in enumerate(BEND_FIELDS)
             }
+            if version4:
+                result["techniqueSchemaVersion"] = 4
+                result["grace"] = None
+                grace_confidence = float(values["grace_logits"][frame, axis].sigmoid())
+                result["graceConfidence"] = grace_confidence
+                if grace_confidence >= grace_threshold:
+                    source_fret = int(categories["grace_fret"][frame, axis])
+                    source_pitch = int(tuning[axis]) + int(capo) + source_fret
+                    mode = int(categories["grace_mode"][frame, axis])
+                    transition = int(categories["grace_transition"][frame, axis])
+                    result["grace"] = {
+                        "confidence": grace_confidence, "sourceFret": source_fret,
+                        "sourcePitchMidi": source_pitch, "intervalSemitones": pitch - source_pitch,
+                        "mode": GRACE_MODES[mode], "transition": RELATION_TYPES[transition],
+                        "fretConfidence": float(values["grace_fret_logits"][frame, axis].softmax(-1)[source_fret]),
+                        "modeConfidence": float(values["grace_mode_logits"][frame, axis].softmax(-1)[mode]),
+                        "transitionConfidence": float(values["grace_transition_logits"][frame, axis].softmax(-1)[transition]),
+                        "onsetSeconds": None, "timingKnown": False,
+                    }
+                    uncertainty.append("grace_audio_timing_unknown")
+                    if source_pitch > 127:
+                        uncertainty.append("grace_source_pitch_outside_midi_range")
         return result
 
     for axis in range(6):
@@ -664,11 +767,44 @@ def decode_events(outputs: Mapping[str, Tensor], frame_seconds: Tensor | Sequenc
                     if not 0 <= feasible_fret <= 24:
                         continue
                     confidence = min(float(technique_scores[frame, axis]), membership_score)
-                    notes.append(note_at(
+                    completed = note_at(
                         frame, string_axis, confidence,
                         ("technique_membership_completed_attack",),
-                    ))
+                    )
+                    completed["completionParent"] = {
+                        "technique": technique, "onsetSeconds": float(seconds[frame]),
+                    }
+                    notes.append(completed)
     notes.sort(key=lambda note: (note["onsetSeconds"], -note["string"]))
+    if version4:
+        # Resolve after full-span decoding, never independently per window.
+        prior_notes = {}
+        id_counts = {}
+        for note in notes:
+            identifier = f"decoded-note:{note['onsetSeconds'].hex()}:s{note['string']}:v{note['voiceIndex']}"
+            ordinal = id_counts.get(identifier, 0)
+            id_counts[identifier] = ordinal + 1
+            note["noteId"] = f"{identifier}:{ordinal}"
+            if note["grace"] is not None:
+                note["grace"]["anchorNoteId"] = note["noteId"]
+            key = note["string"], note["voiceIndex"]
+            prior = prior_notes.get(key)
+            note["connectionOrigin"] = None
+            note["connectionOriginNoteId"] = None
+            if note["connection"] != "none":
+                interval = note["soundingPitchMidi"] - prior["soundingPitchMidi"] if prior is not None else 0
+                valid = prior is not None and prior["onsetSeconds"] < note["onsetSeconds"] and note["grace"] is None and (
+                    interval > 0 if note["connection"] == "hammer_on"
+                    else interval < 0 if note["connection"] == "pull_off" else interval != 0
+                )
+                if valid:
+                    note["connectionOriginNoteId"] = prior["noteId"]
+                    note["connectionOrigin"] = {
+                        field: prior[field] for field in ("noteId", "onsetSeconds", "string", "voiceIndex", "soundingPitchMidi", "fret")
+                    }
+                else:
+                    note["uncertainty"].append("connection_origin_unresolved")
+            prior_notes[key] = note
     gestures.sort(key=lambda gesture: (gesture["onsetSeconds"], PERCUSSION_TYPES.index(gesture["technique"])))
     techniques.sort(key=lambda event: (event["onsetSeconds"], TECHNIQUE_TYPES.index(event["technique"])))
     return {
@@ -676,6 +812,7 @@ def decode_events(outputs: Mapping[str, Tensor], frame_seconds: Tensor | Sequenc
         "percussion": gestures,
         **({"techniques": techniques} if "technique_logits" in values else {}),
         "policy": {
+            **({"techniqueSupervision": SUPERVISION_VERSION} if version4 else {}),
             "output": "musical-event-hypotheses-only; no notation writer",
             "stringAxis": "physical-6-to-1",
             "confidence": "uncalibrated model scores, not reliable probabilities",

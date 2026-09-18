@@ -38,12 +38,59 @@ class DraftCleanupTests(unittest.TestCase):
         before = deepcopy(document)
         cleaned, report = clean_hypotheses(document)
         self.assertEqual(document, before)
-        self.assertEqual([(value["onsetSeconds"], value["string"]) for value in cleaned["notes"]], [(1.02, 5), (1.06, 6)])
-        self.assertEqual(cleaned["percussion"], [{"onsetSeconds": 1.02, "technique": "thumb_slap", "confidence": 0.7}])
+        self.assertEqual([(value["onsetSeconds"], value["string"]) for value in cleaned["notes"]], [(1., 6), (1., 5), (1.03, 6), (1.06, 6)])
+        self.assertEqual(cleaned["percussion"], [{"onsetSeconds": 1., "technique": "thumb_slap", "confidence": 0.7}])
         self.assertEqual(report["sourceCounts"], {"notes": 5, "percussion": 3})
-        self.assertEqual(report["retainedCounts"], {"notes": 2, "percussion": 1})
+        self.assertEqual(report["retainedCounts"], {"notes": 4, "percussion": 1})
         self.assertAlmostEqual(report["maximumOnsetClusterDisplacementSeconds"], 0.02)
         self.assertFalse(report["rawHypothesesModified"])
+
+    def test_repeated_32nds_survive_at_multiple_tempos_and_exact_duplicates_do_not(self):
+        for bpm in (60, 122, 240, 320):
+            step = 60 / bpm / 8
+            document = {"notes": [note(index * step, string, .99) for index in range(4) for string in (6, 4)], "percussion": []}
+            document["notes"].append(note(0, 6, .95))
+            result, report = clean_hypotheses(document)
+            self.assertEqual(len(result["notes"]), 8)
+            self.assertEqual(sorted({n["onsetSeconds"] for n in result["notes"]}), [index * step for index in range(4)])
+            self.assertEqual(report["removedNoteCount"], 1)
+
+    def test_fast_alternating_strings_are_not_misread_as_one_chord(self):
+        document = {
+            "metadata": {"tempo": {"bpm": 240, "beatUnit": [1, 4]}, "timeSignature": [4, 4]},
+            "notes": [note(0, 6, .99), note(.03125, 5, .99)], "percussion": [],
+        }
+        result, report = clean_hypotheses(document)
+        self.assertEqual([n["onsetSeconds"] for n in result["notes"]], [0, .03125])
+        self.assertEqual(report["effectiveChordGroupingSeconds"], .015625)
+
+    def test_simultaneous_different_pitches_on_provisional_string_are_retained(self):
+        document = {
+            "notes": [note(0, 6, .99), {**note(0, 6, .98), "soundingPitchMidi": 45}],
+            "percussion": [],
+        }
+        result, report = clean_hypotheses(document)
+        self.assertEqual([n["soundingPitchMidi"] for n in result["notes"]], [40, 45])
+        self.assertEqual(report["removedNoteCount"], 0)
+
+    def test_weak_member_uses_calibrated_parent_not_independent_attack_threshold(self):
+        document = {
+            "notes": [note(0, 6, .65, uncertainty=("technique_membership_completed_attack",))],
+            "percussion": [],
+            "techniques": [{
+                "onsetSeconds": 0, "technique": "brush", "confidence": .95,
+                "strings": [6], "stringMembershipConfidence": {str(i): .65 if i == 6 else .1 for i in range(1, 7)},
+            }],
+        }
+        cleaned, _ = clean_hypotheses(document)
+        self.assertEqual(len(cleaned["notes"]), 1)
+        document["techniques"][0]["confidence"] = .85
+        cleaned, _ = clean_hypotheses(document)
+        self.assertEqual(cleaned["notes"], [])
+        document["techniques"][0]["confidence"] = .95
+        document["notes"][0]["completionParent"] = {"technique": "arpeggio", "onsetSeconds": 0}
+        cleaned, _ = clean_hypotheses(document)
+        self.assertEqual(cleaned["notes"], [])
 
     def test_uncalibrated_harmonics_are_removed_but_note_is_retained(self):
         harmonic = {"type": "Natural", "fret": 12, "confidence": 0.999}

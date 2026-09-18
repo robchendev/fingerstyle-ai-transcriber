@@ -32,9 +32,14 @@ def synthetic_outputs(batch=2, frames=5, *, requires_grad=False, architecture_ve
         })
     if architecture_version >= 3:
         shapes.update({
-            "connection_logits": (6, 10),
-            "note_technique_logits": (6, 4),
+            "connection_logits": (6, 5 if architecture_version == 4 else 10),
+            "note_technique_logits": (6, 8 if architecture_version == 4 else 4),
             "bend_curve": (6, 7),
+        })
+    if architecture_version == 4:
+        shapes.update({
+            "grace_logits": (6,), "grace_fret_logits": (6, 37),
+            "grace_mode_logits": (6, 2), "grace_transition_logits": (6, 5),
         })
     return {name: torch.zeros(batch, frames, *shape, requires_grad=requires_grad) for name, shape in shapes.items()}
 
@@ -66,6 +71,8 @@ def event_outputs(frames, *, architecture_version=1):
         outputs["technique_strings_logits"].fill_(-12)
     if "note_technique_logits" in outputs:
         outputs["note_technique_logits"].fill_(-12)
+    if "grace_logits" in outputs:
+        outputs["grace_logits"].fill_(-12)
     outputs["duration_log"].fill_(math.log1p(1))
     return outputs
 
@@ -94,7 +101,7 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(ModelConfig(**json.loads(json.dumps(asdict(config)))), config)
         with self.assertRaises(FrozenInstanceError):
             config.max_fret = 10
-        for options in ({"architecture_version": 0}, {"architecture_version": 4}, {"n_mels": 0}, {"conditioning_dim": 11}, {"hidden_size": 0},
+        for options in ({"architecture_version": 0}, {"architecture_version": 5}, {"n_mels": 0}, {"conditioning_dim": 11}, {"hidden_size": 0},
                         {"recurrent_layers": -1}, {"max_fret": -1}, {"max_fret": 128},
                         {"max_voices": 0}, {"dropout": 1}, {"dropout": -1}, {"dropout": float("nan")}):
             with self.subTest(options=options), self.assertRaises(ValueError):
@@ -605,6 +612,12 @@ class EventDecoderTests(unittest.TestCase):
             [(6, 40), (4, 50), (1, 64)],
         )
         self.assertTrue(all("technique_membership_completed_attack" in note["uncertainty"] for note in decoded["notes"]))
+        self.assertTrue(all(note["completionParent"] == {
+            "technique": decoded["techniques"][0]["technique"], "onsetSeconds": .02,
+        } for note in decoded["notes"]))
+        outputs["note_onset_logits"][1, 0] = 8
+        independent = self.decode(outputs, [0, .02, .04])
+        self.assertNotIn("completionParent", next(note for note in independent["notes"] if note["string"] == 6))
 
     def test_v3_decodes_connection_note_techniques_and_bend_curve(self):
         outputs = event_outputs(3, architecture_version=3)

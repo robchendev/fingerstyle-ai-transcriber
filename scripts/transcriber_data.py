@@ -88,20 +88,25 @@ def training_conditioning(record, clip_times):
 def encode_targets(window, canonical, frame_times, model_config, *, negative_onsets_allowed):
     from .transcriber_model import HARMONIC_FRETS, HARMONIC_TYPES, PERCUSSION_TYPES
     from .technique_supervision import TECHNIQUE_DIRECTIONS, TECHNIQUE_TYPES
-    from .connection_supervision import BEND_FIELDS, CONNECTION_TYPES, NOTE_TECHNIQUE_TYPES
+    from .connection_supervision import BEND_FIELDS, GRACE_MODES, RELATION_TYPES, vocabularies
 
     count = len(frame_times)
     targets = {name: torch.zeros((count, 6), dtype=torch.long if name in {"fret", "pitch", "voice", "harmonic_kind", "harmonic_node"} else torch.float32) for name in ("note_onset", "fret", "pitch", "voice", "duration_log", "harmonic", "harmonic_kind", "harmonic_node")}
     targets["percussion"] = torch.zeros((count, len(PERCUSSION_TYPES)))
     architecture_version = getattr(model_config, "architecture_version", 1)
+    connection_types, note_technique_types = vocabularies(architecture_version)
     if architecture_version >= 2:
         targets["technique"] = torch.zeros((count, len(TECHNIQUE_TYPES)))
         targets["technique_direction"] = torch.zeros((count, len(TECHNIQUE_TYPES)), dtype=torch.long)
         targets["technique_strings"] = torch.zeros((count, len(TECHNIQUE_TYPES), 6))
     if architecture_version >= 3:
         targets["connection"] = torch.zeros((count, 6), dtype=torch.long)
-        targets["note_technique"] = torch.zeros((count, 6, len(NOTE_TECHNIQUE_TYPES)))
+        targets["note_technique"] = torch.zeros((count, 6, len(note_technique_types)))
         targets["bend_curve"] = torch.zeros((count, 6, len(BEND_FIELDS)))
+    if architecture_version == 4:
+        targets["grace"] = torch.zeros((count, 6))
+        for name in ("grace_fret", "grace_mode", "grace_transition"):
+            targets[name] = torch.zeros((count, 6), dtype=torch.long)
     masks = {name: torch.zeros_like(value, dtype=torch.bool) for name, value in targets.items()}
     hop = frame_times[1] - frame_times[0] if count > 1 else .02
     valid_interior = (frame_times >= .5) & (frame_times < frame_times[-1] - .5)
@@ -207,19 +212,60 @@ def encode_targets(window, canonical, frame_times, model_config, *, negative_ons
         connection_events = window["targets"].get("connections", [])
         if not isinstance(connection_events, list):
             raise HarnessError("Connection targets must be a list.")
+        event_slots = {}
         for event in connection_events:
+            onset = event["onsetWindowSeconds"]
+            if not np.isfinite(onset) or not 0 <= onset <= frame_times[-1] + hop or type(event["string"]) is not int or not 1 <= event["string"] <= 6:
+                raise HarnessError("A connection target lies outside its window or string range.")
             index = int(np.argmin(np.abs(frame_times - event["onsetWindowSeconds"])))
             axis = 6 - event["string"]
-            if event["supervisionMask"]["connection"]:
-                targets["connection"][index, axis] = CONNECTION_TYPES.index(event["connection"])
+            event_slots.setdefault((index, axis), []).append(event)
+        for (index, axis), connection_events_at_slot in event_slots.items():
+            event = connection_events_at_slot[0]
+            if architecture_version == 4:
+                if any(item.get("techniqueSchemaVersion") != 4 for item in connection_events_at_slot):
+                    raise HarnessError("Architecture v4 requires separately versioned connection supervision.")
+                attacks = events.get((index, axis), [])
+                if len(connection_events_at_slot) != 1 or len(attacks) != 1 or attacks[0]["sourceNoteId"] != event["sourceNoteId"]:
+                    continue
+            connection_known = event["supervisionMask"]["connection"]
+            if architecture_version == 4 and connection_known and event["connection"] != "none":
+                origin = event["origin"]
+                origin_onset = origin["proposedOnsetClipSeconds"] - event["proposedOnsetClipSeconds"] + event["onsetWindowSeconds"]
+                origin_index = int(np.argmin(np.abs(frame_times - origin_onset)))
+                origin_attacks = events.get((origin_index, axis), [])
+                connection_known = len(origin_attacks) == 1 and origin_attacks[0]["sourceNoteId"] == origin["sourceNoteId"]
+            if connection_known:
+                targets["connection"][index, axis] = connection_types.index(event["connection"])
                 masks["connection"][index, axis] = True
             if event["supervisionMask"]["techniques"]:
-                masks["note_technique"][index, axis] = True
+                masks["note_technique"][index, axis] = torch.tensor([
+                    event.get("techniqueMasks", {}).get(name, architecture_version < 4)
+                    for name in note_technique_types
+                ])
                 for name, present in event["techniques"].items():
-                        targets["note_technique"][index, axis, NOTE_TECHNIQUE_TYPES.index(name)] = int(present)
-            if event["bendCurveMask"]:
+                    targets["note_technique"][index, axis, note_technique_types.index(name)] = int(present)
+            if event["supervisionMask"]["bendCurve"]:
                 targets["bend_curve"][index, axis] = torch.tensor(event["bendCurve"], dtype=torch.float32) / 100
                 masks["bend_curve"][index, axis] = True
+            if architecture_version == 4:
+                grace = event["grace"]
+                targets["grace"][index, axis] = int(grace is not None)
+                masks["grace"][index, axis] = event["supervisionMask"]["grace"]
+                if grace is not None:
+                    for name, value in (
+                        ("fret", grace["sourceFret"]), ("mode", grace["mode"]),
+                        ("transition", grace["transition"]),
+                    ):
+                        if not event["supervisionMask"]["graceAttributes"][name]:
+                            continue
+                        if name == "fret":
+                            if type(value) is not int or not 0 <= value <= model_config.max_fret:
+                                raise HarnessError("Grace source fret is outside the model vocabulary.")
+                        else:
+                            value = (GRACE_MODES if name == "mode" else RELATION_TYPES).index(value)
+                        targets[f"grace_{name}"][index, axis] = value
+                        masks[f"grace_{name}"][index, axis] = True
     percussion_events = []
     for gesture in window["targets"]["gestures"]:
         source = source_gestures[gesture["sourceGestureId"]]
@@ -354,7 +400,10 @@ class TrainingDataset(Dataset):
             if model_config.architecture_version >= 3:
                 from .connection_supervision import projected_connections
 
-                record["connections"] = projected_connections(labels, payload["candidate"], ScoreClock(labels, payload["normalization"]))
+                record["connections"] = projected_connections(
+                    labels, payload["candidate"], ScoreClock(labels, payload["normalization"]),
+                    architecture_version=model_config.architecture_version,
+                )
             self.records.append(record)
             self.windows.extend((record, window) for window in payload["windows"])
         if len(self.windows) != manifest["counts"]["windowsBySplit"][split]:

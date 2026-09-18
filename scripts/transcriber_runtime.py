@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .connection_supervision import CONNECTION_TYPES, NOTE_TECHNIQUE_TYPES
+from .connection_supervision import CONNECTION_TYPES, V4_NOTE_TECHNIQUE_TYPES, vocabularies
 from torch.utils.data import BatchSampler, DataLoader, SequentialSampler
 
 
@@ -29,12 +29,20 @@ _TECHNIQUE_STATS = ("technique_positive", "technique_negative")
 _TECHNIQUE_STRING_STATS = ("technique_strings_positive", "technique_strings_negative")
 _CONNECTION_STATS = ("connection_positive", "connection_negative")
 _NOTE_TECHNIQUE_STATS = ("note_technique_positive", "note_technique_negative")
+_GRACE_STATS = ("grace_positive", "grace_negative")
+_CALIBRATION_THRESHOLDS = (.25, .5, .75, .9)
+_CALIBRATION_TASKS = (
+    *(f"connection:{name}" for name in CONNECTION_TYPES[1:]),
+    *(f"note_technique:{name}" for name in V4_NOTE_TECHNIQUE_TYPES),
+    "grace",
+)
 _LOSS_STAT_KEYS = (
     *_NOTE_ONSET_STATS, "fret", "pitch", "voice", "duration_log", "harmonic_positive",
     "harmonic_kind", "harmonic_node", *_PERCUSSION_STATS, "harmonic_sparsity", "percussion_sparsity",
     *_TECHNIQUE_STATS, "technique_direction", *_TECHNIQUE_STRING_STATS,
     *_CONNECTION_STATS, *_NOTE_TECHNIQUE_STATS,
     "bend_curve",
+    *_GRACE_STATS, "grace_fret", "grace_mode", "grace_transition",
 )
 _CHECKPOINT_KEYS = {
     "schema_version", "run_id", "identity", "training_config", "runtime", "model_state",
@@ -567,15 +575,15 @@ def _objective(stats, weights, sparsity_weight):
                 loss += sum(stats[key]["sum"] * _stat_weight(key, weights) for key in observed) / sum(
                     stats[key]["count"] * _stat_weight(key, weights) for key in observed
                 )
-        elif name in ("connection_positive", "note_technique_positive"):
-            group = _CONNECTION_STATS if name == "connection_positive" else _NOTE_TECHNIQUE_STATS
+        elif name in ("connection_positive", "note_technique_positive", "grace_positive"):
+            group = {"connection_positive": _CONNECTION_STATS, "note_technique_positive": _NOTE_TECHNIQUE_STATS, "grace_positive": _GRACE_STATS}[name]
             observed = [key for key in group if stats[key]["count"]]
             if observed:
                 loss += sum(
                     stats[key]["sum"] / stats[key]["count"] * _stat_weight(key, weights)
                     for key in observed
                 ) / sum(_stat_weight(key, weights) for key in observed)
-        elif value["count"] and name not in (*_NOTE_ONSET_STATS, *_PERCUSSION_STATS, *_TECHNIQUE_STATS, *_TECHNIQUE_STRING_STATS, *_CONNECTION_STATS, *_NOTE_TECHNIQUE_STATS):
+        elif value["count"] and name not in (*_NOTE_ONSET_STATS, *_PERCUSSION_STATS, *_TECHNIQUE_STATS, *_TECHNIQUE_STRING_STATS, *_CONNECTION_STATS, *_NOTE_TECHNIQUE_STATS, *_GRACE_STATS):
             weight = sparsity_weight if name in _PRIOR_NAMES else _stat_weight(name, weights)
             loss += weight * value["sum"] / value["count"]
     return _finite(loss, "aggregated loss")
@@ -608,6 +616,20 @@ def _prediction(outputs, name):
     if name in outputs:
         return outputs[name]
     raise ValueError(f"Missing model output for labelled task {name}")
+
+
+def _binary_counts(count, emitted, positive, mask):
+    count["count"] += int(mask.sum())
+    for name, selected in (
+        ("tp", emitted & positive), ("fp", emitted & ~positive),
+        ("fn", ~emitted & positive), ("tn", ~emitted & ~positive),
+    ):
+        count[name] += int((selected & mask).sum())
+
+
+def _calibration_counts(counts, name, scores, positive, mask):
+    for threshold in _CALIBRATION_THRESHOLDS:
+        _binary_counts(counts[f"calibration:{name}:{threshold}"], scores >= threshold, positive, mask)
 
 
 def _metric_counts(outputs, batch, counts):
@@ -691,6 +713,7 @@ def _metric_counts(outputs, batch, counts):
         count["fn"] += int((~emitted & positive & string_mask).sum().item())
         count["tn"] += int((~emitted & ~positive & string_mask).sum().item())
     if "connection" in targets:
+        connection_types, note_technique_types = vocabularies(4 if "grace_logits" in outputs else 3)
         target = targets["connection"]
         mask = _mask(target, masks["connection"], valid)
         prediction = _prediction(outputs, "connection")
@@ -699,7 +722,8 @@ def _metric_counts(outputs, batch, counts):
         selected = prediction.argmax(-1)
         counts["connection"]["correct"] += int(((selected == target) & mask).sum())
         counts["connection"]["count"] += int(mask.sum())
-        for axis, name in enumerate(CONNECTION_TYPES):
+        probabilities = prediction.softmax(-1)
+        for axis, name in enumerate(connection_types):
             emitted, positive = selected == axis, target == axis
             count = counts[f"connection:{name}"]
             count["count"] += int(mask.sum())
@@ -707,6 +731,8 @@ def _metric_counts(outputs, batch, counts):
             count["fp"] += int((emitted & ~positive & mask).sum())
             count["fn"] += int((~emitted & positive & mask).sum())
             count["tn"] += int((~emitted & ~positive & mask).sum())
+            if axis:
+                _calibration_counts(counts, f"connection:{name}", probabilities[..., axis].masked_fill(selected != axis, 0), positive, mask)
         target = targets["note_technique"]
         mask = _mask(target, masks["note_technique"], valid)
         prediction = _prediction(outputs, "note_technique")
@@ -719,7 +745,8 @@ def _metric_counts(outputs, batch, counts):
         count["fp"] += int((emitted & ~positive & mask).sum())
         count["fn"] += int((~emitted & positive & mask).sum())
         count["tn"] += int((~emitted & ~positive & mask).sum())
-        for axis, name in enumerate(NOTE_TECHNIQUE_TYPES):
+        probabilities = prediction.sigmoid()
+        for axis, name in enumerate(note_technique_types):
             selected_mask = mask[..., axis]
             selected_emitted, selected_positive = emitted[..., axis], positive[..., axis]
             count = counts[f"note_technique:{name}"]
@@ -728,6 +755,17 @@ def _metric_counts(outputs, batch, counts):
             count["fp"] += int((selected_emitted & ~selected_positive & selected_mask).sum())
             count["fn"] += int((~selected_emitted & selected_positive & selected_mask).sum())
             count["tn"] += int((~selected_emitted & ~selected_positive & selected_mask).sum())
+            _calibration_counts(counts, f"note_technique:{name}", probabilities[..., axis], selected_positive, selected_mask)
+    if "grace" in targets:
+        mask = _mask(targets["grace"], masks["grace"], valid)
+        scores = outputs["grace_logits"].sigmoid()
+        _binary_counts(counts["grace"], scores >= .5, targets["grace"] > .5, mask)
+        _calibration_counts(counts, "grace", scores, targets["grace"] > .5, mask)
+        for name in ("grace_fret", "grace_mode", "grace_transition"):
+            mask = _mask(targets[name], masks[name], valid)
+            count = counts[name]
+            count["count"] += int(mask.sum())
+            count["correct"] += int(((outputs[f"{name}_logits"].argmax(-1) == targets[name]) & mask).sum())
 
 
 def _divide(numerator, denominator):
@@ -813,7 +851,7 @@ def _metrics(counts):
         "f1": _divide(2 * tp, 2 * tp + fp + fn),
     }
     result["note_technique_classes"] = {}
-    for name in NOTE_TECHNIQUE_TYPES:
+    for name in V4_NOTE_TECHNIQUE_TYPES:
         value = counts[f"note_technique:{name}"]
         tp, fp, fn, tn = (value[key] for key in ("tp", "fp", "fn", "tn"))
         result["note_technique_classes"][name] = {
@@ -822,6 +860,41 @@ def _metrics(counts):
             "precision": _divide(tp, tp + fp), "recall": _divide(tp, tp + fn),
             "f1": _divide(2 * tp, 2 * tp + fp + fn),
         }
+    value = counts["grace"]
+    tp, fp, fn, tn = (value[key] for key in ("tp", "fp", "fn", "tn"))
+    result["grace_frame"] = {
+        "available": bool(value["count"]), "count": value["count"],
+        "true_positive": tp, "false_positive": fp, "false_negative": fn, "true_negative": tn,
+        "precision": _divide(tp, tp + fp) if fp + tn else None,
+        "recall": _divide(tp, tp + fn),
+        "f1": _divide(2 * tp, 2 * tp + fp + fn) if fp + tn else None,
+    }
+    for name in ("grace_fret", "grace_mode", "grace_transition"):
+        value = counts[name]
+        result[f"{name}_accuracy"] = {
+            "available": bool(value["count"]), "count": value["count"],
+            "correct": value["correct"], "accuracy": _divide(value["correct"], value["count"]),
+        }
+    result["technique_calibration"] = {}
+    for name in _CALIBRATION_TASKS:
+        curve = []
+        for threshold in _CALIBRATION_THRESHOLDS:
+            value = counts[f"calibration:{name}:{threshold}"]
+            tp, fp, fn, tn = (value[key] for key in ("tp", "fp", "fn", "tn"))
+            curve.append({
+                "threshold": threshold, "true_positive": tp, "false_positive": fp,
+                "false_negative": fn, "true_negative": tn,
+                "precision": _divide(tp, tp + fp) if fp + tn else None,
+                "recall": _divide(tp, tp + fn),
+                "f1": _divide(2 * tp, 2 * tp + fp + fn) if fp + tn and tp + fn else None,
+            })
+        if any(item["true_positive"] + item["false_positive"] + item["false_negative"] + item["true_negative"] for item in curve):
+            eligible = [item for item in curve if item["f1"] is not None]
+            result["technique_calibration"][name] = {
+                "thresholds": curve,
+                "bestThreshold": max(eligible, key=lambda item: (item["f1"], item["threshold"]))["threshold"] if eligible else None,
+                "scope": "masked validation frames at known note anchors; not calibrated probabilities or decoded-event thresholds",
+            }
     return result
 
 
@@ -856,7 +929,9 @@ def evaluate_model(model, loader, device, *, sparsity_weight=0.02, progress=None
         + ("technique_frame", "technique_direction", "technique_strings")
         + ("connection", "note_technique")
         + tuple(f"connection:{name}" for name in CONNECTION_TYPES)
-        + tuple(f"note_technique:{name}" for name in NOTE_TECHNIQUE_TYPES)
+        + tuple(f"note_technique:{name}" for name in V4_NOTE_TECHNIQUE_TYPES)
+        + ("grace", "grace_fret", "grace_mode", "grace_transition")
+        + tuple(f"calibration:{name}:{threshold}" for name in _CALIBRATION_TASKS for threshold in _CALIBRATION_THRESHOLDS)
     }
     batches = frames = windows = 0
     started = last_log = time.perf_counter()
@@ -937,7 +1012,11 @@ def _require_validation(metrics):
 
 def _event_result(value, *, metric=None):
     result = _json_copy(value)
-    _keys(result, {"score", "metric", "windows"}, "decoded-event evaluation")
+    fields = {"score", "metric", "windows"}
+    v4 = isinstance(result, dict) and result.get("metric") == "harmonic-mean-base-event-micro-f1-and-non-none-technique-macro-f1@100ms-v4"
+    if v4:
+        fields |= {"baseEventScore", "nonNoneTechniqueScore", "techniqueClasses"}
+    _keys(result, fields, "decoded-event evaluation")
     result["score"] = _finite(result["score"], "decoded-event score")
     if result["score"] > 1:
         raise ValueError("Decoded-event score must be within [0, 1]")
@@ -946,6 +1025,16 @@ def _event_result(value, *, metric=None):
     if metric is not None and result["metric"] != metric:
         raise ValueError("Decoded-event metric must stay stable within a run")
     _integer(result["windows"], "decoded-event windows")
+    if v4:
+        for key in ("baseEventScore", "nonNoneTechniqueScore"):
+            _finite(result[key], key)
+            if result[key] > 1:
+                raise ValueError(f"{key} must be within [0, 1]")
+        _integer(result["techniqueClasses"], "supported technique classes", minimum=1)
+        base, technique = result["baseEventScore"], result["nonNoneTechniqueScore"]
+        expected = 2 * base * technique / (base + technique) if base + technique else 0.
+        if not math.isclose(result["score"], expected, rel_tol=1e-9, abs_tol=1e-12):
+            raise ValueError("V4 checkpoint score differs from its base/technique harmonic mean.")
     return result
 
 

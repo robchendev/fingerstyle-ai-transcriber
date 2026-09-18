@@ -130,6 +130,32 @@ class RhythmInferenceTests(unittest.TestCase):
         with self.assertRaises(HarnessError):
             PerformanceMap(evidence([0, .5], [.25]), metadata(), 1)
 
+    def test_perfect_32nd_pair_and_downbeat_survive_end_to_end(self):
+        from scripts.draft_cleanup import clean_hypotheses
+
+        for bpm in (60, 122, 240):
+            seconds_per_quarter = 60 / bpm
+            beat_evidence = evidence([i * seconds_per_quarter for i in range(9)], [i * seconds_per_quarter for i in (0, 4, 8)])
+            onsets = [Fraction(15, 4), Fraction(31, 8), Fraction(4)]
+            document = {
+                "metadata": metadata(bpm), "audioDurationSeconds": 8 * seconds_per_quarter,
+                "notes": [note(float(q) * seconds_per_quarter, 1 / 8) for q in onsets],
+                "percussion": [], "techniques": [],
+            }
+            cleaned, _ = clean_hypotheses(document)
+            result, _ = infer_notated_timing(cleaned, beat_evidence)
+            self.assertEqual([Fraction(*n["scoreOnsetQuarter"]) for n in result["notes"]], onsets)
+            self.assertEqual([n["scoreDurationQuarter"] for n in result["notes"]], [[1, 8]] * 3)
+
+    def test_two_nearby_observations_cannot_fake_two_distinct_triplet_positions(self):
+        document = {
+            "metadata": metadata(), "audioDurationSeconds": 2,
+            "notes": [note(1 / 3), {**note(1 / 3 + .001), "string": 5}],
+            "percussion": [],
+        }
+        _, report = infer_notated_timing(document, evidence([0, .5, 1, 1.5, 2], [0, 2]))
+        self.assertEqual(report["onsetOptimization"]["tripletBeatCount"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -10,6 +10,7 @@ from .score_alignment import ScoreClock
 from .training_windows import projected_targets
 from .transcriber_audio import HarnessError
 from .transcriber_data import training_conditioning
+from .connection_supervision import RELATION_TYPES, SUPERVISION_VERSION, V4_NOTE_TECHNIQUE_TYPES
 
 
 class OutputTimeline:
@@ -102,8 +103,9 @@ def match_events(truth, predictions, tolerance, keys):
     return matches
 
 
-def event_counts(truth, predictions, tolerance, keys, negative_known, *, has_negative_coverage):
-    matches = match_events(truth, predictions, tolerance, keys)
+def event_counts(truth, predictions, tolerance, keys, negative_known, *, has_negative_coverage, matches=None):
+    if matches is None:
+        matches = match_events(truth, predictions, tolerance, keys)
     matched_predictions = {prediction for _, prediction in matches}
     false_positive = sum(index not in matched_predictions and negative_known(event) for index, event in enumerate(predictions))
     return {
@@ -139,14 +141,138 @@ def checkpoint_event_score(report):
     fn = sum(value["false_negative"] for value in selected)
     if not selected or not sum(value["reference_events"] for value in selected):
         raise HarnessError("Decoded checkpoint selection requires scorable validation events, not only unknown or empty labels.")
+    score = 2 * tp / (2 * tp + fp + fn)
+    if report.get("techniqueSupervisionVersion") == SUPERVISION_VERSION:
+        names = [
+            *(f"relation_{name}" for name in RELATION_TYPES[1:]),
+            *(f"note_technique_{name}" for name in V4_NOTE_TECHNIQUE_TYPES),
+            "grace_attributes",
+        ]
+        observed = [metrics[name] for name in names if name in metrics and metrics[name]["reference_events"] and metrics[name]["f1"] is not None]
+        if not observed:
+            raise HarnessError("Architecture v4 checkpoint selection requires covered non-none technique/anchored-grace validation events.")
+        technique_score = sum(value["f1"] for value in observed) / len(observed)
+        return {
+            "score": 2 * score * technique_score / (score + technique_score) if score + technique_score else 0.,
+            "metric": "harmonic-mean-base-event-micro-f1-and-non-none-technique-macro-f1@100ms-v4",
+            "baseEventScore": score, "nonNoneTechniqueScore": technique_score,
+            "techniqueClasses": len(observed), "windows": report["windowVisits"],
+        }
     return {
-        "score": 2 * tp / (2 * tp + fp + fn),
+        "score": score,
         "metric": (
             "joint-note-covered-percussion-and-technique-string-set-micro-f1@100ms"
             if technique_metric else "joint-note-and-covered-percussion-micro-f1@100ms"
         ),
         "windows": report["windowVisits"],
     }
+
+
+def _relation_matches(truth, predictions, tolerance):
+    keys = ("string", "voiceIndex", "soundingPitchMidi", "connection")
+    grouped = defaultdict(list)
+    for index, event in enumerate(predictions):
+        grouped[tuple(event[key] for key in keys)].append(index)
+    candidates = {}
+    for index, event in enumerate(truth):
+        origin = event["connectionOrigin"]
+        candidates[index] = [
+            other for other in grouped[tuple(event[key] for key in keys)]
+            if abs(event["onsetSeconds"] - predictions[other]["onsetSeconds"]) <= tolerance + 1e-9
+            and predictions[other].get("connectionOrigin") is not None
+            and all(origin[key] == predictions[other]["connectionOrigin"].get(key) for key in ("string", "voiceIndex", "soundingPitchMidi"))
+            and abs(origin["onsetSeconds"] - predictions[other]["connectionOrigin"]["onsetSeconds"]) <= tolerance + 1e-9
+        ]
+    assigned = {}
+
+    def assign(index, seen):
+        for other in candidates[index]:
+            if other in seen:
+                continue
+            seen.add(other)
+            if other not in assigned or assign(assigned[other], seen):
+                assigned[other] = index
+                return True
+        return False
+
+    for index in candidates:
+        assign(index, set())
+    return [(index, other) for other, index in assigned.items()]
+
+
+def score_note_attributes(connections, predictions, scoring, tolerance, *, note_technique_threshold=.5, unknown_notes=(), negative_onsets_allowed=None):
+    """Pitch-correct anchor metrics; relation matches require both endpoints."""
+    if not math.isfinite(note_technique_threshold) or not 0 <= note_technique_threshold <= 1:
+        raise HarnessError("Note-technique threshold must be between zero and one.")
+    negative_onsets_allowed = [False] * 6 if negative_onsets_allowed is None else negative_onsets_allowed
+    if len(negative_onsets_allowed) != 6 or any(type(value) is not bool for value in negative_onsets_allowed):
+        raise HarnessError("Technique scoring requires six explicit onset-coverage masks.")
+    anchors = [
+        {**event, "onsetSeconds": event["proposedOnsetClipSeconds"]}
+        for event in connections if event["proposedOnsetClipSeconds"] is not None
+    ]
+    pitch_keys = ("string", "voiceIndex", "soundingPitchMidi")
+    result = {}
+
+    def coverage(known):
+        unknown = [event for event in anchors if not known(event)] + list(unknown_notes)
+        resolved = [event for event in anchors if known(event) and inside(event["onsetSeconds"], scoring)]
+
+        def negative(event):
+            return inside(event["onsetSeconds"], scoring) and (negative_onsets_allowed[6 - event["string"]] or any(
+                other["string"] == event["string"] and abs(other["onsetSeconds"] - event["onsetSeconds"]) <= tolerance
+                for other in resolved
+            )) and not any(
+                other["string"] == event["string"] and abs(other["onsetSeconds"] - event["onsetSeconds"]) <= tolerance
+                for other in unknown
+            )
+
+        return resolved, negative
+
+    known, negative = coverage(lambda event: event["connectionMask"] and (
+        event["connection"] == "none" or event.get("origin") is not None
+        and event["origin"]["proposedOnsetClipSeconds"] is not None
+        and inside(event["origin"]["proposedOnsetClipSeconds"], scoring)
+    ))
+    truth = [{
+        **event, "connectionOrigin": {
+            **event["origin"], "onsetSeconds": event["origin"]["proposedOnsetClipSeconds"],
+        },
+    } for event in known if event["connection"] != "none"]
+    guessed = [event for event in predictions if event.get("connection", "none") != "none"]
+    for name in (None, *RELATION_TYPES[1:]):
+        expected = [event for event in truth if name is None or event["connection"] == name]
+        actual = [event for event in guessed if name is None or event["connection"] == name]
+        result["relation_joint" if name is None else f"relation_{name}"] = event_counts(
+            expected, actual, tolerance, (*pitch_keys, "connection"), negative,
+            has_negative_coverage=bool(known) or any(negative_onsets_allowed), matches=_relation_matches(expected, actual, tolerance),
+        )
+    pooled = []
+    for name in V4_NOTE_TECHNIQUE_TYPES:
+        known, negative = coverage(lambda event: event["techniqueMasks"][name])
+        expected = [event for event in known if event["techniques"][name]]
+        actual = [event for event in predictions if event.get("noteTechniques", {}).get(name, 0) >= note_technique_threshold]
+        counts = event_counts(expected, actual, tolerance, pitch_keys, negative, has_negative_coverage=bool(known) or any(negative_onsets_allowed))
+        result[f"note_technique_{name}"] = counts
+        pooled.append(counts)
+    result["note_technique_joint"] = {
+        key: any(value[key] for value in pooled) if key == "has_negative_coverage" else sum(value[key] for value in pooled)
+        for key in pooled[0]
+    }
+    for name, attributes, masks in (
+        ("grace_presence", (), ()),
+        ("grace_fret", ("sourceFret", "sourcePitchMidi", "intervalSemitones"), ("fret",)),
+        ("grace_mode", ("mode",), ("mode",)),
+        ("grace_transition", ("transition",), ("transition",)),
+        ("grace_attributes", ("sourceFret", "sourcePitchMidi", "intervalSemitones", "mode", "transition"), ("fret", "mode", "transition")),
+    ):
+        known, negative = coverage(lambda event: event["graceMask"] and (
+            event["grace"] is None or all(event["graceAttributeMasks"][key] for key in masks)
+        ))
+        expected = [{**event, **{key: event["grace"][key] for key in attributes}} for event in known if event["grace"] is not None]
+        actual = [{**event, **{key: event["grace"].get(key) for key in attributes}} for event in predictions if event.get("grace") is not None]
+        result[name] = event_counts(expected, actual, tolerance, (*pitch_keys, *attributes), negative, has_negative_coverage=bool(known) or any(negative_onsets_allowed))
+    return result
 
 
 def _spans(windows):
@@ -161,7 +287,8 @@ def _spans(windows):
 
 
 @torch.no_grad()
-def evaluate_events(model, dataset, device, *, tolerances=(.05, .1, .2), onset_threshold=.5, percussion_threshold=.5, technique_threshold=.5, progress=None):
+def evaluate_events(model, dataset, device, *, tolerances=(.05, .1, .2), onset_threshold=.5, percussion_threshold=.5, technique_threshold=.5,
+                    connection_threshold=.5, note_technique_threshold=.5, grace_threshold=.5, progress=None):
     from .transcriber_model import PERCUSSION_TYPES, decode_events
     from .technique_supervision import TECHNIQUE_TYPES
 
@@ -171,6 +298,7 @@ def evaluate_events(model, dataset, device, *, tolerances=(.05, .1, .2), onset_t
     config = dataset.feature_config
     records = []
     totals = {}
+    version4 = getattr(getattr(model, "config", None), "architecture_version", None) == 4
     modes = [(module, module.training) for module in model.modules()]
     try:
         model.eval()
@@ -209,9 +337,14 @@ def evaluate_events(model, dataset, device, *, tolerances=(.05, .1, .2), onset_t
                     outputs = model(features[None].to(device), conditioning[None].to(device), torch.tensor([len(features)], dtype=torch.long))
                     timeline.add({name: value[0] for name, value in outputs.items()}, local_times, window["stopSampleExclusive"] / rate)
                 instrument = data.labels["conditioning"]["instrument"]
-                decoded = decode_events(timeline.finish(), torch.tensor(times), tuning=instrument["openStringMidi"], capo=instrument["capoFret"], onset_threshold=onset_threshold, percussion_threshold=percussion_threshold, technique_threshold=technique_threshold)
+                decoded = decode_events(
+                    timeline.finish(), torch.tensor(times), tuning=instrument["openStringMidi"], capo=instrument["capoFret"],
+                    onset_threshold=onset_threshold, percussion_threshold=percussion_threshold, technique_threshold=technique_threshold,
+                    connection_threshold=connection_threshold, grace_threshold=grace_threshold,
+                )
                 for kind in predictions:
                     predictions[kind].extend(decoded.get(kind, []))
+                version4 |= decoded["policy"].get("techniqueSupervision") == SUPERVISION_VERSION
                 if progress is not None:
                     progress(f"Event evaluation: {row['id']} span {span_index + 1}/{len(spans)}")
             clock = ScoreClock(data.labels, data.normalization)
@@ -302,6 +435,17 @@ def evaluate_events(model, dataset, device, *, tolerances=(.05, .1, .2), onset_t
                             expected, actual, tolerance, ("technique",), known_technique_negative,
                             has_negative_coverage=technique_complete,
                         )
+                if version4:
+                    if "connections" not in record:
+                        raise HarnessError("Architecture v4 event evaluation requires v4 canonical connections.")
+                    if any(event.get("techniqueSchemaVersion") != 4 for event in record["connections"]):
+                        raise HarnessError("Do not score v4 predictions against legacy slide supervision.")
+                    comparisons.update(score_note_attributes(
+                        record["connections"], predictions["notes"], scoring, tolerance,
+                        note_technique_threshold=note_technique_threshold,
+                        unknown_notes=[note for note in notes if not note["onsetTimingKnownInScore"] or not note["sourceLabelMask"]["pitch"]],
+                        negative_onsets_allowed=record["negativeAllowed"],
+                    ))
                 tolerance_key = f"{tolerance:g}"
                 scored[tolerance_key] = {key: summarize_counts(value) for key, value in comparisons.items()}
                 for name, counts in comparisons.items():
@@ -323,7 +467,10 @@ def evaluate_events(model, dataset, device, *, tolerances=(.05, .1, .2), onset_t
         "schemaVersion": 1, "kind": "decoded-event-evaluation", "visibility": "private", "trainingPerformed": False,
         "recordings": records,
         "windowVisits": len(dataset.windows),
+        **({"techniqueSupervisionVersion": SUPERVISION_VERSION} if version4 else {}),
         "metricsByToleranceSeconds": {key: {name: summarize_counts(value) for name, value in groups.items()} for key, groups in totals.items()},
-        "settings": {"onsetThreshold": onset_threshold, "percussionThreshold": percussion_threshold, "techniqueThreshold": technique_threshold, "tolerancesSeconds": tolerances, "windowBoundaryGuardSeconds": .5},
+        "settings": {"onsetThreshold": onset_threshold, "percussionThreshold": percussion_threshold, "techniqueThreshold": technique_threshold,
+                     "connectionThreshold": connection_threshold, "noteTechniqueThreshold": note_technique_threshold,
+                     "graceThreshold": grace_threshold, "tolerancesSeconds": tolerances, "windowBoundaryGuardSeconds": .5},
         "policy": "Window logits are stitched before decoding; gaps remain separate. Canonical event IDs are scored once, not once per overlapping window. Metrics are masked string-specific event metrics, not complete-score quality. Unmatched predictions in unresolved annotation coverage are censored. Percussion precision/F1 require explicit negative annotation coverage; otherwise only known-positive recall and emission counts are available. No acoustic-release correctness is inferred from notated durations.",
     }

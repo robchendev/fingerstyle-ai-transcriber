@@ -2,6 +2,7 @@
 
 import argparse
 from collections import Counter
+from copy import deepcopy
 from dataclasses import asdict, fields
 from datetime import datetime
 import math
@@ -35,7 +36,7 @@ def default_config():
     from .transcriber_model import ModelConfig
     from .transcriber_runtime import TrainingConfig
     return {
-        "schemaVersion": 1, "features": asdict(FeatureConfig()), "model": asdict(ModelConfig(architecture_version=3)),
+        "schemaVersion": 1, "features": asdict(FeatureConfig()), "model": asdict(ModelConfig(architecture_version=4)),
         "training": asdict(TrainingConfig()),
         "data": {"manifest": "data\\releases\\dataset-v1\\manifest.json", "batch_size": 4, "num_workers": 0, "num_threads": 4, "cache": "cache\\transcriber"},
     }
@@ -91,13 +92,16 @@ def make_loader(dataset, config, training, *, shuffle):
 
 
 def run_identity(dataset, config, features, model, training, device):
+    from .connection_supervision import SUPERVISION_VERSION
+
     settings = asdict(training)
     settings.pop("epochs", None)
     settings.pop("max_steps", None)
-    modules = ("transcriber.py", "transcriber_audio.py", "transcriber_data.py", "transcriber_model.py", "transcriber_runtime.py", "transcriber_events.py", "technique_supervision.py", "dataset_release.py", "training_windows.py", "score_alignment.py", "dataset_io.py", "canonical_events.py", "gp_events.py", "inspect_gp_files.py", "settings.py")
+    modules = ("transcriber.py", "transcriber_audio.py", "transcriber_data.py", "transcriber_model.py", "transcriber_runtime.py", "transcriber_events.py", "technique_supervision.py", "connection_supervision.py", "dataset_release.py", "training_windows.py", "score_alignment.py", "dataset_io.py", "canonical_events.py", "gp_events.py", "inspect_gp_files.py", "settings.py")
     return {
         "schemaVersion": 1, "manifest_sha256": dataset.manifest_sha256,
         "features": asdict(features), "model": asdict(model), "training": settings,
+        "techniqueSupervisionVersion": SUPERVISION_VERSION if model.architecture_version >= 4 else f"historical-architecture-v{model.architecture_version}",
         "batch_size": config["data"]["batch_size"], "num_workers": config["data"]["num_workers"],
         "device": str(device), "implementationSha256": {name: sha256(Path(__file__).with_name(name)) for name in modules},
         "runtime": {"torch": str(torch.__version__), "numpy": np.__version__, "scipy": scipy.__version__, "soundfile": sf.__version__},
@@ -216,7 +220,7 @@ def train(args):
 
 
 def initialize_model(model, target_config, checkpoint_path, manifest_sha256):
-    from .transcriber_model import ModelConfig
+    from .transcriber_model import FingerstyleTranscriber, ModelConfig, initialize_v4_from_model
     from .transcriber_runtime import load_checkpoint
 
     checkpoint_path = Path(checkpoint_path).resolve()
@@ -225,15 +229,29 @@ def initialize_model(model, target_config, checkpoint_path, manifest_sha256):
     source_values, target_values = asdict(source), asdict(target_config)
     source_version = source_values.pop("architecture_version")
     target_version = target_values.pop("architecture_version")
+    if checkpoint["identity"]["manifest_sha256"] != manifest_sha256 or checkpoint["global_step"] <= 0:
+        raise HarnessError("Initialization requires a trained checkpoint from the same release.")
+    if target_version == 4 and source_version in (2, 3):
+        with torch.random.fork_rng(devices=[]):
+            source_model = FingerstyleTranscriber(source)
+            source_model.load_state_dict(checkpoint["model_state"], strict=True)
+            transfer = initialize_v4_from_model(model, source_model)
+        return {
+            **transfer, "kind": "corrected-v4-supervision-with-reset-technique-heads",
+            "checkpointSha256": sha256(checkpoint_path), "sourceGlobalStep": checkpoint["global_step"],
+            "copiedParameterTensors": len(transfer["copiedParameters"]),
+            "newParameterTensors": [
+                key for key in model.state_dict() if any(key.startswith(f"heads.{name}.") for name in transfer["resetHeads"])
+            ],
+            "optimizerStateImported": False,
+        }
     if target_version != source_version + 1 or source_values != target_values:
         raise HarnessError("Initialization requires compatible consecutive architecture versions differing only by architecture_version.")
-    if checkpoint["identity"]["manifest_sha256"] != manifest_sha256 or checkpoint["global_step"] <= 0:
-        raise HarnessError("V2 initialization requires a trained architecture-v1 checkpoint from the same release.")
     current = model.state_dict()
     state = checkpoint["model_state"]
     new_keys = set(current) - set(state)
     if set(state) != set(current) - new_keys or any(current[key].shape != value.shape for key, value in state.items()):
-        raise HarnessError("Architecture-v1 checkpoint parameters do not exactly match the shared v2 model.")
+        raise HarnessError("Source checkpoint parameters do not exactly match the shared target model.")
     current.update(state)
     model.load_state_dict(current, strict=True)
     return {
@@ -292,7 +310,12 @@ def evaluate_decoded_events(args):
     config = default_config()
     torch.set_num_threads(config["data"]["num_threads"])
     dataset = make_dataset(config, FeatureConfig(**identity["features"]), ModelConfig(**identity["model"]), args.split, args.data_root, args.manifest)
-    report = evaluate_events(model, dataset, device, tolerances=args.tolerances, onset_threshold=args.onset_threshold, percussion_threshold=args.percussion_threshold, technique_threshold=getattr(args, "technique_threshold", .5), progress=log_progress)
+    report = evaluate_events(
+        model, dataset, device, tolerances=args.tolerances, onset_threshold=args.onset_threshold,
+        percussion_threshold=args.percussion_threshold, technique_threshold=args.technique_threshold,
+        connection_threshold=args.connection_threshold, note_technique_threshold=args.note_technique_threshold,
+        grace_threshold=args.grace_threshold, progress=log_progress,
+    )
     if sha256(Path(args.checkpoint)) != checkpoint_hash:
         raise HarnessError("Checkpoint changed during event evaluation.")
     if implementation != {path.name: sha256(path) for path in Path(__file__).parent.glob("*.py")}:
@@ -388,11 +411,18 @@ def infer(args):
         raise HarnessError("Input audio is silent; no transcription hypotheses were published.")
     if sha256(audio_path) != audio_hash:
         raise HarnessError("Audio changed during inference.")
-    events = decode_events(timeline.finish(), torch.tensor(frame_times), tuning=metadata["openStringMidi"], capo=metadata["capoFret"], onset_threshold=args.onset_threshold, percussion_threshold=args.percussion_threshold, technique_threshold=getattr(args, "technique_threshold", .5))
+    events = decode_events(
+        timeline.finish(), torch.tensor(frame_times), tuning=metadata["openStringMidi"], capo=metadata["capoFret"],
+        onset_threshold=args.onset_threshold, percussion_threshold=args.percussion_threshold,
+        technique_threshold=getattr(args, "technique_threshold", .5),
+        connection_threshold=getattr(args, "connection_threshold", .5),
+        grace_threshold=getattr(args, "grace_threshold", .5),
+    )
     report = {
         "schemaVersion": 1, "kind": "fingerstyle-transcription-hypotheses", "visibility": "private", "distributionAuthorized": False,
         "audioSha256": audio_hash, "checkpointSha256": sha256(Path(args.checkpoint)),
         "audioDurationSeconds": duration,
+        "modelArchitectureVersion": checkpoint["identity"].get("model", {}).get("architecture_version", 1),
         "metadata": metadata, "timeUnit": "input-audio-seconds", "notatedDurationUnit": "quarter-note",
         "gpWriterImplemented": True, "gpWrittenByThisCommand": False, "modelTrainingPerformedByThisCommand": False,
         **events,
@@ -414,6 +444,45 @@ def export_gp(args):
     if full_path.suffix.lower() != ".gp" or single_path.suffix.lower() != ".gp" or full_path == single_path:
         raise HarnessError("GP outputs require two different .gp paths under the private runs directory.")
     before = sha256(predictions_path)
+    hand_evidence_identity = None
+    if args.hand_position_evidence:
+        if not args.beat_evidence:
+            raise HarnessError("Hand-position evidence requires the exact beat-evidence file used for score timing.")
+        evidence_path = Path(args.hand_position_evidence).resolve()
+        hand_evidence = read_json(evidence_path)
+        required = {"schemaVersion", "kind", "audioSha256", "beatEvidenceSha256", "evidenceType", "observations"}
+        if (
+            not isinstance(hand_evidence, dict)
+            or not required <= hand_evidence.keys()
+            or hand_evidence.keys() - required - {"sourceVideoSha256"}
+            or type(hand_evidence["schemaVersion"]) is not int or hand_evidence["schemaVersion"] != 1
+            or hand_evidence["kind"] != "hand-position-evidence"
+            or hand_evidence["evidenceType"] not in ("visual", "reference-oracle")
+            or not isinstance(hand_evidence["observations"], list)
+        ):
+            raise HarnessError("Expected version-1 hand-position evidence with explicit visual/reference-oracle provenance.")
+        hash_fields = ["audioSha256", "beatEvidenceSha256"]
+        if "sourceVideoSha256" in hand_evidence:
+            hash_fields.append("sourceVideoSha256")
+        if any(
+            not isinstance(hand_evidence[field], str) or len(hand_evidence[field]) != 64
+            or any(character not in "0123456789abcdefABCDEF" for character in hand_evidence[field])
+            for field in hash_fields
+        ):
+            raise HarnessError("Hand-position evidence identities must be SHA-256 hex digests.")
+        if (
+            hand_evidence["audioSha256"].lower() != str(predictions.get("audioSha256", "")).lower()
+            or hand_evidence["beatEvidenceSha256"].lower() != sha256(Path(args.beat_evidence)).lower()
+        ):
+            raise HarnessError("Hand-position evidence is bound to different audio or beat evidence.")
+        if "handPositionEvidence" in predictions:
+            raise HarnessError("Predictions already contain hand-position evidence; do not silently replace it.")
+        predictions = deepcopy(predictions)
+        predictions["handPositionEvidence"] = hand_evidence["observations"]
+        hand_evidence_identity = {
+            key: value for key, value in hand_evidence.items() if key != "observations"
+        }
+        hand_evidence_identity.update(fileSha256=sha256(evidence_path), observationCount=len(hand_evidence["observations"]))
     profile = DraftProfile(
         note_threshold=args.draft_note_threshold,
         percussion_threshold=args.draft_percussion_threshold,
@@ -429,6 +498,7 @@ def export_gp(args):
         rasgueado_membership_threshold=args.rasgueado_membership_threshold,
         connection_threshold=args.connection_threshold,
         note_technique_threshold=args.note_technique_threshold,
+        grace_threshold=args.grace_threshold,
         chord_tolerance_seconds=args.chord_tolerance,
         same_string_gap_seconds=args.same_string_gap,
     )
@@ -465,6 +535,7 @@ def export_gp(args):
         singleOutputSha256=sha256(single_path),
         fingeringArranger=arranger_identity,
         symbolicCompleter=completer_identity,
+        handPositionEvidenceInput=hand_evidence_identity,
     )
     report_path = private_output(args.report, args.data_root)
     publish_json(report_path, report)
@@ -511,7 +582,7 @@ def main(argv=None):
             command.add_argument("--run-dir", required=True)
             start = command.add_mutually_exclusive_group()
             start.add_argument("--resume")
-            start.add_argument("--initialize-from", help="Start a new consecutive-version experiment from compatible model weights; optimizer/RNG/history are not resumed.")
+            start.add_argument("--initialize-from", help="Initialize a new model (including v2/v3 to corrected v4); optimizer/RNG/history are never resumed.")
         else:
             command.add_argument("--checkpoint", required=True)
             command.add_argument("--split", choices=("train", "validation"), default="validation")
@@ -522,6 +593,9 @@ def main(argv=None):
                 command.add_argument("--onset-threshold", type=float, default=.5)
                 command.add_argument("--percussion-threshold", type=float, default=.5)
                 command.add_argument("--technique-threshold", type=float, default=.5)
+                command.add_argument("--connection-threshold", type=float, default=.5)
+                command.add_argument("--note-technique-threshold", type=float, default=.5)
+                command.add_argument("--grace-threshold", type=float, default=.5)
     inference = commands.add_parser("infer")
     inference.add_argument("--data-root", default=str(ROOT))
     inference.add_argument("--checkpoint", required=True)
@@ -532,6 +606,8 @@ def main(argv=None):
     inference.add_argument("--onset-threshold", type=float, default=.5)
     inference.add_argument("--percussion-threshold", type=float, default=.5)
     inference.add_argument("--technique-threshold", type=float, default=.5)
+    inference.add_argument("--connection-threshold", type=float, default=.5)
+    inference.add_argument("--grace-threshold", type=float, default=.5)
     beats = commands.add_parser("analyze-beats")
     beats.add_argument("--data-root", default=str(ROOT))
     beats.add_argument("--audio", required=True)
@@ -544,6 +620,7 @@ def main(argv=None):
     export.add_argument("--template", required=True)
     export.add_argument("--beat-evidence", help="Private analyze-beats output for beat-anchored constrained rhythm inference.")
     export.add_argument("--fingering-arranger", help="Optional trained symbolic arranger checkpoint; training is a separate human-owner command.")
+    export.add_argument("--hand-position-evidence", help="Optional audio/beat-hash-bound visual or explicitly labeled reference-oracle hand-position sidecar.")
     export.add_argument("--symbolic-completer", help="Optional GP-trained missing-onset/chord checkpoint; training is a separate human-owner command.")
     export.add_argument("--symbolic-completion-threshold", type=float, default=.8)
     export.add_argument("--symbolic-completion-technique-threshold", type=float, default=.8)
@@ -564,8 +641,9 @@ def main(argv=None):
     export.add_argument("--rasgueado-membership-threshold", type=float, default=.8)
     export.add_argument("--connection-threshold", type=float, default=.8)
     export.add_argument("--note-technique-threshold", type=float, default=.8)
+    export.add_argument("--grace-threshold", type=float, default=.8, help="Minimum presence and attribute confidence for anchored grace notation.")
     export.add_argument("--chord-tolerance", type=float, default=.04)
-    export.add_argument("--same-string-gap", type=float, default=.08)
+    export.add_argument("--same-string-gap", type=float, default=0., help="Opt-in temporal suppression in seconds; zero preserves distinct reattacks.")
     export.add_argument("--include-beat-unsupported-tail", action="store_true", help="Keep attacks after the final detected beat using extrapolated timing; raw JSON always retains them.")
     args = parser.parse_args(argv)
     try:

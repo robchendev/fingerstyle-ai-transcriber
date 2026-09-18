@@ -250,13 +250,38 @@ def _validate_predictions(document):
             "connection": value.get("connection", "none"),
             "connectionToken": value.get("_connectionToken"),
             "connectionOriginToken": value.get("_connectionOriginToken"),
+            "techniqueSchemaVersion": value.get("techniqueSchemaVersion", 3),
             "noteTechniques": deepcopy(value.get("noteTechniques", {})),
             "bendCurve": deepcopy(value.get("bendCurve")),
+            "grace": deepcopy(value.get("grace")),
         }
         if note["connection"] not in ("none", "hammer_on", "pull_off", *(f"slide_{value}" for value in (1, 2, 4, 8, 16, 20, 32))):
             raise HarnessError("Predicted note connection is unsupported.")
         if note["confidence"] > 1:
             raise HarnessError("Note confidence must be from zero through one.")
+        grace = note["grace"]
+        if grace is not None:
+            if not isinstance(grace, dict) or grace.get("mode") not in ("OnBeat", "BeforeBeat") or grace.get("transition") not in ("none", "hammer_on", "pull_off", "slide_1", "slide_2"):
+                raise HarnessError("Anchored grace notation requires a supported mode and transition.")
+            source_pitch = _integer(grace.get("sourcePitchMidi"), "Grace source pitch", 0, 127)
+            if grace.get("onsetSeconds") is not None or grace.get("timingKnown") is not False:
+                raise HarnessError("Anchored grace gestures must not invent an independent audio onset.")
+            if grace.get("anchorNoteId") != value.get("noteId"):
+                raise HarnessError("Grace gesture refers to a different main-note anchor.")
+            source_fret = source_pitch - tuning[6 - note["string"]] - capo
+            delta = note["soundingPitchMidi"] - source_pitch
+            valid = (
+                note["harmonic"] is None and 0 <= source_fret <= 24
+                and grace.get("intervalSemitones") == delta
+                and (grace["transition"] != "hammer_on" or delta > 0)
+                and (grace["transition"] != "pull_off" or delta < 0)
+                and (not grace["transition"].startswith("slide_") or delta != 0)
+            )
+            if valid:
+                grace["selectedFret"] = source_fret
+            else:
+                note["rejectedGrace"] = {"reason": "grace_pitch_or_transition_infeasible_after_fingering", "gesture": grace}
+                note["grace"] = None
         notes.append(note)
     percussion = []
     for index, value in enumerate(document.get("percussion", [])):
@@ -437,8 +462,15 @@ def _resolve_percussion(percussion):
 
 def _bind_connection_origins(document):
     notes = document["notes"]
+    seen = set()
     for index, note in enumerate(notes):
-        note["_connectionToken"] = f"connection-note-{index}"
+        token = note.get("noteId") if note.get("techniqueSchemaVersion") == 4 else f"connection-note-{index}"
+        if not isinstance(token, str) or not token or token in seen:
+            raise HarnessError("V4 notes require unique stable decoder note IDs.")
+        seen.add(token)
+        note["_connectionToken"] = token
+        if note.get("techniqueSchemaVersion") == 4:
+            note["_connectionOriginToken"] = note.get("connectionOriginNoteId")
     by_string = defaultdict(list)
     for note in notes:
         by_string[note["string"]].append(note)
@@ -449,7 +481,7 @@ def _bind_connection_origins(document):
             note["_connectionToken"],
         ))
         for prior, note in zip(values, values[1:]):
-            if note.get("connection", "none") != "none":
+            if note.get("connection", "none") != "none" and note.get("techniqueSchemaVersion") != 4:
                 note["_connectionOriginToken"] = prior["_connectionToken"]
     return document
 
@@ -687,6 +719,7 @@ def _template_invariant(root):
 
 class _ScoreWriter:
     def __init__(self, root, tuning, capo, measures, notes, percussion, techniques, key_count, spellings, *, simplified):
+        notes = deepcopy(notes)
         self.root = root
         self.tuning = tuning
         self.capo = capo
@@ -702,6 +735,14 @@ class _ScoreWriter:
         self.fallbacks = []
         self.connection_fallbacks = []
         self.articulation_fallbacks = []
+        for note in notes:
+            if note.get("rejectedGrace"):
+                self.articulation_fallbacks.append({
+                    "id": note["id"], "onsetQuarter": _rational(note["onset"]), **note["rejectedGrace"],
+                })
+            grace = note.get("grace")
+            if grace is not None and grace["transition"] in ("hammer_on", "pull_off"):
+                note["hopoDestination"] = True
         by_string = defaultdict(list)
         for note in notes:
             by_string[note["string"]].append(note)
@@ -717,7 +758,11 @@ class _ScoreWriter:
                 continue
             prior = by_token.get(note.get("connectionOriginToken"))
             valid = prior is not None and previous.get(note["connectionToken"]) is prior
-            valid = valid and prior["string"] == note["string"] and note["onset"] - prior["onset"] <= 2
+            valid = valid and prior["string"] == note["string"] and prior["onset"] < note["onset"]
+            if note.get("techniqueSchemaVersion") == 4:
+                valid = valid and prior["voice"] == note["voice"] and prior["end"] >= note["onset"] and note.get("grace") is None
+            else:
+                valid = valid and note["onset"] - prior["onset"] <= 2
             if connection == "hammer_on":
                 valid = valid and note["soundingPitchMidi"] > prior["soundingPitchMidi"]
             elif connection == "pull_off":
@@ -811,9 +856,22 @@ class _ScoreWriter:
             if note.get(name) and (not incoming if attack_only else not outgoing):
                 native = "HopoOrigin" if name == "hopoOrigin" else "HopoDestination"
                 ET.SubElement(ET.SubElement(props, "Property", name=native), "Enable")
-        if note.get("slideFlags") and not outgoing:
-            ET.SubElement(ET.SubElement(props, "Property", name="Slide"), "Flags").text = str(note["slideFlags"])
         technique_scores = note.get("noteTechniques", {})
+        slide_flags = note.get("slideFlags", 0) if not outgoing else 0
+        for name, bit, enabled in (
+            ("slide_in_below", 16, not incoming), ("slide_in_above", 32, not incoming),
+            ("slide_out_down", 4, not outgoing), ("slide_out_up", 8, not outgoing),
+        ):
+            if enabled and technique_scores.get(name, 0) >= .5:
+                slide_flags |= bit
+        if slide_flags & 48 == 48 or sum(bool(slide_flags & bit) for bit in (1, 2, 4, 8)) > 1:
+            self.articulation_fallbacks.append({
+                "id": note["id"], "onsetQuarter": _rational(start),
+                "reason": "conflicting_native_slide_flags", "predictedFlags": slide_flags,
+            })
+            slide_flags = (slide_flags & 48 if slide_flags & 48 != 48 else 0) | (note.get("slideFlags", 0) if not outgoing else 0)
+        if slide_flags:
+            ET.SubElement(ET.SubElement(props, "Property", name="Slide"), "Flags").text = str(slide_flags)
         for name, native in (("tap", "Tapped"), ("left_hand_tap", "LeftHandTapped")):
             if technique_scores.get(name, 0) >= .5 and not incoming:
                 ET.SubElement(ET.SubElement(props, "Property", name=native), "Enable")
@@ -843,6 +901,35 @@ class _ScoreWriter:
             ET.SubElement(ET.SubElement(props, "Property", name="HarmonicType"), "HType").text = note["harmonic"]["type"]
         self.root.find("Notes").append(node)
         return identifier
+
+    def grace_beats(self, active, onset, voice):
+        groups = defaultdict(list)
+        for note in active:
+            if note["onset"] == onset and note.get("grace") is not None:
+                groups[note["grace"]["mode"]].append(note)
+        result = []
+        for mode, notes in sorted(groups.items()):
+            beat = ET.Element("Beat", id=self.identifier("Beats"))
+            ET.SubElement(beat, "Dynamic").text = "MF"
+            ET.SubElement(beat, "Rhythm", ref=self.rhythm(("32nd", 0, None)))
+            ET.SubElement(beat, "GraceNotes").text = mode
+            ET.SubElement(beat, "TransposedPitchStemOrientation").text = "Upward" if voice == 0 else "Downward"
+            ids = []
+            for note in sorted(notes, key=lambda item: -item["string"]):
+                grace = note["grace"]
+                source = {
+                    **note, "fret": grace["selectedFret"], "basePitchMidi": grace["sourcePitchMidi"],
+                    "soundingPitchMidi": grace["sourcePitchMidi"], "onset": onset, "end": onset,
+                    "harmonic": None, "noteTechniques": {}, "bendCurve": None,
+                    "hopoOrigin": grace["transition"] in ("hammer_on", "pull_off"),
+                    "hopoDestination": False,
+                    "slideFlags": int(grace["transition"].split("_")[1]) if grace["transition"].startswith("slide_") else 0,
+                }
+                ids.append(self.pitched_note(source, onset, onset))
+            ET.SubElement(beat, "Notes").text = " ".join(ids)
+            self.root.find("Beats").append(beat)
+            result.append(beat.get("id"))
+        return result
 
     def percussion_note(self, event, string):
         identifier = self.identifier("Notes")
@@ -966,6 +1053,7 @@ class _ScoreWriter:
                 stop = cursor + duration
                 local_carriers = carriers if cursor == left else []
                 local_text = text if cursor == left else ""
+                beats.extend(self.grace_beats(active, cursor, voice))
                 beats.append(self.beat(notation, active, local_carriers, local_text, techniques if cursor == left else [], voice, cursor, stop))
                 cursor = stop
         return beats
@@ -1105,7 +1193,11 @@ def _build_variant(template_raw, notes, percussion, techniques, measures, tuning
     preference = root.findtext("./MasterBars/MasterBar/Key/TransposeAs", "Sharps")
     if preference not in ("Sharps", "Flats"):
         preference = "Sharps"
-    key_count, spellings, accidental_count = _select_key(notes, measures, preference, offsets["TransposedPitch"])
+    key_notes = notes + [
+        {**note, "basePitchMidi": note["grace"]["sourcePitchMidi"]}
+        for note in notes if note.get("grace") is not None
+    ]
+    key_count, spellings, accidental_count = _select_key(key_notes, measures, preference, offsets["TransposedPitch"])
     writer = _ScoreWriter(root, tuning, capo, measures, notes, percussion, techniques, key_count, spellings, simplified=simplified)
     fallbacks = writer.build()
     _tempo_automations(root, tempo, measures, notated_tempo_changes, initial_tempo)
@@ -1168,19 +1260,6 @@ def write_gp_outputs(template_path, predictions, full_path, single_path, *, prof
         from .rhythm_inference import infer_notated_timing
 
         cleaned, rhythm_inference = infer_notated_timing(cleaned, beat_evidence, include_unsupported_tail=include_unsupported_tail)
-    completion = None
-    if completer is not None:
-        from .symbolic_completer import complete_document
-
-        cleaned, completion = complete_document(
-            completer, cleaned, threshold=completion_threshold,
-            technique_threshold=completion_technique_threshold,
-        )
-    paired_brush_completion = None
-    if rhythm_inference is not None:
-        from .symbolic_completer import complete_pre_downbeat_brush_pairs
-
-        cleaned, paired_brush_completion = complete_pre_downbeat_brush_pairs(cleaned)
     cleaned = _bind_connection_origins(cleaned)
     arranger_applied = False
     if arranger is not None:
@@ -1191,6 +1270,23 @@ def write_gp_outputs(template_path, predictions, full_path, single_path, *, prof
     from .fingering_optimizer import optimize_fingerings
 
     cleaned, fingering_optimization = optimize_fingerings(cleaned)
+    completion = None
+    fingering_before_completion = None
+    if completer is not None:
+        from .symbolic_completer import complete_document
+
+        fingering_before_completion = fingering_optimization
+        cleaned, completion = complete_document(
+            completer, cleaned, threshold=completion_threshold,
+            technique_threshold=completion_technique_threshold,
+        )
+        if completion["addedCount"]:
+            for index, note in enumerate(cleaned["notes"]):
+                if "_connectionToken" not in note:
+                    note["_connectionToken"] = f"completed-note-{index}"
+            if arranger is not None:
+                cleaned = apply_arranger(arranger, cleaned)
+            cleaned, fingering_optimization = optimize_fingerings(cleaned)
     voice_optimization = None
     if rhythm_inference is not None:
         from .voice_optimizer import optimize_voices
@@ -1221,9 +1317,10 @@ def write_gp_outputs(template_path, predictions, full_path, single_path, *, prof
         "draftCleanup": cleanup,
         "rhythmInference": rhythm_inference,
         "fingeringOptimization": fingering_optimization,
+        "fingeringBeforeCompletion": fingering_before_completion,
         "fingeringArrangerApplied": arranger_applied,
         "symbolicCompletion": completion,
-        "pairedBrushCompletion": paired_brush_completion,
+        "strokePolicy": "Preserve predicted attacks; never fabricate a paired stroke from bar position alone.",
         "voiceOptimization": voice_optimization,
         "rhythmicGridPolicy": {
             "mode": "beat-anchored-constrained" if structured else "nominal-tempo-fallback",

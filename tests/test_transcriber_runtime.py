@@ -40,6 +40,8 @@ WEIGHTS = {
     "connection_positive": 2.0, "connection_negative": 1.0,
     "note_technique_positive": 2.0, "note_technique_negative": 1.0,
     "bend_curve": 0.5,
+    "grace_positive": 2.0, "grace_negative": 1.0,
+    "grace_fret": 1.0, "grace_mode": 0.5, "grace_transition": 1.0,
 }
 STAT_KEYS = (
     "note_onset_positive", "note_onset_negative", "fret", "pitch", "voice", "duration_log",
@@ -50,6 +52,7 @@ STAT_KEYS = (
     "connection_positive", "connection_negative",
     "note_technique_positive", "note_technique_negative",
     "bend_curve",
+    "grace_positive", "grace_negative", "grace_fret", "grace_mode", "grace_transition",
 )
 
 
@@ -372,6 +375,22 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(no_op["best_event_score"], expected_score)
         self.assertEqual(no_op["best_event_checkpoint"], resumed["best_event_checkpoint"])
         self.assertEqual(before, Path(no_op["best_event_checkpoint"]).read_bytes())
+
+    def test_v4_event_selection_components_survive_checkpoint_and_resume(self):
+        result = {
+            "score": .4, "metric": "harmonic-mean-base-event-micro-f1-and-non-none-technique-macro-f1@100ms-v4",
+            "windows": 2, "baseEventScore": .6, "nonNoneTechniqueScore": .3, "techniqueClasses": 5,
+        }
+        summary, _ = self.train(event_evaluator=lambda model: result)
+        checkpoint = runtime.load_checkpoint(summary["best_event_checkpoint"])
+        self.assertEqual(checkpoint["history"][-1]["validation"]["decoded_events"], result)
+        resumed, _ = self.train(
+            config=replace(self.config, max_steps=3), resume=summary["latest_checkpoint"],
+            event_evaluator=lambda model: result,
+        )
+        self.assertEqual(resumed["best_event_score"], .4)
+        with self.assertRaisesRegex(ValueError, "harmonic mean"):
+            runtime._event_result({**result, "score": .9})
 
     def test_event_resume_preserves_prior_best_then_updates_only_on_improvement(self):
         def result(score, windows):
@@ -1146,6 +1165,9 @@ class RuntimeTests(unittest.TestCase):
             "note_technique_positive": {"sum": 0.0, "count": 0},
             "note_technique_negative": {"sum": 0.0, "count": 0},
             "bend_curve": {"sum": 0.0, "count": 0},
+            **{name: {"sum": 0.0, "count": 0} for name in (
+                "grace_positive", "grace_negative", "grace_fret", "grace_mode", "grace_transition",
+            )},
         }
         parsed = runtime._stats(stats, weights)
         self.assertAlmostEqual(runtime._objective(parsed, weights, 0.02), 1.5 + 0.5 + 37 / 14 + 0.02 * (0.5 + 0.2))

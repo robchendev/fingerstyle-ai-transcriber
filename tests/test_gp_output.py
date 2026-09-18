@@ -81,6 +81,91 @@ def gp_root(path):
 
 
 class GpOutputTests(unittest.TestCase):
+    def test_v4_grace_slide_has_zero_score_advance_and_terminal_slides_stay_local(self):
+        document = hypotheses()
+        document["notes"] = [{
+            **document["notes"][0], "noteId": "anchor", "techniqueSchemaVersion": 4,
+            "onsetSeconds": 0., "string": 1, "fret": 2, "soundingPitchMidi": 66,
+            "voiceIndex": 0, "notatedDurationQuarter": 1., "harmonic": None,
+            "confidence": .99, "connection": "none", "connectionOriginNoteId": None,
+            "noteTechniques": {"slide_out_down": .99, "slide_in_below": .99},
+            "grace": {
+                "anchorNoteId": "anchor", "confidence": .99,
+                "sourceFret": 1, "sourcePitchMidi": 65, "intervalSemitones": 1,
+                "mode": "OnBeat", "transition": "slide_2",
+                "fretConfidence": .99, "modeConfidence": .99, "transitionConfidence": .99,
+                "onsetSeconds": None, "timingKnown": False,
+            },
+        }]
+        document["percussion"] = []
+        with TemporaryDirectory(dir=ROOT) as directory:
+            directory = Path(directory)
+            template, full, single = directory / "template.gpt", directory / "full.gp", directory / "single.gp"
+            template.write_bytes(archive_bytes(output_template()))
+            write_gp_outputs(template, document, full, single)
+            for path in (full, single):
+                root = gp_root(path)
+                decoded = decode_score(root, document["metadata"]["openStringMidi"], 0)
+                grace = [beat for beat in decoded["scoreEvents"] if beat["graceMode"]]
+                self.assertEqual(len(grace), 1)
+                self.assertEqual(grace[0]["advanceQuarter"], [0, 1])
+                self.assertEqual(grace[0]["notes"][0]["soundingPitchMidi"], 65)
+                self.assertEqual(grace[0]["notes"][0]["techniques"]["slideFlags"], 2)
+                main = [beat for beat in decoded["scoreEvents"] if beat["graceMode"] is None and beat["notes"]]
+                self.assertEqual(main[0]["notes"][0]["techniques"]["slideFlags"], 20)
+
+    def test_v4_filtered_origin_is_never_rebound_to_remaining_note(self):
+        document = hypotheses()
+        document["percussion"] = []
+        document["notes"] = [{
+            **document["notes"][0], "noteId": name, "techniqueSchemaVersion": 4,
+            "onsetSeconds": seconds, "string": 1, "fret": pitch - 64, "soundingPitchMidi": pitch,
+            "voiceIndex": 0, "notatedDurationQuarter": 1., "harmonic": None,
+            "confidence": confidence, "connection": "hammer_on" if name == "destination" else "none",
+            "connectionConfidence": .99, "connectionOriginNoteId": "filtered-origin" if name == "destination" else None,
+        } for name, seconds, pitch, confidence in (
+            ("unrelated", 0., 64, .99), ("filtered-origin", .5, 65, .2), ("destination", 1., 67, .99),
+        )]
+        with TemporaryDirectory(dir=ROOT) as directory:
+            directory = Path(directory)
+            template, full, single = directory / "template.gpt", directory / "full.gp", directory / "single.gp"
+            template.write_bytes(archive_bytes(output_template()))
+            report = write_gp_outputs(template, document, full, single)
+            self.assertFalse(gp_root(single).findall("./Notes/Note/Properties/Property[@name='HopoDestination']"))
+            self.assertTrue(report["singleVoice"]["connectionFallbacks"])
+
+    def test_paired_32nds_keep_distinct_attacks_without_inventing_brushes(self):
+        document = hypotheses()
+        document["notes"] = [{
+            **document["notes"][0], "onsetSeconds": onset, "string": 1, "fret": 0,
+            "soundingPitchMidi": 64, "voiceIndex": 0, "harmonic": None,
+            "confidence": .99, "notatedDurationQuarter": .125, "uncertainty": [],
+        } for onset in (1.875, 1.9375, 2.)]
+        document["percussion"] = []
+        document["techniques"] = [{
+            "onsetSeconds": 1.875, "technique": "brush", "direction": "Down",
+            "strings": [1], "confidence": .99,
+            "stringMembershipConfidence": {str(i): .99 if i == 1 else .01 for i in range(1, 7)},
+        }]
+        beat_evidence = {
+            "kind": "audio-beat-evidence", "audioSha256": "audio",
+            "beatSeconds": [i / 2 for i in range(11)], "downbeatSeconds": [0., 2., 4.],
+        }
+        with TemporaryDirectory(dir=ROOT) as directory:
+            directory = Path(directory)
+            template, full, single = directory / "template.gpt", directory / "full.gp", directory / "single.gp"
+            template.write_bytes(archive_bytes(output_template()))
+            write_gp_outputs(template, document, full, single, beat_evidence=beat_evidence)
+            for path in (full, single):
+                root = gp_root(path)
+                score = decode_score(root, document["metadata"]["openStringMidi"], 0)
+                positions = [
+                    Fraction(*beat["scoreOnsetQuarter"]) for beat in score["scoreEvents"]
+                    for note in beat["notes"] if not note["tie"]["destination"]
+                ]
+                self.assertEqual(positions, [Fraction(15, 4), Fraction(31, 8), Fraction(4)])
+                self.assertEqual(len(root.findall("./Beats/Beat/Properties/Property[@name='Brush']")), 1)
+
     def test_tempo_map_integrates_constant_and_linear_tempo(self):
         mapping = TempoMap({
             "tempo": {"bpm": 60, "beatUnit": [1, 4], "linear": True},
@@ -251,7 +336,7 @@ class GpOutputTests(unittest.TestCase):
             self.assertIsNotNone(notes[1].find("./Properties/Property[@name='Bended']/Enable"))
             self.assertEqual(notes[1].findtext("./Properties/Property[@name='BendDestinationValue']/Float"), "25.000000")
 
-    def test_connection_is_suppressed_if_fingering_moves_it_to_another_origin(self):
+    def test_connection_keeps_original_pair_or_is_suppressed_after_fingering(self):
         document = hypotheses()
         document["notes"] = [
             {
@@ -276,9 +361,14 @@ class GpOutputTests(unittest.TestCase):
             template.write_bytes(archive_bytes(output_template()))
             report = write_gp_outputs(template, document, full, single)
             root = gp_root(full)
-            self.assertFalse(root.findall("./Notes/Note/Properties/Property[@name='HopoOrigin']"))
-            self.assertFalse(root.findall("./Notes/Note/Properties/Property[@name='HopoDestination']"))
-            self.assertEqual(report["fullVoices"]["connectionFallbacks"][0]["reason"], "invalid_connection_relationship")
+            origins = [n for n in root.findall("./Notes/Note") if n.find("./Properties/Property[@name='HopoOrigin']") is not None]
+            destinations = [n for n in root.findall("./Notes/Note") if n.find("./Properties/Property[@name='HopoDestination']") is not None]
+            if origins:
+                self.assertEqual([n.findtext("./Properties/Property[@name='Midi']/Number") for n in origins], ["57"])
+                self.assertEqual([n.findtext("./Properties/Property[@name='Midi']/Number") for n in destinations], ["60"])
+            else:
+                self.assertFalse(destinations)
+                self.assertEqual(report["fullVoices"]["connectionFallbacks"][0]["reason"], "invalid_connection_relationship")
 
     def test_attack_articulations_are_not_repeated_on_tied_continuations(self):
         document = hypotheses()

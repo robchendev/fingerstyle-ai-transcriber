@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass
 import math
 
 from .transcriber_audio import HarnessError
+from .gp_events import validate_provided_timing
 
 
 @dataclass(frozen=True)
@@ -23,8 +24,9 @@ class DraftProfile:
     rasgueado_membership_threshold: float = 0.8
     connection_threshold: float = 0.8
     note_technique_threshold: float = 0.8
+    grace_threshold: float = 0.8
     chord_tolerance_seconds: float = 0.04
-    same_string_gap_seconds: float = 0.08
+    same_string_gap_seconds: float = 0.0
 
     def __post_init__(self):
         if type(self.include_harmonics) is not bool:
@@ -34,7 +36,7 @@ class DraftProfile:
             "brush_threshold", "arpeggio_threshold", "pick_stroke_threshold", "rasgueado_threshold",
             "brush_membership_threshold", "arpeggio_membership_threshold",
             "pick_stroke_membership_threshold", "rasgueado_membership_threshold",
-            "connection_threshold", "note_technique_threshold",
+            "connection_threshold", "note_technique_threshold", "grace_threshold",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1:
@@ -82,18 +84,30 @@ def _representative_time(events):
 
 def _cluster_notes(notes, tolerance, removed, onset_adjustments):
     result = []
-    for cluster in _time_clusters(notes, tolerance):
+    clusters = []
+    for note in sorted(notes, key=lambda item: (_onset(item), -_confidence(item))):
+        string = note.get("string")
+        if type(string) is not int or not 1 <= string <= 6:
+            raise HarnessError("Draft cleanup requires physical note strings from one through six.")
+        prior = clusters[-1] if clusters else []
+        reattack = any(value["string"] == string and _onset(value) != _onset(note) for value in prior)
+        if not prior or _onset(note) - _onset(prior[0]) > tolerance or reattack:
+            clusters.append([note])
+        else:
+            prior.append(note)
+    for cluster in clusters:
         time = _representative_time(cluster)
         strings = {}
         for note in cluster:
             string = note.get("string")
             if type(string) is not int or not 1 <= string <= 6:
                 raise HarnessError("Draft cleanup requires physical note strings from one through six.")
-            current = strings.get(string)
+            key = (string, note.get("soundingPitchMidi"))
+            current = strings.get(key)
             if current is None or (_confidence(note), -_onset(note)) > (_confidence(current), -_onset(current)):
                 if current is not None:
                     removed.append({"reason": "same_string_chord_cluster", "event": current})
-                strings[string] = note
+                strings[key] = note
             else:
                 removed.append({"reason": "same_string_chord_cluster", "event": note})
         for note in strings.values():
@@ -155,7 +169,7 @@ def _clean_harmonics(notes, profile):
     return removed
 
 
-def _clean_percussion(percussion, note_times, profile, removed, onset_adjustments):
+def _clean_percussion(percussion, note_times, profile, removed, onset_adjustments, grouping_tolerance):
     filtered = []
     for event in percussion:
         if _confidence(event) < profile.percussion_threshold:
@@ -163,12 +177,12 @@ def _clean_percussion(percussion, note_times, profile, removed, onset_adjustment
         else:
             filtered.append(deepcopy(event))
     result = []
-    for cluster in _time_clusters(filtered, profile.chord_tolerance_seconds):
+    for cluster in _time_clusters(filtered, grouping_tolerance):
         nearest = None
         center = _representative_time(cluster)
         if note_times:
             candidate = min(note_times, key=lambda value: abs(value - center))
-            if abs(candidate - center) <= profile.chord_tolerance_seconds:
+            if abs(candidate - center) <= grouping_tolerance:
                 nearest = candidate
         time = center if nearest is None else nearest
         techniques = {}
@@ -202,19 +216,31 @@ def clean_hypotheses(document, profile=DraftProfile()):
     if not isinstance(profile, DraftProfile):
         raise TypeError("profile must be DraftProfile.")
     source = deepcopy(document)
+    grouping_tolerance = profile.chord_tolerance_seconds
+    metadata = document.get("metadata")
+    if metadata is not None:
+        if not isinstance(metadata, dict) or not {"tempo", "timeSignature"} <= metadata.keys():
+            raise HarnessError("Chord grouping requires explicit tempo and meter when metadata is supplied.")
+        changes = metadata.get("tempoChanges", [])
+        if not isinstance(changes, list):
+            raise HarnessError("Chord grouping requires a list of tempo changes.")
+        tempos = [metadata["tempo"], *changes]
+        fastest_quarter_bpm = max(float(validate_provided_timing(tempo, metadata["timeSignature"])) for tempo in tempos)
+        grouping_tolerance = min(grouping_tolerance, 60 / fastest_quarter_bpm / 16)
     removed_notes = []
     onset_adjustments = []
     selected = []
     for note in source["notes"]:
-        if _confidence(note) < profile.note_threshold:
+        membership_completed = "technique_membership_completed_attack" in note.get("uncertainty", [])
+        if _confidence(note) < profile.note_threshold and not membership_completed:
             removed_notes.append({"reason": "below_note_threshold", "event": note})
         else:
             selected.append(note)
-    selected = _cluster_notes(selected, profile.chord_tolerance_seconds, removed_notes, onset_adjustments)
+    selected = _cluster_notes(selected, grouping_tolerance, removed_notes, onset_adjustments)
     selected = _suppress_same_string(selected, profile.same_string_gap_seconds, removed_notes)
     removed_harmonics = _clean_harmonics(selected, profile)
     removed_percussion = []
-    percussion = _clean_percussion(source["percussion"], sorted({_onset(note) for note in selected}), profile, removed_percussion, onset_adjustments)
+    percussion = _clean_percussion(source["percussion"], sorted({_onset(note) for note in selected}), profile, removed_percussion, onset_adjustments, grouping_tolerance)
     source["notes"] = selected
     source["percussion"] = percussion
     removed_techniques = []
@@ -263,9 +289,15 @@ def clean_hypotheses(document, profile=DraftProfile()):
         if "technique_membership_completed_attack" not in note.get("uncertainty", []):
             retained_notes.append(note)
             continue
+        parent = note.get("completionParent")
+        if parent is not None and (not isinstance(parent, dict) or not {"technique", "onsetSeconds"} <= parent.keys()):
+            raise HarnessError("Completed attack parent requires technique and onsetSeconds.")
+        if parent is not None:
+            _onset(parent)
         supported = any(
             note["string"] in event["strings"]
             and abs(_onset(note) - _onset(event)) <= profile.chord_tolerance_seconds
+            and (parent is None or (event["technique"] == parent["technique"] and _onset(event) == _onset(parent)))
             for event in retained_techniques
         )
         if supported:
@@ -275,6 +307,7 @@ def clean_hypotheses(document, profile=DraftProfile()):
     source["notes"] = retained_notes
     removed_connections = []
     removed_note_techniques = []
+    removed_grace = []
     for note in retained_notes:
         connection = note.get("connection", "none")
         if connection != "none":
@@ -292,7 +325,7 @@ def clean_hypotheses(document, profile=DraftProfile()):
             raise HarnessError("Predicted note techniques must be a confidence mapping.")
         retained_scores = {}
         for technique, confidence in scores.items():
-            if technique not in ("bend", "tap", "left_hand_tap", "vibrato"):
+            if technique not in ("bend", "tap", "left_hand_tap", "vibrato", "slide_out_down", "slide_out_up", "slide_in_below", "slide_in_above"):
                 raise HarnessError(f"Unsupported predicted note technique: {technique}")
             if isinstance(confidence, bool) or type(confidence) not in (int, float) or not math.isfinite(confidence) or not 0 <= confidence <= 1:
                 raise HarnessError("Predicted note-technique confidence must be finite and from zero through one.")
@@ -306,10 +339,27 @@ def clean_hypotheses(document, profile=DraftProfile()):
         note["noteTechniques"] = retained_scores
         if "bend" not in retained_scores:
             note["bendCurve"] = None
+        grace = note.get("grace")
+        if grace is not None:
+            if not isinstance(grace, dict):
+                raise HarnessError("An anchored grace gesture must be an object.")
+            fields = ("confidence", "fretConfidence", "modeConfidence", "transitionConfidence")
+            for field in fields:
+                confidence = grace.get(field)
+                if type(confidence) not in (int, float) or not math.isfinite(confidence) or not 0 <= confidence <= 1:
+                    raise HarnessError(f"Grace {field} must be a finite zero-to-one score.")
+            if any(grace[field] < profile.grace_threshold for field in fields):
+                removed_grace.append({
+                    "onsetSeconds": _onset(note), "string": note["string"],
+                    "reason": "below_grace_presence_or_attribute_threshold", "grace": deepcopy(grace),
+                })
+                note["grace"] = None
     return source, {
         "schemaVersion": 1,
         "kind": "editable-draft-cleanup",
         "profile": asdict(profile),
+        "effectiveChordGroupingSeconds": grouping_tolerance,
+        "reattackPolicy": "Distinct same-string attack times split chord clusters; different simultaneous pitches survive for fingering resolution. Temporal suppression is disabled by default.",
         "sourceCounts": {"notes": len(document["notes"]), "percussion": len(document["percussion"])},
         "retainedCounts": {"notes": len(retained_notes), "percussion": len(percussion)},
         "removedNoteCount": len(removed_notes) + len(removed_orphan_members),
@@ -332,5 +382,6 @@ def clean_hypotheses(document, profile=DraftProfile()):
         "removedTechniques": removed_techniques,
         "removedConnections": removed_connections,
         "removedNoteTechniques": removed_note_techniques,
+        "removedGraceGestures": removed_grace,
         "rawHypothesesModified": False,
     }
