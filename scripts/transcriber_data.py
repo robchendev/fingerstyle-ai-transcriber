@@ -88,6 +88,7 @@ def training_conditioning(record, clip_times):
 def encode_targets(window, canonical, frame_times, model_config, *, negative_onsets_allowed):
     from .transcriber_model import HARMONIC_FRETS, HARMONIC_TYPES, PERCUSSION_TYPES
     from .technique_supervision import TECHNIQUE_DIRECTIONS, TECHNIQUE_TYPES
+    from .connection_supervision import BEND_FIELDS, CONNECTION_TYPES, NOTE_TECHNIQUE_TYPES
 
     count = len(frame_times)
     targets = {name: torch.zeros((count, 6), dtype=torch.long if name in {"fret", "pitch", "voice", "harmonic_kind", "harmonic_node"} else torch.float32) for name in ("note_onset", "fret", "pitch", "voice", "duration_log", "harmonic", "harmonic_kind", "harmonic_node")}
@@ -97,6 +98,10 @@ def encode_targets(window, canonical, frame_times, model_config, *, negative_ons
         targets["technique"] = torch.zeros((count, len(TECHNIQUE_TYPES)))
         targets["technique_direction"] = torch.zeros((count, len(TECHNIQUE_TYPES)), dtype=torch.long)
         targets["technique_strings"] = torch.zeros((count, len(TECHNIQUE_TYPES), 6))
+    if architecture_version >= 3:
+        targets["connection"] = torch.zeros((count, 6), dtype=torch.long)
+        targets["note_technique"] = torch.zeros((count, 6, len(NOTE_TECHNIQUE_TYPES)))
+        targets["bend_curve"] = torch.zeros((count, 6, len(BEND_FIELDS)))
     masks = {name: torch.zeros_like(value, dtype=torch.bool) for name, value in targets.items()}
     hop = frame_times[1] - frame_times[0] if count > 1 else .02
     valid_interior = (frame_times >= .5) & (frame_times < frame_times[-1] - .5)
@@ -198,6 +203,23 @@ def encode_targets(window, canonical, frame_times, model_config, *, negative_ons
                         if type(string_number) is not int or not 1 <= string_number <= 6:
                             raise HarnessError("Technique membership requires physical strings one through six.")
                         targets["technique_strings"][index, axis, 6 - string_number] = 1
+    if architecture_version >= 3:
+        connection_events = window["targets"].get("connections", [])
+        if not isinstance(connection_events, list):
+            raise HarnessError("Connection targets must be a list.")
+        for event in connection_events:
+            index = int(np.argmin(np.abs(frame_times - event["onsetWindowSeconds"])))
+            axis = 6 - event["string"]
+            if event["supervisionMask"]["connection"]:
+                targets["connection"][index, axis] = CONNECTION_TYPES.index(event["connection"])
+                masks["connection"][index, axis] = True
+            if event["supervisionMask"]["techniques"]:
+                masks["note_technique"][index, axis] = True
+                for name, present in event["techniques"].items():
+                        targets["note_technique"][index, axis, NOTE_TECHNIQUE_TYPES.index(name)] = int(present)
+            if event["bendCurveMask"]:
+                targets["bend_curve"][index, axis] = torch.tensor(event["bendCurve"], dtype=torch.float32) / 100
+                masks["bend_curve"][index, axis] = True
     percussion_events = []
     for gesture in window["targets"]["gestures"]:
         source = source_gestures[gesture["sourceGestureId"]]
@@ -280,6 +302,13 @@ class TrainingDataset(Dataset):
             local_window["targets"]["techniques"] = techniques_in_window(
                 record["techniques"], window["startSample"], window["stopSampleExclusive"], record["row"]["sampleRate"],
             )
+        if self.model_config.architecture_version >= 3:
+            from .connection_supervision import connections_in_window
+
+            local_window = deepcopy(local_window)
+            local_window["targets"]["connections"] = connections_in_window(
+                record["connections"], window["startSample"], window["stopSampleExclusive"], record["row"]["sampleRate"],
+            )
         targets, masks, collisions = encode_targets(local_window, record["data"].labels, times, self.model_config, negative_onsets_allowed=record["negativeAllowed"])
         return {
             "features": features, "conditioning": conditioning, "targets": targets, "masks": masks,
@@ -322,6 +351,10 @@ class TrainingDataset(Dataset):
 
                 record["techniques"] = projected_techniques(labels, payload["candidate"], ScoreClock(labels, payload["normalization"]))
                 record["techniqueAnnotationsComplete"] = True
+            if model_config.architecture_version >= 3:
+                from .connection_supervision import projected_connections
+
+                record["connections"] = projected_connections(labels, payload["candidate"], ScoreClock(labels, payload["normalization"]))
             self.records.append(record)
             self.windows.extend((record, window) for window in payload["windows"])
         if len(self.windows) != manifest["counts"]["windowsBySplit"][split]:

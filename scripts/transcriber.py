@@ -35,7 +35,7 @@ def default_config():
     from .transcriber_model import ModelConfig
     from .transcriber_runtime import TrainingConfig
     return {
-        "schemaVersion": 1, "features": asdict(FeatureConfig()), "model": asdict(ModelConfig(architecture_version=2)),
+        "schemaVersion": 1, "features": asdict(FeatureConfig()), "model": asdict(ModelConfig(architecture_version=3)),
         "training": asdict(TrainingConfig()),
         "data": {"manifest": "data\\releases\\dataset-v1\\manifest.json", "batch_size": 4, "num_workers": 0, "num_threads": 4, "cache": "cache\\transcriber"},
     }
@@ -223,13 +223,15 @@ def initialize_model(model, target_config, checkpoint_path, manifest_sha256):
     checkpoint = load_checkpoint(checkpoint_path)
     source = ModelConfig(**checkpoint["identity"]["model"])
     source_values, target_values = asdict(source), asdict(target_config)
-    if source_values.pop("architecture_version") != 1 or target_values.pop("architecture_version") != 2 or source_values != target_values:
-        raise HarnessError("V2 initialization requires a compatible architecture-v1 checkpoint differing only by architecture_version.")
+    source_version = source_values.pop("architecture_version")
+    target_version = target_values.pop("architecture_version")
+    if target_version != source_version + 1 or source_values != target_values:
+        raise HarnessError("Initialization requires compatible consecutive architecture versions differing only by architecture_version.")
     if checkpoint["identity"]["manifest_sha256"] != manifest_sha256 or checkpoint["global_step"] <= 0:
         raise HarnessError("V2 initialization requires a trained architecture-v1 checkpoint from the same release.")
     current = model.state_dict()
     state = checkpoint["model_state"]
-    new_keys = {key for key in current if key.startswith("heads.technique")}
+    new_keys = set(current) - set(state)
     if set(state) != set(current) - new_keys or any(current[key].shape != value.shape for key, value in state.items()):
         raise HarnessError("Architecture-v1 checkpoint parameters do not exactly match the shared v2 model.")
     current.update(state)
@@ -237,7 +239,8 @@ def initialize_model(model, target_config, checkpoint_path, manifest_sha256):
     return {
         "kind": "architecture-transfer-with-new-random-heads",
         "checkpointSha256": sha256(checkpoint_path),
-        "sourceArchitectureVersion": 1,
+        "sourceArchitectureVersion": source_version,
+        "targetArchitectureVersion": target_version,
         "sourceGlobalStep": checkpoint["global_step"],
         "copiedParameterTensors": len(state),
         "newParameterTensors": sorted(new_keys),
@@ -416,6 +419,16 @@ def export_gp(args):
         percussion_threshold=args.draft_percussion_threshold,
         harmonic_threshold=args.draft_harmonic_threshold,
         include_harmonics=args.include_harmonics,
+        brush_threshold=args.brush_threshold,
+        arpeggio_threshold=args.arpeggio_threshold,
+        pick_stroke_threshold=args.pick_stroke_threshold,
+        rasgueado_threshold=args.rasgueado_threshold,
+        brush_membership_threshold=args.brush_membership_threshold,
+        arpeggio_membership_threshold=args.arpeggio_membership_threshold,
+        pick_stroke_membership_threshold=args.pick_stroke_membership_threshold,
+        rasgueado_membership_threshold=args.rasgueado_membership_threshold,
+        connection_threshold=args.connection_threshold,
+        note_technique_threshold=args.note_technique_threshold,
         chord_tolerance_seconds=args.chord_tolerance,
         same_string_gap_seconds=args.same_string_gap,
     )
@@ -428,10 +441,20 @@ def export_gp(args):
             "checkpointSha256": sha256(args.fingering_arranger),
             "manifestSha256": arranger_checkpoint["manifestSha256"],
         }
+    completer = completer_identity = None
+    if args.symbolic_completer:
+        from .symbolic_completer import load_completer
+
+        completer, completer_checkpoint = load_completer(args.symbolic_completer)
+        completer_identity = {
+            "checkpointSha256": sha256(args.symbolic_completer),
+            "manifestSha256": completer_checkpoint["manifestSha256"],
+        }
     report = write_gp_outputs(
         args.template, predictions, full_path, single_path, profile=profile,
         beat_evidence=beat_evidence, include_unsupported_tail=args.include_beat_unsupported_tail,
-        arranger=arranger,
+        arranger=arranger, completer=completer, completion_threshold=args.symbolic_completion_threshold,
+        completion_technique_threshold=args.symbolic_completion_technique_threshold,
     )
     if sha256(predictions_path) != before:
         raise HarnessError("Prediction hypotheses changed during GP export.")
@@ -441,6 +464,7 @@ def export_gp(args):
         fullOutputSha256=sha256(full_path),
         singleOutputSha256=sha256(single_path),
         fingeringArranger=arranger_identity,
+        symbolicCompleter=completer_identity,
     )
     report_path = private_output(args.report, args.data_root)
     publish_json(report_path, report)
@@ -487,7 +511,7 @@ def main(argv=None):
             command.add_argument("--run-dir", required=True)
             start = command.add_mutually_exclusive_group()
             start.add_argument("--resume")
-            start.add_argument("--initialize-from", help="Start a new v2 experiment from compatible v1 model weights; optimizer/RNG/history are not resumed.")
+            start.add_argument("--initialize-from", help="Start a new consecutive-version experiment from compatible model weights; optimizer/RNG/history are not resumed.")
         else:
             command.add_argument("--checkpoint", required=True)
             command.add_argument("--split", choices=("train", "validation"), default="validation")
@@ -520,6 +544,9 @@ def main(argv=None):
     export.add_argument("--template", required=True)
     export.add_argument("--beat-evidence", help="Private analyze-beats output for beat-anchored constrained rhythm inference.")
     export.add_argument("--fingering-arranger", help="Optional trained symbolic arranger checkpoint; training is a separate human-owner command.")
+    export.add_argument("--symbolic-completer", help="Optional GP-trained missing-onset/chord checkpoint; training is a separate human-owner command.")
+    export.add_argument("--symbolic-completion-threshold", type=float, default=.8)
+    export.add_argument("--symbolic-completion-technique-threshold", type=float, default=.8)
     export.add_argument("--full-output", default="runs/transcription.full-voices.gp")
     export.add_argument("--single-output", default="runs/transcription.single-voice.gp")
     export.add_argument("--report", default="runs/gp-output.json")
@@ -527,6 +554,16 @@ def main(argv=None):
     export.add_argument("--draft-percussion-threshold", type=float, default=.6)
     export.add_argument("--draft-harmonic-threshold", type=float, default=.8)
     export.add_argument("--include-harmonics", action="store_true", help="Export consistency-gated harmonic guesses; disabled by default because the positive-only harmonic head is uncalibrated.")
+    export.add_argument("--brush-threshold", type=float, default=.9)
+    export.add_argument("--arpeggio-threshold", type=float, default=.925)
+    export.add_argument("--pick-stroke-threshold", type=float, default=.8)
+    export.add_argument("--rasgueado-threshold", type=float, default=.99)
+    export.add_argument("--brush-membership-threshold", type=float, default=.6)
+    export.add_argument("--arpeggio-membership-threshold", type=float, default=.5)
+    export.add_argument("--pick-stroke-membership-threshold", type=float, default=.7)
+    export.add_argument("--rasgueado-membership-threshold", type=float, default=.8)
+    export.add_argument("--connection-threshold", type=float, default=.8)
+    export.add_argument("--note-technique-threshold", type=float, default=.8)
     export.add_argument("--chord-tolerance", type=float, default=.04)
     export.add_argument("--same-string-gap", type=float, default=.08)
     export.add_argument("--include-beat-unsupported-tail", action="store_true", help="Keep attacks after the final detected beat using extrapolated timing; raw JSON always retains them.")

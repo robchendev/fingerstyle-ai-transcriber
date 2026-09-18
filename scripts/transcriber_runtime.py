@@ -16,6 +16,8 @@ from pathlib import Path
 
 import numpy as np
 import torch
+
+from .connection_supervision import CONNECTION_TYPES, NOTE_TECHNIQUE_TYPES
 from torch.utils.data import BatchSampler, DataLoader, SequentialSampler
 
 
@@ -25,10 +27,13 @@ _NOTE_ONSET_STATS = ("note_onset_positive", "note_onset_negative")
 _PERCUSSION_STATS = ("percussion_positive", "percussion_negative")
 _TECHNIQUE_STATS = ("technique_positive", "technique_negative")
 _TECHNIQUE_STRING_STATS = ("technique_strings_positive", "technique_strings_negative")
+_NOTE_TECHNIQUE_STATS = ("note_technique_positive", "note_technique_negative")
 _LOSS_STAT_KEYS = (
     *_NOTE_ONSET_STATS, "fret", "pitch", "voice", "duration_log", "harmonic_positive",
     "harmonic_kind", "harmonic_node", *_PERCUSSION_STATS, "harmonic_sparsity", "percussion_sparsity",
     *_TECHNIQUE_STATS, "technique_direction", *_TECHNIQUE_STRING_STATS,
+    "connection", *_NOTE_TECHNIQUE_STATS,
+    "bend_curve",
 )
 _CHECKPOINT_KEYS = {
     "schema_version", "run_id", "identity", "training_config", "runtime", "model_state",
@@ -551,14 +556,18 @@ def _objective(stats, weights, sparsity_weight):
                 loss += sum(stats[key]["sum"] * _stat_weight(key, weights) for key in percussion) / sum(
                     stats[key]["count"] * _stat_weight(key, weights) for key in percussion
                 )
-        elif name in ("technique_positive", "technique_strings_positive"):
-            group = _TECHNIQUE_STATS if name == "technique_positive" else _TECHNIQUE_STRING_STATS
+        elif name in ("technique_positive", "technique_strings_positive", "note_technique_positive"):
+            group = (
+                _TECHNIQUE_STATS if name == "technique_positive"
+                else _TECHNIQUE_STRING_STATS if name == "technique_strings_positive"
+                else _NOTE_TECHNIQUE_STATS
+            )
             observed = [key for key in group if stats[key]["count"]]
             if observed:
                 loss += sum(stats[key]["sum"] * _stat_weight(key, weights) for key in observed) / sum(
                     stats[key]["count"] * _stat_weight(key, weights) for key in observed
                 )
-        elif value["count"] and name not in (*_NOTE_ONSET_STATS, *_PERCUSSION_STATS, *_TECHNIQUE_STATS, *_TECHNIQUE_STRING_STATS):
+        elif value["count"] and name not in (*_NOTE_ONSET_STATS, *_PERCUSSION_STATS, *_TECHNIQUE_STATS, *_TECHNIQUE_STRING_STATS, *_NOTE_TECHNIQUE_STATS):
             weight = sparsity_weight if name in _PRIOR_NAMES else _stat_weight(name, weights)
             loss += weight * value["sum"] / value["count"]
     return _finite(loss, "aggregated loss")
@@ -673,6 +682,44 @@ def _metric_counts(outputs, batch, counts):
         count["fp"] += int((emitted & ~positive & string_mask).sum().item())
         count["fn"] += int((~emitted & positive & string_mask).sum().item())
         count["tn"] += int((~emitted & ~positive & string_mask).sum().item())
+    if "connection" in targets:
+        target = targets["connection"]
+        mask = _mask(target, masks["connection"], valid)
+        prediction = _prediction(outputs, "connection")
+        if prediction.shape[:-1] != target.shape:
+            raise ValueError("Invalid categorical output shape for connection")
+        selected = prediction.argmax(-1)
+        counts["connection"]["correct"] += int(((selected == target) & mask).sum())
+        counts["connection"]["count"] += int(mask.sum())
+        for axis, name in enumerate(CONNECTION_TYPES):
+            emitted, positive = selected == axis, target == axis
+            count = counts[f"connection:{name}"]
+            count["count"] += int(mask.sum())
+            count["tp"] += int((emitted & positive & mask).sum())
+            count["fp"] += int((emitted & ~positive & mask).sum())
+            count["fn"] += int((~emitted & positive & mask).sum())
+            count["tn"] += int((~emitted & ~positive & mask).sum())
+        target = targets["note_technique"]
+        mask = _mask(target, masks["note_technique"], valid)
+        prediction = _prediction(outputs, "note_technique")
+        if prediction.shape != target.shape:
+            raise ValueError("Invalid binary output shape for note_technique")
+        emitted, positive = prediction >= 0, target > .5
+        count = counts["note_technique"]
+        count["count"] += int(mask.sum())
+        count["tp"] += int((emitted & positive & mask).sum())
+        count["fp"] += int((emitted & ~positive & mask).sum())
+        count["fn"] += int((~emitted & positive & mask).sum())
+        count["tn"] += int((~emitted & ~positive & mask).sum())
+        for axis, name in enumerate(NOTE_TECHNIQUE_TYPES):
+            selected_mask = mask[..., axis]
+            selected_emitted, selected_positive = emitted[..., axis], positive[..., axis]
+            count = counts[f"note_technique:{name}"]
+            count["count"] += int(selected_mask.sum())
+            count["tp"] += int((selected_emitted & selected_positive & selected_mask).sum())
+            count["fp"] += int((selected_emitted & ~selected_positive & selected_mask).sum())
+            count["fn"] += int((~selected_emitted & selected_positive & selected_mask).sum())
+            count["tn"] += int((~selected_emitted & ~selected_positive & selected_mask).sum())
 
 
 def _divide(numerator, denominator):
@@ -734,6 +781,39 @@ def _metrics(counts):
         "available": bool(direction["count"]), "count": direction["count"],
         "correct": direction["correct"], "accuracy": _divide(direction["correct"], direction["count"]),
     }
+    connection = counts["connection"]
+    result["connection_accuracy"] = {
+        "available": bool(connection["count"]), "count": connection["count"],
+        "correct": connection["correct"], "accuracy": _divide(connection["correct"], connection["count"]),
+    }
+    result["connection_classes"] = {}
+    for name in CONNECTION_TYPES:
+        value = counts[f"connection:{name}"]
+        tp, fp, fn, tn = (value[key] for key in ("tp", "fp", "fn", "tn"))
+        result["connection_classes"][name] = {
+            "available": bool(value["count"]), "count": value["count"],
+            "true_positive": tp, "false_positive": fp, "false_negative": fn, "true_negative": tn,
+            "precision": _divide(tp, tp + fp), "recall": _divide(tp, tp + fn),
+            "f1": _divide(2 * tp, 2 * tp + fp + fn),
+        }
+    value = counts["note_technique"]
+    tp, fp, fn, tn = (value[key] for key in ("tp", "fp", "fn", "tn"))
+    result["note_technique_frame"] = {
+        "available": bool(value["count"]), "count": value["count"],
+        "true_positive": tp, "false_positive": fp, "false_negative": fn, "true_negative": tn,
+        "precision": _divide(tp, tp + fp), "recall": _divide(tp, tp + fn),
+        "f1": _divide(2 * tp, 2 * tp + fp + fn),
+    }
+    result["note_technique_classes"] = {}
+    for name in NOTE_TECHNIQUE_TYPES:
+        value = counts[f"note_technique:{name}"]
+        tp, fp, fn, tn = (value[key] for key in ("tp", "fp", "fn", "tn"))
+        result["note_technique_classes"][name] = {
+            "available": bool(value["count"]), "count": value["count"],
+            "true_positive": tp, "false_positive": fp, "false_negative": fn, "true_negative": tn,
+            "precision": _divide(tp, tp + fp), "recall": _divide(tp, tp + fn),
+            "f1": _divide(2 * tp, 2 * tp + fp + fn),
+        }
     return result
 
 
@@ -766,6 +846,9 @@ def evaluate_model(model, loader, device, *, sparsity_weight=0.02, progress=None
         name: {"count": 0, "sum": 0.0, "correct": 0, "tp": 0, "fp": 0, "fn": 0, "tn": 0, "emitted": 0, "positions": 0}
         for name in ("note_onset", "fret", "pitch", "voice", "duration", "harmonic_presence", "percussion", "percussion_frame")
         + ("technique_frame", "technique_direction", "technique_strings")
+        + ("connection", "note_technique")
+        + tuple(f"connection:{name}" for name in CONNECTION_TYPES)
+        + tuple(f"note_technique:{name}" for name in NOTE_TECHNIQUE_TYPES)
     }
     batches = frames = windows = 0
     started = last_log = time.perf_counter()

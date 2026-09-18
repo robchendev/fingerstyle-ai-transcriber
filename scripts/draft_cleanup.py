@@ -13,13 +13,29 @@ class DraftProfile:
     percussion_threshold: float = 0.6
     harmonic_threshold: float = 0.8
     include_harmonics: bool = False
+    brush_threshold: float = 0.9
+    arpeggio_threshold: float = 0.925
+    pick_stroke_threshold: float = 0.8
+    rasgueado_threshold: float = 0.99
+    brush_membership_threshold: float = 0.6
+    arpeggio_membership_threshold: float = 0.5
+    pick_stroke_membership_threshold: float = 0.7
+    rasgueado_membership_threshold: float = 0.8
+    connection_threshold: float = 0.8
+    note_technique_threshold: float = 0.8
     chord_tolerance_seconds: float = 0.04
     same_string_gap_seconds: float = 0.08
 
     def __post_init__(self):
         if type(self.include_harmonics) is not bool:
             raise TypeError("include_harmonics must be boolean.")
-        for name in ("note_threshold", "percussion_threshold", "harmonic_threshold"):
+        for name in (
+            "note_threshold", "percussion_threshold", "harmonic_threshold",
+            "brush_threshold", "arpeggio_threshold", "pick_stroke_threshold", "rasgueado_threshold",
+            "brush_membership_threshold", "arpeggio_membership_threshold",
+            "pick_stroke_membership_threshold", "rasgueado_membership_threshold",
+            "connection_threshold", "note_technique_threshold",
+        ):
             value = getattr(self, name)
             if isinstance(value, bool) or type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1:
                 raise ValueError(f"{name} must be from zero through one.")
@@ -201,22 +217,120 @@ def clean_hypotheses(document, profile=DraftProfile()):
     percussion = _clean_percussion(source["percussion"], sorted({_onset(note) for note in selected}), profile, removed_percussion, onset_adjustments)
     source["notes"] = selected
     source["percussion"] = percussion
+    removed_techniques = []
+    retained_techniques = []
+    thresholds = {
+        "brush": profile.brush_threshold,
+        "arpeggio": profile.arpeggio_threshold,
+        "pick_stroke": profile.pick_stroke_threshold,
+        "rasgueado": profile.rasgueado_threshold,
+    }
+    membership_thresholds = {
+        "brush": profile.brush_membership_threshold,
+        "arpeggio": profile.arpeggio_membership_threshold,
+        "pick_stroke": profile.pick_stroke_membership_threshold,
+        "rasgueado": profile.rasgueado_membership_threshold,
+    }
+    techniques = source.get("techniques", [])
+    if not isinstance(techniques, list):
+        raise HarnessError("Draft cleanup requires a technique list when technique predictions are present.")
+    for event in techniques:
+        technique = event.get("technique")
+        if technique not in thresholds:
+            raise HarnessError(f"Unsupported technique prediction: {technique}")
+        if _confidence(event) < thresholds[technique]:
+            removed_techniques.append({"reason": "below_technique_threshold", "event": event})
+            continue
+        membership = event.get("stringMembershipConfidence")
+        if not isinstance(membership, dict):
+            raise HarnessError("Technique predictions require per-string membership confidence.")
+        strings = []
+        for string in range(1, 7):
+            score = membership.get(str(string))
+            if isinstance(score, bool) or type(score) not in (int, float) or not math.isfinite(score) or not 0 <= score <= 1:
+                raise HarnessError("Technique string-membership scores must be finite values from zero through one.")
+            if score >= membership_thresholds[technique]:
+                strings.append(string)
+        if not strings:
+            removed_techniques.append({"reason": "empty_membership_after_threshold", "event": event})
+            continue
+        event["strings"] = strings
+        retained_techniques.append(event)
+    source["techniques"] = retained_techniques
+    retained_notes = []
+    removed_orphan_members = []
+    for note in source["notes"]:
+        if "technique_membership_completed_attack" not in note.get("uncertainty", []):
+            retained_notes.append(note)
+            continue
+        supported = any(
+            note["string"] in event["strings"]
+            and abs(_onset(note) - _onset(event)) <= profile.chord_tolerance_seconds
+            for event in retained_techniques
+        )
+        if supported:
+            retained_notes.append(note)
+        else:
+            removed_orphan_members.append({"reason": "parent_technique_or_membership_filtered", "event": note})
+    source["notes"] = retained_notes
+    removed_connections = []
+    removed_note_techniques = []
+    for note in retained_notes:
+        connection = note.get("connection", "none")
+        if connection != "none":
+            confidence = note.get("connectionConfidence")
+            if isinstance(confidence, bool) or type(confidence) not in (int, float) or not math.isfinite(confidence) or not 0 <= confidence <= 1:
+                raise HarnessError("Predicted note connections require finite zero-to-one confidence.")
+            if confidence < profile.connection_threshold:
+                removed_connections.append({
+                    "reason": "below_connection_threshold", "onsetSeconds": _onset(note),
+                    "string": note["string"], "connection": connection, "confidence": confidence,
+                })
+                note["connection"] = "none"
+        scores = note.get("noteTechniques", {})
+        if not isinstance(scores, dict):
+            raise HarnessError("Predicted note techniques must be a confidence mapping.")
+        retained_scores = {}
+        for technique, confidence in scores.items():
+            if technique not in ("bend", "tap", "left_hand_tap", "vibrato"):
+                raise HarnessError(f"Unsupported predicted note technique: {technique}")
+            if isinstance(confidence, bool) or type(confidence) not in (int, float) or not math.isfinite(confidence) or not 0 <= confidence <= 1:
+                raise HarnessError("Predicted note-technique confidence must be finite and from zero through one.")
+            if confidence >= profile.note_technique_threshold:
+                retained_scores[technique] = confidence
+            else:
+                removed_note_techniques.append({
+                    "reason": "below_note_technique_threshold", "onsetSeconds": _onset(note),
+                    "string": note["string"], "technique": technique, "confidence": confidence,
+                })
+        note["noteTechniques"] = retained_scores
+        if "bend" not in retained_scores:
+            note["bendCurve"] = None
     return source, {
         "schemaVersion": 1,
         "kind": "editable-draft-cleanup",
         "profile": asdict(profile),
         "sourceCounts": {"notes": len(document["notes"]), "percussion": len(document["percussion"])},
-        "retainedCounts": {"notes": len(selected), "percussion": len(percussion)},
-        "removedNoteCount": len(removed_notes),
+        "retainedCounts": {"notes": len(retained_notes), "percussion": len(percussion)},
+        "removedNoteCount": len(removed_notes) + len(removed_orphan_members),
         "removedPercussionCount": len(removed_percussion),
         "removedHarmonicCount": len(removed_harmonics),
+        "sourceTechniqueCount": len(techniques),
+        "retainedTechniqueCount": len(retained_techniques),
+        "removedTechniqueCount": len(removed_techniques),
+        "techniqueThresholds": thresholds,
+        "techniqueMembershipThresholds": membership_thresholds,
         "maximumOnsetClusterDisplacementSeconds": max(
             (abs(value["toSeconds"] - value["fromSeconds"]) for value in onset_adjustments),
             default=0,
         ),
         "onsetAdjustments": onset_adjustments,
         "removedNotes": removed_notes,
+        "removedOrphanTechniqueMembers": removed_orphan_members,
         "removedPercussion": removed_percussion,
         "removedHarmonics": removed_harmonics,
+        "removedTechniques": removed_techniques,
+        "removedConnections": removed_connections,
+        "removedNoteTechniques": removed_note_techniques,
         "rawHypothesesModified": False,
     }

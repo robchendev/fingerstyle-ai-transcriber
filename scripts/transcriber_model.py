@@ -20,6 +20,7 @@ from torch.nn import functional as F
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 from .technique_supervision import TECHNIQUE_DIRECTIONS, TECHNIQUE_TYPES
+from .connection_supervision import BEND_FIELDS, CONNECTION_TYPES, NOTE_TECHNIQUE_TYPES
 
 
 PERCUSSION_TYPES = ("wrist_thump", "thumb_slap", "percussive_hit")
@@ -44,6 +45,10 @@ LOSS_WEIGHTS = {
     "technique_direction": 0.5,
     "technique_strings_positive": 2.0,
     "technique_strings_negative": 1.0,
+    "connection": 1.0,
+    "note_technique_positive": 2.0,
+    "note_technique_negative": 1.0,
+    "bend_curve": 0.5,
 }
 LOSS_STAT_KEYS = (
     "note_onset_positive", "note_onset_negative", "fret", "pitch", "voice",
@@ -51,6 +56,8 @@ LOSS_STAT_KEYS = (
     "percussion_positive", "percussion_negative", "harmonic_sparsity", "percussion_sparsity",
     "technique_positive", "technique_negative", "technique_direction",
     "technique_strings_positive", "technique_strings_negative",
+    "connection", "note_technique_positive", "note_technique_negative",
+    "bend_curve",
 )
 _BASE_HEADS = {
     "note_onset": "note_onset_logits",
@@ -68,8 +75,13 @@ _TECHNIQUE_HEADS = {
     "technique_direction": "technique_direction_logits",
     "technique_strings": "technique_strings_logits",
 }
-_HEADS = {**_BASE_HEADS, **_TECHNIQUE_HEADS}
-_CATEGORICAL = ("fret", "pitch", "voice", "harmonic_kind", "harmonic_node", "technique_direction")
+_CONNECTION_HEADS = {
+    "connection": "connection_logits",
+    "note_technique": "note_technique_logits",
+    "bend_curve": "bend_curve",
+}
+_HEADS = {**_BASE_HEADS, **_TECHNIQUE_HEADS, **_CONNECTION_HEADS}
+_CATEGORICAL = ("fret", "pitch", "voice", "harmonic_kind", "harmonic_node", "technique_direction", "connection")
 
 
 class LossStat(TypedDict):
@@ -121,8 +133,8 @@ class ModelConfig:
     def __post_init__(self) -> None:
         for name in ("architecture_version", "n_mels", "hidden_size", "recurrent_layers", "max_voices"):
             _integer(name, getattr(self, name), 1)
-        if self.architecture_version not in (1, 2):
-            raise ValueError("architecture_version must be 1 or 2")
+        if self.architecture_version not in (1, 2, 3):
+            raise ValueError("architecture_version must be 1, 2, or 3")
         _integer("conditioning_dim", self.conditioning_dim, 12, 12)
         _integer("max_fret", self.max_fret, 0, 127)
         _real("dropout", self.dropout, 0, 1)
@@ -173,6 +185,12 @@ class FingerstyleTranscriber(nn.Module):
                 "technique_direction_logits": (len(TECHNIQUE_TYPES), len(TECHNIQUE_DIRECTIONS)),
                 "technique_strings_logits": (len(TECHNIQUE_TYPES), 6),
             })
+        if config.architecture_version >= 3:
+            self.head_shapes.update({
+                "connection_logits": (6, len(CONNECTION_TYPES)),
+                "note_technique_logits": (6, len(NOTE_TECHNIQUE_TYPES)),
+                "bend_curve": (6, len(BEND_FIELDS)),
+            })
         self.heads = nn.ModuleDict({
             name: nn.Linear(2 * config.hidden_size, math.prod(shape))
             for name, shape in self.head_shapes.items()
@@ -221,6 +239,9 @@ def _validate_outputs(outputs: Mapping[str, Tensor], *, batched: bool) -> tuple[
     present_technique = set(_TECHNIQUE_HEADS.values()) & outputs.keys()
     if present_technique:
         heads.update(_TECHNIQUE_HEADS)
+    present_connection = set(_CONNECTION_HEADS.values()) & outputs.keys()
+    if present_connection:
+        heads.update(_CONNECTION_HEADS)
     missing = set(heads.values()) - outputs.keys()
     if missing:
         raise ValueError(f"outputs missing heads: {sorted(missing)}")
@@ -245,6 +266,12 @@ def _validate_outputs(outputs: Mapping[str, Tensor], *, batched: bool) -> tuple[
             "technique_logits": (len(TECHNIQUE_TYPES),),
             "technique_direction_logits": (len(TECHNIQUE_TYPES), len(TECHNIQUE_DIRECTIONS)),
             "technique_strings_logits": (len(TECHNIQUE_TYPES), 6),
+        })
+    if present_connection:
+        shapes.update({
+            "connection_logits": (6, len(CONNECTION_TYPES)),
+            "note_technique_logits": (6, len(NOTE_TECHNIQUE_TYPES)),
+            "bend_curve": (6, len(BEND_FIELDS)),
         })
     for name in ("fret_logits", "voice_logits"):
         value = outputs[name]
@@ -287,6 +314,8 @@ def masked_loss(outputs: Mapping[str, Tensor], targets: Mapping[str, Tensor], ma
     active_heads = dict(_BASE_HEADS)
     if "technique_logits" in outputs:
         active_heads.update(_TECHNIQUE_HEADS)
+    if "connection_logits" in outputs:
+        active_heads.update(_CONNECTION_HEADS)
     for label, mapping in (("targets", targets), ("masks", masks)):
         missing = set(active_heads) - mapping.keys()
         if missing:
@@ -299,6 +328,10 @@ def masked_loss(outputs: Mapping[str, Tensor], targets: Mapping[str, Tensor], ma
             tail = (len(TECHNIQUE_TYPES),)
         elif name == "technique_strings":
             tail = (len(TECHNIQUE_TYPES), 6)
+        elif name == "note_technique":
+            tail = (6, len(NOTE_TECHNIQUE_TYPES))
+        elif name == "bend_curve":
+            tail = (6, len(BEND_FIELDS))
         else:
             tail = (6,)
         shape = prefix + tail
@@ -318,6 +351,9 @@ def masked_loss(outputs: Mapping[str, Tensor], targets: Mapping[str, Tensor], ma
         elif name == "duration_log":
             if (selected < 0).any().item():
                 raise ValueError("supervised duration_log targets must be nonnegative")
+        elif name == "bend_curve":
+            if ((selected < 0) | (selected > 1)).any().item():
+                raise ValueError("supervised bend_curve targets must be from zero through one")
         elif ((selected != 0) & (selected != 1)).any().item():
             raise ValueError(f"supervised {name} targets must be 0 or 1")
         if name == "harmonic" and (selected != 1).any().item():
@@ -421,6 +457,23 @@ def masked_loss(outputs: Mapping[str, Tensor], targets: Mapping[str, Tensor], ma
             string_components.append((numerator, count, LOSS_WEIGHTS[name]))
         if string_components:
             loss = loss + sum(total * weight for total, _, weight in string_components) / sum(count * weight for _, count, weight in string_components)
+    if "connection" in active_heads:
+        components = []
+        for value, suffix in ((1, "positive"), (0, "negative")):
+            selected = effective["note_technique"] & (targets["note_technique"] == value)
+            if not selected.any().item():
+                continue
+            values = F.binary_cross_entropy_with_logits(outputs["note_technique_logits"][selected], targets["note_technique"][selected], reduction="none")
+            numerator, count = values.sum(), values.numel()
+            name = f"note_technique_{suffix}"
+            stats[name] = {"sum": float(numerator.detach()), "count": count}
+            components.append((numerator, count, LOSS_WEIGHTS[name]))
+        if components:
+            loss = loss + sum(total * weight for total, _, weight in components) / sum(count * weight for _, count, weight in components)
+        mask = effective["bend_curve"]
+        if mask.any().item():
+            values = F.smooth_l1_loss(outputs["bend_curve"][mask], targets["bend_curve"][mask], reduction="none")
+            loss = loss + LOSS_WEIGHTS["bend_curve"] * term("bend_curve", values)
     return loss, stats
 
 
@@ -521,7 +574,7 @@ def decode_events(outputs: Mapping[str, Tensor], frame_seconds: Tensor | Sequenc
         duration = math.expm1(duration_log) if duration_log <= duration_limit_log else float(max_duration_quarter)
         if duration_log > duration_limit_log:
             uncertainty.append("duration_clipped")
-        return {
+        result = {
             "onsetSeconds": float(seconds[frame]),
             "string": 6 - axis,
             "fret": fret,
@@ -534,6 +587,21 @@ def decode_events(outputs: Mapping[str, Tensor], frame_seconds: Tensor | Sequenc
             "confidence": float(confidence),
             "uncertainty": uncertainty,
         }
+        if "connection_logits" in values:
+            connection_scores = values["connection_logits"][frame, axis].softmax(-1)
+            connection_index = int(categories["connection"][frame, axis])
+            result["connection"] = CONNECTION_TYPES[connection_index]
+            result["connectionConfidence"] = float(connection_scores[connection_index])
+            technique_scores = values["note_technique_logits"][frame, axis].sigmoid()
+            result["noteTechniques"] = {
+                name: float(technique_scores[index])
+                for index, name in enumerate(NOTE_TECHNIQUE_TYPES)
+            }
+            result["bendCurve"] = {
+                field: float(values["bend_curve"][frame, axis, index].clamp(0, 1) * 100)
+                for index, field in enumerate(BEND_FIELDS)
+            }
+        return result
 
     for axis in range(6):
         for frame in _temporal_peaks(onsets[:, axis].tolist(), seconds, onset_threshold, min_gap_seconds):
@@ -574,6 +642,10 @@ def decode_events(outputs: Mapping[str, Tensor], frame_seconds: Tensor | Sequenc
                         and abs(note["onsetSeconds"] - seconds[frame]) < min_gap_seconds
                         for note in notes
                     ):
+                        continue
+                    predicted_pitch = int(categories["pitch"][frame, string_axis])
+                    feasible_fret = predicted_pitch - int(tuning[string_axis]) - int(capo)
+                    if not 0 <= feasible_fret <= 24:
                         continue
                     confidence = min(float(technique_scores[frame, axis]), membership_score)
                     notes.append(note_at(

@@ -247,7 +247,14 @@ def _validate_predictions(document):
             "harmonic": deepcopy(harmonic),
             "confidence": _finite(value["confidence"], "Note confidence", minimum=0),
             "uncertainty": list(value.get("uncertainty", [])),
+            "connection": value.get("connection", "none"),
+            "connectionToken": value.get("_connectionToken"),
+            "connectionOriginToken": value.get("_connectionOriginToken"),
+            "noteTechniques": deepcopy(value.get("noteTechniques", {})),
+            "bendCurve": deepcopy(value.get("bendCurve")),
         }
+        if note["connection"] not in ("none", "hammer_on", "pull_off", *(f"slide_{value}" for value in (1, 2, 4, 8, 16, 20, 32))):
+            raise HarnessError("Predicted note connection is unsupported.")
         if note["confidence"] > 1:
             raise HarnessError("Note confidence must be from zero through one.")
         notes.append(note)
@@ -426,6 +433,25 @@ def _resolve_percussion(percussion):
         else:
             dropped.append({"id": event["id"], "reason": "duplicate_quantized_percussion", "kept": current["id"]})
     return sorted(selected.values(), key=lambda item: (item["onset"], PERCUSSION_TYPES.index(item["technique"]))), dropped
+
+
+def _bind_connection_origins(document):
+    notes = document["notes"]
+    for index, note in enumerate(notes):
+        note["_connectionToken"] = f"connection-note-{index}"
+    by_string = defaultdict(list)
+    for note in notes:
+        by_string[note["string"]].append(note)
+    for values in by_string.values():
+        values.sort(key=lambda note: (
+            Fraction(*note["scoreOnsetQuarter"]) if note.get("scoreOnsetQuarter") is not None
+            else Fraction(str(note["onsetSeconds"])),
+            note["_connectionToken"],
+        ))
+        for prior, note in zip(values, values[1:]):
+            if note.get("connection", "none") != "none":
+                note["_connectionOriginToken"] = prior["_connectionToken"]
+    return document
 
 
 def _meter_changes(document, tempo):
@@ -673,9 +699,44 @@ class _ScoreWriter:
         self.simplified = simplified
         self.pitch_offsets = _prototype_pitch_offsets(root)
         self.pitch_profile = {"offsets": self.pitch_offsets, "spellings": {}}
+        self.fallbacks = []
+        self.connection_fallbacks = []
+        self.articulation_fallbacks = []
+        by_string = defaultdict(list)
+        for note in notes:
+            by_string[note["string"]].append(note)
+        previous = {}
+        for values in by_string.values():
+            values.sort(key=lambda note: (note["onset"], note["id"]))
+            for prior, note in zip(values, values[1:]):
+                previous[note["connectionToken"]] = prior
+        by_token = {note["connectionToken"]: note for note in notes}
+        for note in notes:
+            connection = note.get("connection", "none")
+            if connection == "none":
+                continue
+            prior = by_token.get(note.get("connectionOriginToken"))
+            valid = prior is not None and previous.get(note["connectionToken"]) is prior
+            valid = valid and prior["string"] == note["string"] and note["onset"] - prior["onset"] <= 2
+            if connection == "hammer_on":
+                valid = valid and note["soundingPitchMidi"] > prior["soundingPitchMidi"]
+            elif connection == "pull_off":
+                valid = valid and note["soundingPitchMidi"] < prior["soundingPitchMidi"]
+            elif connection.startswith("slide_"):
+                valid = valid and note["soundingPitchMidi"] != prior["soundingPitchMidi"]
+            if not valid:
+                self.connection_fallbacks.append({
+                    "id": note["id"], "onsetQuarter": _rational(note["onset"]),
+                    "connection": connection, "reason": "invalid_connection_relationship",
+                })
+                continue
+            if connection in ("hammer_on", "pull_off"):
+                prior["hopoOrigin"] = True
+                note["hopoDestination"] = True
+            elif connection.startswith("slide_"):
+                prior["slideFlags"] = int(connection.split("_", 1)[1])
         self.ids = defaultdict(int)
         self.rhythms = {}
-        self.fallbacks = []
         voices = sorted({note["voice"] for note in notes} | {0})
         self.percussion_voices = {}
         for event in percussion:
@@ -745,6 +806,37 @@ class _ScoreWriter:
             ("String", "String", 6 - note["string"]),
         ):
             ET.SubElement(ET.SubElement(props, "Property", name=name), tag).text = str(value)
+        for name in ("hopoOrigin", "hopoDestination"):
+            attack_only = name == "hopoDestination"
+            if note.get(name) and (not incoming if attack_only else not outgoing):
+                native = "HopoOrigin" if name == "hopoOrigin" else "HopoDestination"
+                ET.SubElement(ET.SubElement(props, "Property", name=native), "Enable")
+        if note.get("slideFlags") and not outgoing:
+            ET.SubElement(ET.SubElement(props, "Property", name="Slide"), "Flags").text = str(note["slideFlags"])
+        technique_scores = note.get("noteTechniques", {})
+        for name, native in (("tap", "Tapped"), ("left_hand_tap", "LeftHandTapped")):
+            if technique_scores.get(name, 0) >= .5 and not incoming:
+                ET.SubElement(ET.SubElement(props, "Property", name=native), "Enable")
+        if technique_scores.get("vibrato", 0) >= .5 and not incoming:
+            ET.SubElement(node, "Vibrato").text = "Slight"
+        if technique_scores.get("bend", 0) >= .5 and not incoming:
+            curve = note.get("bendCurve")
+            if outgoing:
+                self.articulation_fallbacks.append({
+                    "id": note["id"], "onsetQuarter": _rational(note["onset"]),
+                    "technique": "bend", "reason": "bend_curve_crosses_tie",
+                })
+            elif not isinstance(curve, dict) or set(curve) != {
+                "OriginOffset", "OriginValue", "MiddleOffset1", "MiddleOffset2",
+                "MiddleValue", "DestinationOffset", "DestinationValue",
+            }:
+                note.setdefault("uncertainty", []).append("bend_curve_unavailable")
+            else:
+                ET.SubElement(ET.SubElement(props, "Property", name="Bended"), "Enable")
+                for name, value in curve.items():
+                    if type(value) not in (int, float) or not math.isfinite(value):
+                        raise HarnessError("Predicted bend curve contains a nonfinite value.")
+                    ET.SubElement(ET.SubElement(props, "Property", name=f"Bend{name}"), "Float").text = f"{max(0, min(100, value)):.6f}"
         if note["harmonic"] is not None:
             ET.SubElement(ET.SubElement(props, "Property", name="Harmonic"), "Enable")
             ET.SubElement(ET.SubElement(props, "Property", name="HarmonicFret"), "HFret").text = f"{note['harmonic']['fret']:.6f}"
@@ -1036,6 +1128,8 @@ def _build_variant(template_raw, notes, percussion, techniques, measures, tuning
         "noteSegmentCount": len(parsed.findall("./Notes/Note")),
         "voiceCount": 1 if simplified else max((note["voice"] for note in notes), default=0) + 1,
         "percussionTextFallbacks": fallbacks,
+        "connectionFallbacks": writer.connection_fallbacks,
+        "articulationFallbacks": writer.articulation_fallbacks,
     }
 
 
@@ -1058,7 +1152,7 @@ def _atomic_bytes(path, content):
             temporary.unlink()
 
 
-def write_gp_outputs(template_path, predictions, full_path, single_path, *, profile=DraftProfile(), beat_evidence=None, include_unsupported_tail=False, arranger=None):
+def write_gp_outputs(template_path, predictions, full_path, single_path, *, profile=DraftProfile(), beat_evidence=None, include_unsupported_tail=False, arranger=None, completer=None, completion_threshold=.8, completion_technique_threshold=.8):
     template_path = Path(template_path).resolve()
     if not template_path.is_file():
         raise HarnessError(f"GP output template does not exist: {template_path}")
@@ -1074,6 +1168,15 @@ def write_gp_outputs(template_path, predictions, full_path, single_path, *, prof
         from .rhythm_inference import infer_notated_timing
 
         cleaned, rhythm_inference = infer_notated_timing(cleaned, beat_evidence, include_unsupported_tail=include_unsupported_tail)
+    completion = None
+    if completer is not None:
+        from .symbolic_completer import complete_document
+
+        cleaned, completion = complete_document(
+            completer, cleaned, threshold=completion_threshold,
+            technique_threshold=completion_technique_threshold,
+        )
+    cleaned = _bind_connection_origins(cleaned)
     arranger_applied = False
     if arranger is not None:
         from .fingering_arranger import apply_arranger
@@ -1114,6 +1217,7 @@ def write_gp_outputs(template_path, predictions, full_path, single_path, *, prof
         "rhythmInference": rhythm_inference,
         "fingeringOptimization": fingering_optimization,
         "fingeringArrangerApplied": arranger_applied,
+        "symbolicCompletion": completion,
         "voiceOptimization": voice_optimization,
         "rhythmicGridPolicy": {
             "mode": "beat-anchored-constrained" if structured else "nominal-tempo-fallback",

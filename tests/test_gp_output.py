@@ -177,8 +177,16 @@ class GpOutputTests(unittest.TestCase):
     def test_acoustic_technique_hypotheses_serialize_native_gp_marks(self):
         document = hypotheses()
         document["techniques"] = [
-            {"onsetSeconds": .5, "technique": "brush", "direction": "Down", "strings": [1, 2, 6], "confidence": .95},
-            {"onsetSeconds": 1., "technique": "arpeggio", "direction": "Up", "strings": [1, 2], "confidence": .9},
+            {
+                "onsetSeconds": .5, "technique": "brush", "direction": "Down",
+                "strings": [1, 2, 6], "stringMembershipConfidence": {str(string): 1. for string in range(1, 7)},
+                "confidence": .95,
+            },
+            {
+                "onsetSeconds": 1., "technique": "arpeggio", "direction": "Up",
+                "strings": [1, 2], "stringMembershipConfidence": {str(string): 1. for string in range(1, 7)},
+                "confidence": .95,
+            },
         ]
         with TemporaryDirectory(dir=ROOT) as directory:
             directory = Path(directory)
@@ -196,6 +204,113 @@ class GpOutputTests(unittest.TestCase):
             self.assertEqual(brush.findtext("./XProperties/XProperty[@id='687935490']/Float"), "0")
             self.assertEqual(root.findtext("./Beats/Beat/Arpeggio"), "Up")
             self.assertEqual(report["techniqueHypotheses"], 2)
+
+    def test_note_connections_and_supported_note_techniques_serialize_natively(self):
+        document = hypotheses()
+        document["notes"] = [
+            {
+                **document["notes"][0],
+                "onsetSeconds": 0,
+                "string": 1,
+                "fret": 0,
+                "soundingPitchMidi": 64,
+                "notatedDurationQuarter": .5,
+                "connection": "none",
+                "noteTechniques": {},
+            },
+            {
+                **document["notes"][0],
+                "onsetSeconds": .5,
+                "string": 1,
+                "fret": 2,
+                "soundingPitchMidi": 66,
+                "notatedDurationQuarter": .5,
+                "connection": "hammer_on",
+                "connectionConfidence": .95,
+                "noteTechniques": {"left_hand_tap": .9, "vibrato": .8, "bend": .9},
+                "bendCurve": {
+                    "OriginOffset": 0, "OriginValue": 0, "MiddleOffset1": 12,
+                    "MiddleOffset2": 12, "MiddleValue": 12,
+                    "DestinationOffset": 99, "DestinationValue": 25,
+                },
+            },
+        ]
+        document["percussion"] = []
+        with TemporaryDirectory(dir=ROOT) as directory:
+            directory = Path(directory)
+            template = directory / "template.gpt"
+            full, single = directory / "full.gp", directory / "single.gp"
+            template.write_bytes(archive_bytes(output_template()))
+            write_gp_outputs(template, document, full, single)
+            root = gp_root(full)
+            notes = root.findall("./Notes/Note")
+            self.assertIsNotNone(notes[0].find("./Properties/Property[@name='HopoOrigin']/Enable"))
+            self.assertIsNotNone(notes[1].find("./Properties/Property[@name='HopoDestination']/Enable"))
+            self.assertIsNotNone(notes[1].find("./Properties/Property[@name='LeftHandTapped']/Enable"))
+            self.assertEqual(notes[1].findtext("Vibrato"), "Slight")
+            self.assertIsNotNone(notes[1].find("./Properties/Property[@name='Bended']/Enable"))
+            self.assertEqual(notes[1].findtext("./Properties/Property[@name='BendDestinationValue']/Float"), "25.000000")
+
+    def test_connection_is_suppressed_if_fingering_moves_it_to_another_origin(self):
+        document = hypotheses()
+        document["notes"] = [
+            {
+                **document["notes"][0], "onsetSeconds": 0, "string": 3, "fret": 2,
+                "soundingPitchMidi": 57, "notatedDurationQuarter": 2, "connection": "none",
+            },
+            {
+                **document["notes"][0], "onsetSeconds": .5, "string": 2, "fret": 0,
+                "soundingPitchMidi": 59, "notatedDurationQuarter": .5, "connection": "none",
+            },
+            {
+                **document["notes"][0], "onsetSeconds": 1, "string": 3, "fret": 5,
+                "soundingPitchMidi": 60, "notatedDurationQuarter": .5,
+                "connection": "hammer_on", "connectionConfidence": .95,
+            },
+        ]
+        document["percussion"] = []
+        with TemporaryDirectory(dir=ROOT) as directory:
+            directory = Path(directory)
+            template = directory / "template.gpt"
+            full, single = directory / "full.gp", directory / "single.gp"
+            template.write_bytes(archive_bytes(output_template()))
+            report = write_gp_outputs(template, document, full, single)
+            root = gp_root(full)
+            self.assertFalse(root.findall("./Notes/Note/Properties/Property[@name='HopoOrigin']"))
+            self.assertFalse(root.findall("./Notes/Note/Properties/Property[@name='HopoDestination']"))
+            self.assertEqual(report["fullVoices"]["connectionFallbacks"][0]["reason"], "invalid_connection_relationship")
+
+    def test_attack_articulations_are_not_repeated_on_tied_continuations(self):
+        document = hypotheses()
+        document["notes"] = [
+            {
+                **document["notes"][0], "onsetSeconds": 0, "string": 1, "fret": 0,
+                "soundingPitchMidi": 64, "notatedDurationQuarter": .5, "connection": "none",
+            },
+            {
+                **document["notes"][0], "onsetSeconds": .5, "string": 1, "fret": 2,
+                "soundingPitchMidi": 66, "notatedDurationQuarter": 5,
+                "connection": "hammer_on", "connectionConfidence": .95,
+                "noteTechniques": {"tap": .9, "bend": .9},
+                "bendCurve": {
+                    "OriginOffset": 0, "OriginValue": 0, "MiddleOffset1": 12,
+                    "MiddleOffset2": 12, "MiddleValue": 12,
+                    "DestinationOffset": 99, "DestinationValue": 25,
+                },
+            },
+        ]
+        document["percussion"] = []
+        with TemporaryDirectory(dir=ROOT) as directory:
+            directory = Path(directory)
+            template = directory / "template.gpt"
+            full, single = directory / "full.gp", directory / "single.gp"
+            template.write_bytes(archive_bytes(output_template()))
+            report = write_gp_outputs(template, document, full, single)
+            root = gp_root(full)
+            self.assertEqual(len(root.findall("./Notes/Note/Properties/Property[@name='HopoDestination']")), 1)
+            self.assertEqual(len(root.findall("./Notes/Note/Properties/Property[@name='Tapped']")), 1)
+            self.assertFalse(root.findall("./Notes/Note/Properties/Property[@name='Bended']"))
+            self.assertEqual(report["fullVoices"]["articulationFallbacks"][0]["reason"], "bend_curve_crosses_tie")
 
     def test_beat_evidence_drives_constrained_score_timing(self):
         document = hypotheses()

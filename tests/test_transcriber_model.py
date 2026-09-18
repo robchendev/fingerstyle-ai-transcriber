@@ -30,6 +30,12 @@ def synthetic_outputs(batch=2, frames=5, *, requires_grad=False, architecture_ve
             "technique_direction_logits": (4, 2),
             "technique_strings_logits": (4, 6),
         })
+    if architecture_version >= 3:
+        shapes.update({
+            "connection_logits": (6, 10),
+            "note_technique_logits": (6, 4),
+            "bend_curve": (6, 7),
+        })
     return {name: torch.zeros(batch, frames, *shape, requires_grad=requires_grad) for name, shape in shapes.items()}
 
 
@@ -58,6 +64,8 @@ def event_outputs(frames, *, architecture_version=1):
     if "technique_logits" in outputs:
         outputs["technique_logits"].fill_(-12)
         outputs["technique_strings_logits"].fill_(-12)
+    if "note_technique_logits" in outputs:
+        outputs["note_technique_logits"].fill_(-12)
     outputs["duration_log"].fill_(math.log1p(1))
     return outputs
 
@@ -86,7 +94,7 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(ModelConfig(**json.loads(json.dumps(asdict(config)))), config)
         with self.assertRaises(FrozenInstanceError):
             config.max_fret = 10
-        for options in ({"architecture_version": 0}, {"architecture_version": 3}, {"n_mels": 0}, {"conditioning_dim": 11}, {"hidden_size": 0},
+        for options in ({"architecture_version": 0}, {"architecture_version": 4}, {"n_mels": 0}, {"conditioning_dim": 11}, {"hidden_size": 0},
                         {"recurrent_layers": -1}, {"max_fret": -1}, {"max_fret": 128},
                         {"max_voices": 0}, {"dropout": 1}, {"dropout": -1}, {"dropout": float("nan")}):
             with self.subTest(options=options), self.assertRaises(ValueError):
@@ -168,6 +176,33 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(stats["technique_direction"]["count"], 1)
         self.assertEqual(stats["technique_strings_positive"]["count"], 3)
         self.assertEqual(stats["technique_strings_negative"]["count"], 3)
+
+    def test_v3_adds_connection_and_note_technique_heads(self):
+        config = ModelConfig(architecture_version=3, hidden_size=8, recurrent_layers=1, dropout=0)
+        model = FingerstyleTranscriber(config)
+        self.assertEqual(model.head_shapes["connection_logits"], (6, 10))
+        self.assertEqual(model.head_shapes["note_technique_logits"], (6, 4))
+        self.assertEqual(model.head_shapes["bend_curve"], (6, 7))
+        outputs = model(torch.zeros(1, 3, 96), torch.zeros(1, 3, 12))
+        targets, masks, valid = synthetic_targets(1, 3, architecture_version=2)
+        targets["connection"] = torch.zeros(1, 3, 6, dtype=torch.long)
+        masks["connection"] = torch.zeros_like(targets["connection"], dtype=torch.bool)
+        targets["note_technique"] = torch.zeros(1, 3, 6, 4)
+        masks["note_technique"] = torch.zeros_like(targets["note_technique"], dtype=torch.bool)
+        targets["bend_curve"] = torch.zeros(1, 3, 6, 7)
+        masks["bend_curve"] = torch.zeros_like(targets["bend_curve"], dtype=torch.bool)
+        targets["connection"][0, 1, 0] = 1
+        masks["connection"][0, 1, 0] = True
+        targets["note_technique"][0, 1, 0, :2] = 1
+        masks["note_technique"][0, 1, 0] = True
+        targets["bend_curve"][0, 1, 0] = torch.tensor([0, 0, .12, .12, .12, .99, .25])
+        masks["bend_curve"][0, 1, 0] = True
+        loss, stats = masked_loss(outputs, targets, masks, valid)
+        self.assertTrue(torch.isfinite(loss))
+        self.assertEqual(stats["connection"]["count"], 1)
+        self.assertEqual(stats["note_technique_positive"]["count"], 2)
+        self.assertEqual(stats["note_technique_negative"]["count"], 2)
+        self.assertEqual(stats["bend_curve"]["count"], 7)
 
     def test_padding_does_not_change_real_frames(self):
         model = FingerstyleTranscriber(ModelConfig(n_mels=9, hidden_size=8, recurrent_layers=1, dropout=0)).eval()
@@ -548,6 +583,21 @@ class EventDecoderTests(unittest.TestCase):
             [(6, 40), (4, 50), (1, 64)],
         )
         self.assertTrue(all("technique_membership_completed_attack" in note["uncertainty"] for note in decoded["notes"]))
+
+    def test_v3_decodes_connection_note_techniques_and_bend_curve(self):
+        outputs = event_outputs(3, architecture_version=3)
+        outputs["note_onset_logits"][1, 0] = 8
+        choose_category(outputs, "pitch_logits", 1, 0, 40)
+        choose_category(outputs, "connection_logits", 1, 0, 1)
+        outputs["note_technique_logits"][1, 0, [0, 2, 3]] = 8
+        outputs["bend_curve"][1, 0] = torch.tensor([0, 0, .12, .12, .12, .99, .25])
+        note = self.decode(outputs, [0, .02, .04])["notes"][0]
+        self.assertEqual(note["connection"], "hammer_on")
+        self.assertGreater(note["connectionConfidence"], .99)
+        self.assertGreater(note["noteTechniques"]["bend"], .99)
+        self.assertGreater(note["noteTechniques"]["left_hand_tap"], .99)
+        self.assertAlmostEqual(note["bendCurve"]["DestinationOffset"], 99)
+        self.assertAlmostEqual(note["bendCurve"]["DestinationValue"], 25)
 
     def test_plateaus_repeated_attacks_and_late_audio_are_not_truncated(self):
         outputs = event_outputs(14)

@@ -116,6 +116,31 @@ class HarnessCommandTests(unittest.TestCase):
             with self.assertRaises(HarnessError):
                 transcriber.initialize_model(target_model, target_config, path, "different")
 
+    def test_v3_initialization_copies_v2_and_leaves_connection_heads_random(self):
+        from scripts.transcriber_model import FingerstyleTranscriber, ModelConfig
+
+        source_config = ModelConfig(architecture_version=2)
+        target_config = ModelConfig(architecture_version=3)
+        source_model = FingerstyleTranscriber(source_config)
+        target_model = FingerstyleTranscriber(target_config)
+        new_before = {key: value.clone() for key, value in target_model.state_dict().items() if key not in source_model.state_dict()}
+        checkpoint = {
+            "identity": {"model": asdict(source_config), "manifest_sha256": "manifest"},
+            "global_step": 100,
+            "model_state": source_model.state_dict(),
+        }
+        with TemporaryDirectory(dir=ROOT) as directory:
+            path = Path(directory) / "source.pt"
+            path.write_bytes(b"checkpoint")
+            with patch("scripts.transcriber_runtime.load_checkpoint", return_value=checkpoint), patch.object(transcriber, "sha256", return_value="hash"):
+                report = transcriber.initialize_model(target_model, target_config, path, "manifest")
+        for key, value in source_model.state_dict().items():
+            torch.testing.assert_close(target_model.state_dict()[key], value)
+        for key, value in new_before.items():
+            torch.testing.assert_close(target_model.state_dict()[key], value)
+        self.assertEqual(report["sourceArchitectureVersion"], 2)
+        self.assertEqual(report["targetArchitectureVersion"], 3)
+
     def test_event_evaluation_records_explicitly_selected_release_without_training(self):
         with TemporaryDirectory(dir=ROOT) as directory:
             root = Path(directory).resolve()
@@ -167,6 +192,8 @@ class HarnessCommandTests(unittest.TestCase):
         self.assertEqual(profile.note_threshold, .9)
         self.assertEqual(profile.percussion_threshold, .6)
         self.assertFalse(profile.include_harmonics)
+        self.assertEqual(profile.connection_threshold, .8)
+        self.assertEqual(profile.note_technique_threshold, .8)
         self.assertEqual(profile.chord_tolerance_seconds, .04)
         self.assertEqual(profile.same_string_gap_seconds, .08)
 

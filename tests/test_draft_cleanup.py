@@ -68,6 +68,46 @@ class DraftCleanupTests(unittest.TestCase):
         with self.assertRaises(HarnessError):
             clean_hypotheses({"notes": [], "percussion": [{"onsetSeconds": 0, "technique": "", "confidence": 0.9}]})
 
+    def test_technique_thresholds_are_per_class_and_rebuild_string_membership(self):
+        document = {
+            "notes": [],
+            "percussion": [],
+            "techniques": [
+                {
+                    "onsetSeconds": 0, "technique": "brush", "confidence": .89,
+                    "strings": [1], "stringMembershipConfidence": {str(i): .95 for i in range(1, 7)},
+                },
+                {
+                    "onsetSeconds": 1, "technique": "arpeggio", "confidence": .95,
+                    "strings": [1], "stringMembershipConfidence": {
+                        "1": .9, "2": .6, "3": .49, "4": .2, "5": .1, "6": .8,
+                    },
+                },
+            ],
+        }
+        cleaned, report = clean_hypotheses(document)
+        self.assertEqual([(event["technique"], event["strings"]) for event in cleaned["techniques"]], [("arpeggio", [1, 2, 6])])
+        self.assertEqual(report["sourceTechniqueCount"], 2)
+        self.assertEqual(report["removedTechniqueCount"], 1)
+
+    def test_membership_completed_note_requires_retained_parent_and_member_string(self):
+        document = {
+            "notes": [{
+                "onsetSeconds": 1, "string": 3, "confidence": .95,
+                "uncertainty": ["technique_membership_completed_attack"],
+            }],
+            "percussion": [],
+            "techniques": [{
+                "onsetSeconds": 1, "technique": "brush", "confidence": .95,
+                "strings": [3], "stringMembershipConfidence": {
+                    "1": .1, "2": .1, "3": .59, "4": .1, "5": .1, "6": .1,
+                },
+            }],
+        }
+        cleaned, report = clean_hypotheses(document)
+        self.assertEqual(cleaned["notes"], [])
+        self.assertEqual(len(report["removedOrphanTechniqueMembers"]), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

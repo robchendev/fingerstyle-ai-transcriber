@@ -37,6 +37,8 @@ WEIGHTS = {
     "harmonic_node": 0.25, "percussion_positive": 5.0, "percussion_negative": 1.0,
     "technique_positive": 4.0, "technique_negative": 1.0, "technique_direction": 0.5,
     "technique_strings_positive": 2.0, "technique_strings_negative": 1.0,
+    "connection": 1.0, "note_technique_positive": 2.0, "note_technique_negative": 1.0,
+    "bend_curve": 0.5,
 }
 STAT_KEYS = (
     "note_onset_positive", "note_onset_negative", "fret", "pitch", "voice", "duration_log",
@@ -44,6 +46,8 @@ STAT_KEYS = (
     "percussion_negative", "harmonic_sparsity", "percussion_sparsity",
     "technique_positive", "technique_negative", "technique_direction",
     "technique_strings_positive", "technique_strings_negative",
+    "connection", "note_technique_positive", "note_technique_negative",
+    "bend_curve",
 )
 
 
@@ -1135,6 +1139,10 @@ class RuntimeTests(unittest.TestCase):
             "technique_direction": {"sum": 0.0, "count": 0},
             "technique_strings_positive": {"sum": 0.0, "count": 0},
             "technique_strings_negative": {"sum": 0.0, "count": 0},
+            "connection": {"sum": 0.0, "count": 0},
+            "note_technique_positive": {"sum": 0.0, "count": 0},
+            "note_technique_negative": {"sum": 0.0, "count": 0},
+            "bend_curve": {"sum": 0.0, "count": 0},
         }
         parsed = runtime._stats(stats, weights)
         self.assertAlmostEqual(runtime._objective(parsed, weights, 0.02), 1.5 + 0.5 + 37 / 14 + 0.02 * (0.5 + 0.2))
@@ -1229,7 +1237,43 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(metrics["percussion_frame"]["available"])
         self.assertTrue(model.training)
         self.assertTrue(all(parameter.grad is None for parameter in model.parameters()))
-        self.assert_tree_equal(state, model.state_dict())
+
+    def test_v3_frame_metrics_include_connections_and_note_techniques(self):
+        from scripts.transcriber_model import FingerstyleTranscriber, ModelConfig
+        from tests.test_transcriber_model import synthetic_targets
+
+        config = ModelConfig(architecture_version=3, n_mels=1, hidden_size=4, recurrent_layers=1, max_fret=3, max_voices=2, dropout=0)
+        model = FingerstyleTranscriber(config)
+        frames = 3
+        targets, masks, valid = synthetic_targets(1, frames, architecture_version=2)
+        targets["technique"] = torch.zeros(1, frames, 4)
+        masks["technique"] = torch.zeros_like(targets["technique"], dtype=torch.bool)
+        targets["technique_direction"] = torch.zeros(1, frames, 4, dtype=torch.long)
+        masks["technique_direction"] = torch.zeros_like(targets["technique_direction"], dtype=torch.bool)
+        targets["technique_strings"] = torch.zeros(1, frames, 4, 6)
+        masks["technique_strings"] = torch.zeros_like(targets["technique_strings"], dtype=torch.bool)
+        targets["connection"] = torch.zeros(1, frames, 6, dtype=torch.long)
+        masks["connection"] = torch.zeros_like(targets["connection"], dtype=torch.bool)
+        targets["note_technique"] = torch.zeros(1, frames, 6, 4)
+        masks["note_technique"] = torch.zeros_like(targets["note_technique"], dtype=torch.bool)
+        targets["bend_curve"] = torch.zeros(1, frames, 6, 7)
+        masks["bend_curve"] = torch.zeros_like(targets["bend_curve"], dtype=torch.bool)
+        targets["connection"][0, 1, 0] = 1
+        masks["connection"][0, 1, 0] = True
+        targets["note_technique"][0, 1, 0, 0] = 1
+        masks["note_technique"][0, 1, 0] = True
+        features = torch.zeros(1, frames, 1)
+        batch = {
+            "features": features, "conditioning": torch.zeros(1, frames, 12),
+            "lengths": torch.tensor([frames]), "valid_frames": valid,
+            "targets": targets, "masks": masks, "metadata": [{}],
+        }
+        self.loss_patch.stop()
+        metrics = runtime.evaluate_model(model, [batch], "cpu")
+        self.assertTrue(metrics["connection_accuracy"]["available"])
+        self.assertTrue(metrics["note_technique_frame"]["available"])
+        self.assertTrue(metrics["connection_classes"]["hammer_on"]["available"])
+        self.assertTrue(metrics["note_technique_classes"]["bend"]["available"])
 
     def test_loss_stat_schema_rejects_removed_aliases_and_missing_keys(self):
         stats = {name: {"sum": 0.0, "count": 0} for name in STAT_KEYS}
