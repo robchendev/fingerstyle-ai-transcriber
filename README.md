@@ -1,4 +1,4 @@
-# Fingerstyle Guitar Transcriber
+# Fingerstyle Guitar Transcriber AI
 
 Turn fingerstyle guitar performances into editable Guitar Pro `.gp` drafts using audio and hand tracking. Run the included PyTorch model locally or train one on your own performances and scores.
 
@@ -67,3 +67,7 @@ Partial capos, retuning during a recording and multi-instrument scores are unsup
 .\.venv\Scripts\python.exe -m unittest discover -s tests -p 'test_*.py'
 .\scripts\video-evidence\.venv\Scripts\python.exe -m unittest discover -s tests\video -t .
 ```
+
+## License
+
+[MIT](LICENSE).
