@@ -13,7 +13,7 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
-from core import EvidenceError, frames_in_shot_range, private_output, sha256
+from core import EvidenceError, frames_in_shot_range, private_output, sha256, video_stream
 
 
 def _safe_directory(path):
@@ -304,10 +304,9 @@ def track_hands(
     guided_tracker = None
     pose_tracker = None
     try:
-        streams = [stream for stream in container.streams if stream.type == "video"]
-        if len(streams) != 1 or streams[0].index != shots_document["videoStreamIndex"]:
+        stream = video_stream(container)
+        if stream.index != shots_document["videoStreamIndex"]:
             raise EvidenceError("Video stream differs from the shot report.")
-        stream = streams[0]
         time_base = Fraction(stream.time_base)
         shot_index = 0
         prior_shot = None

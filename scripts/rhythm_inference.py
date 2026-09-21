@@ -706,25 +706,3 @@ def infer_notated_timing(document, evidence, *, include_unsupported_tail=False, 
 def _round_score_position(value):
     result = Fraction(round(float(value) * TICKS_PER_QUARTER), TICKS_PER_QUARTER)
     return result.numerator, result.denominator
-
-
-def score_seconds_at(document, quarter):
-    anchors = document.get("scoreTimeAnchors")
-    if not isinstance(anchors, list) or len(anchors) < 2:
-        raise HarnessError("Missing score/audio anchors for a newly inferred score position; run beat-based rhythm inference.")
-    if any(not isinstance(point, dict) or not {"scoreQuarter", "audioSeconds"} <= point.keys() for point in anchors):
-        raise HarnessError("Score/audio anchors require scoreQuarter and audioSeconds.")
-    quarters = [_finite(point["scoreQuarter"], "Score anchor") for point in anchors]
-    seconds = [_finite(point["audioSeconds"], "Audio anchor") for point in anchors]
-    if any(a >= b for a, b in zip(quarters, quarters[1:])) or any(a >= b for a, b in zip(seconds, seconds[1:])):
-        raise HarnessError("Score/audio anchors must be strictly increasing.")
-    value = float(quarter)
-    if value < quarters[0]:
-        time = seconds[0] + (value - quarters[0]) * (seconds[1] - seconds[0]) / (quarters[1] - quarters[0])
-    elif value > quarters[-1]:
-        time = seconds[-1] + (value - quarters[-1]) * (seconds[-1] - seconds[-2]) / (quarters[-1] - quarters[-2])
-    else:
-        time = float(np.interp(value, quarters, seconds))
-    if time < 0:
-        raise HarnessError("Inferred score position precedes the supplied audio.")
-    return time

@@ -6,7 +6,6 @@ import argparse
 from contextlib import contextmanager
 from fractions import Fraction
 import hashlib
-import importlib.metadata
 import json
 import math
 import os
@@ -22,10 +21,10 @@ import mediapipe
 import numpy as np
 import scipy
 
-from audio_sync import align_retained_source, align_soundtrack, load_source_provenance
-from core import EvidenceError, PRIVATE_OUTPUT_ROOT, REPOSITORY_ROOT, sha256
-from geometry import (AUTOMATIC_PREPARATION_METHOD, GEOMETRY_POINTS, STATE_CODES, geometry_row_complete, prepare_geometry_annotations,
-                      annotations_ready, automatic_cut_intervals, cut_uncertainty_mask, track_geometry, validate_geometry_annotations)
+from audio_sync import align_soundtrack, installed_tools as _installed_tools
+from core import EvidenceError, PRIVATE_OUTPUT_ROOT, REPOSITORY_ROOT, sha256, video_stream
+from geometry import (AUTOMATIC_PREPARATION_METHOD, GEOMETRY_POINTS, STATE_CODES, geometry_row_complete,
+                      annotations_ready, automatic_cut_intervals, cut_uncertainty_mask, validate_geometry_annotations)
 from hand_motion import load_audio_clock, validate_clips
 from hand_roles import (RoleConfig, _read_arrays, assign_hand_roles, load_role_inputs,
                         load_role_observations)
@@ -36,19 +35,19 @@ from shot_inspector import (_write_thumbnail, frame_timeline_sha256, inspect_sho
                             prepare_automatic_shots, validate_frame_timeline)
 
 
-STAGES = ("alignment", "shots", "hands", "annotations", "geometry", "roles", "coarse", "bundle")
+STAGES = ("alignment", "shots", "hands", "annotations", "geometry", "roles", "bundle")
 SHOT_STAGES = ("inspection", "automatic-inspection")
 KINDS = {
     "alignment": "video-to-trimmed-audio-alignment",
     "shots": "video-shot-inspection", "hands": "fingerstyle-hand-observations",
     "annotations": "guitar-geometry-annotations", "geometry": "guitar-geometry-observations",
-    "roles": "guitar-relative-hand-roles", "coarse": "coarse-instrument-context", "bundle": "paired-video-inputs",
+    "roles": "guitar-relative-hand-roles", "bundle": "paired-video-inputs",
 }
 SOURCE_TIME_POLICY = (
     "Original video bytes, integer source PTS and time base are retained. "
     "Only frames inside the aligned already-trimmed audio and requested clips are packaged. "
     "Fresh detection uses the contiguous clip envelope; true shot cuts reset trackers. "
-    "Final inputs contain optional calibrated geometry, independent hands, coarse tracked context and masks, never RGB crops. "
+    "Final inputs contain independent hands and masks, never RGB crops; geometry and coarse slots remain unavailable. "
     "No frame/geometry interpolation, target-derived inputs, training or video rewriting."
 )
 
@@ -96,18 +95,6 @@ def _digest(value):
                                      allow_nan=False).encode()).hexdigest()
 
 
-def _installed_tools():
-    # Do not call static_ffmpeg's fetch-capable discovery from this worker.
-    from static_ffmpeg.run import get_platform_dir
-
-    directory = Path(get_platform_dir())
-    suffix = ".exe" if sys.platform == "win32" else ""
-    paths = [directory / f"{name}{suffix}" for name in ("ffmpeg", "ffprobe")]
-    if not (directory / "installed.crumb").is_file() or not all(p.is_file() for p in paths):
-        raise EvidenceError("Existing isolated FFmpeg/FFprobe installation is required; worker never downloads.")
-    return tuple(paths)
-
-
 def _runtime():
     tools = {}
     for path in _installed_tools():
@@ -116,8 +103,7 @@ def _runtime():
     return {
         "python": sys.version,
         "packages": {"av": av.__version__, "numpy": np.__version__, "opencv": cv2.__version__,
-                     "mediapipe": mediapipe.__version__, "scipy": scipy.__version__,
-                     "static-ffmpeg": importlib.metadata.version("static-ffmpeg")},
+                     "mediapipe": mediapipe.__version__, "scipy": scipy.__version__},
         "tools": tools,
         "implementationSha256": {p.name: sha256(p) for p in sorted(Path(__file__).parent.glob("*.py"))
                                  if not p.name.startswith("test_")},
@@ -127,9 +113,8 @@ def _runtime():
 def _request(path):
     path = _path(path, file=True)
     document = _json(path)
-    allowed = {"schemaVersion", "kind", "id", "video", "audio", "gp", "outputDirectory",
-               "pluckingScreenSide", "clips", "reuse", "correspondenceReview",
-               "handModel", "poseModel", "sourceMapping", "videoReceipt", "reviewMode", "geometryReference", "geometryMode", "coarseContext"}
+    allowed = {"schemaVersion", "kind", "id", "video", "audio", "outputDirectory",
+               "pluckingScreenSide", "clips", "reuse", "handModel", "poseModel", "reviewMode"}
     if set(document) - allowed:
         raise EvidenceError(f"Unknown video request fields: {sorted(set(document) - allowed)}")
     if type(document.get("schemaVersion")) is not int or document["schemaVersion"] != 1 or document.get("kind") != "paired-video-preparation-request":
@@ -139,7 +124,6 @@ def _request(path):
     result = dict(document)
     for name in ("video", "audio"):
         result[name] = str(_path(document.get(name), file=True))
-    result["gp"] = None if document.get("gp") is None else str(_path(document["gp"], file=True))
     output = _path(document.get("outputDirectory"), private=True)
     if not output.is_relative_to(PRIVATE_OUTPUT_ROOT / "batches") or len(output.relative_to(PRIVATE_OUTPUT_ROOT / "batches").parts) < 2:
         raise EvidenceError("Worker output must be runs/video-evidence/batches/<batch>/<id>.")
@@ -148,10 +132,6 @@ def _request(path):
     result.setdefault("reviewMode", "automatic")
     if result["reviewMode"] not in ("automatic", "manual"):
         raise EvidenceError("reviewMode must be automatic or manual.")
-    result.setdefault("geometryMode", "existing-only")
-    result.setdefault("coarseContext", False)
-    if result["geometryMode"] not in ("disabled", "existing-only", "automatic") or type(result["coarseContext"]) is not bool:
-        raise EvidenceError("Invalid geometryMode or coarseContext selection.")
     RoleConfig(plucking_screen_side=result["pluckingScreenSide"])
     clips = result.get("clips")
     if clips is not None:
@@ -168,27 +148,14 @@ def _request(path):
     if not isinstance(reuse, dict) or set(reuse) - set(STAGES):
         raise EvidenceError("reuse contains unsupported video stages.")
     result["reuse"] = {name: str(_path(value, file=True, private=True)) for name, value in reuse.items()}
-    if result.get("coarseContext") is False and "coarse" in result["reuse"]:
-        raise EvidenceError("coarseContext=false cannot silently consume a reused coarse stage.")
-    if result["geometryMode"] == "disabled":
-        if result["reviewMode"] != "automatic" or result["coarseContext"] or set(result["reuse"]) & {"geometry", "roles", "coarse", "bundle"}:
-            raise EvidenceError("Disabled geometry requires automatic masked geometry and rebuilt roles/bundles; old coordinate-derived stages cannot be reused.")
     result.setdefault("handModel", str(PRIVATE_OUTPUT_ROOT / "models" / "hand_landmarker.task"))
     result.setdefault("poseModel", None)
-    result.setdefault("correspondenceReview", None)
-    result.setdefault("sourceMapping", None)
-    result.setdefault("videoReceipt", None)
-    result.setdefault("geometryReference", None)
-    if bool(result["sourceMapping"]) != bool(result["videoReceipt"]):
-        raise EvidenceError("Retained source timing needs both sourceMapping and videoReceipt.")
-    if result["correspondenceReview"] is not None and result["gp"] is None:
-        raise EvidenceError("Correspondence review requires its actual source GP; inference without GP must omit that review.")
-    for name in ("handModel", "poseModel", "correspondenceReview", "sourceMapping", "videoReceipt", "geometryReference"):
+    for name in ("handModel", "poseModel"):
         if result[name] is not None:
-            result[name] = str(_path(result[name], file=name not in ("handModel", "poseModel")))
-    inputs = [Path(result[name]) for name in ("video", "audio", "gp") if result[name] is not None]
+            result[name] = str(_path(result[name]))
+    inputs = [Path(result[name]) for name in ("video", "audio")]
     other = [Path(p) for p in result["reuse"].values()]
-    other.extend(Path(result[n]) for n in ("correspondenceReview", "handModel", "poseModel", "sourceMapping", "videoReceipt", "geometryReference") if result[n])
+    other.extend(Path(result[n]) for n in ("handModel", "poseModel") if result[n])
     if len(set(inputs + other)) != len(inputs + other) or any(p.is_relative_to(output) for p in inputs + other + [path]):
         raise EvidenceError("Input paths must be distinct and outside the worker output directory.")
     return path, result
@@ -199,7 +166,7 @@ def _artifacts(path, stage):
         stage = "shots"
     path = _path(path, file=True, private=True)
     values = {str(path): sha256(path)}
-    if stage in ("hands", "geometry", "roles", "coarse", "bundle"):
+    if stage in ("hands", "geometry", "roles", "bundle"):
         document = _json(path)
         expected = "inputs.npz" if stage == "bundle" else f"{stage}.npz"
         key = "arraysPath" if stage == "bundle" else "arrays"
@@ -209,18 +176,12 @@ def _artifacts(path, stage):
         digest = sha256(arrays)
         if document.get("arraysSha256") is not None and document["arraysSha256"] != digest:
             raise EvidenceError(f"{stage} arrays differ from the report hash.")
-        if stage in ("roles", "coarse", "bundle") and document.get("arraysSha256") != digest:
+        if stage in ("roles", "bundle") and document.get("arraysSha256") != digest:
             raise EvidenceError(f"{stage} requires its array hash.")
         values[str(arrays)] = digest
     if stage == "annotations":
         document = _json(path)
         values.update({str(p): sha256(p) for p in _annotation_image_paths(path, document)})
-        if document.get("proposalReport"):
-            report = Path(document["proposalReport"])
-            if report.name != str(report):
-                raise EvidenceError("Geometry proposalReport must be a local filename.")
-            report = _path(path.with_name(report.name), file=True, private=True)
-            values[str(report)] = sha256(report)
     if stage == "shots":
         rows = _json(path).get("shots")
         if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
@@ -287,7 +248,7 @@ def _validate_report(stage, path, request, sources, paths):
     if document.get("kind") != KINDS[stage] or type(document.get("schemaVersion")) is not int or document["schemaVersion"] != version:
         raise EvidenceError(f"Invalid {stage} report schema.")
     _artifacts(path, stage)
-    if stage in ("alignment", "shots", "hands", "annotations", "geometry", "coarse"):
+    if stage in ("alignment", "shots", "hands", "annotations", "geometry"):
         if document.get("videoSha256") != sources["video"]:
             raise EvidenceError(f"{stage} report does not match video hash.")
     if stage == "alignment":
@@ -301,10 +262,6 @@ def _validate_report(stage, path, request, sources, paths):
             raise EvidenceError("Unsupported alignment status.")
         if document["status"] == "supported":
             load_audio_clock(sources["video"], request["audio"], path)
-        if request.get("sourceMapping"):
-            expected = load_source_provenance(request["sourceMapping"], request["videoReceipt"], request["id"], request["video"], request["audio"])
-            if document.get("method") != "retained-source-samples" or document.get("sourceProvenance") != expected:
-                raise EvidenceError("Alignment reuse must match the selected retained source provenance; omit old inferred alignment to rebuild.")
     if stage == "shots":
         validate_frame_timeline(document)
         rows = document.get("shots")
@@ -332,6 +289,8 @@ def _validate_report(stage, path, request, sources, paths):
             validate_geometry_annotations(document, shots, sources["video"], sha256(paths["shots"]))
             if annotations_ready(document) and not all(geometry_row_complete(row) for row in document["shots"]):
                 raise EvidenceError("Completed annotations contain incomplete shot geometry.")
+            if any(row["geometry"] is not None or row.get("additionalKeyframes") for row in document["shots"]):
+                raise EvidenceError("Geometry preparation is disabled; reused annotations must contain only unavailable coordinates.")
         else:
             if any(document.get(key) != shots.get(key) for key in ("timeBase", "frameCount", "shotCount")):
                 raise EvidenceError(f"{stage} coverage differs from shots.")
@@ -350,13 +309,8 @@ def _validate_report(stage, path, request, sources, paths):
                     raise EvidenceError("Geometry requires its exact source annotations.")
                 if document.get("pointOrder") != list(GEOMETRY_POINTS) or document.get("stateEncoding") != STATE_CODES:
                     raise EvidenceError("Geometry point/state encoding is unsupported.")
-    if stage == "coarse":
-        from coarse_context import load_coarse_observations
-        required = {"shots", "hands", "geometry", "annotations"}
-        if not required <= paths.keys():
-            raise EvidenceError("Coarse context requires its source shots, hands, geometry and annotations.")
-        inputs = load_role_inputs(request["video"], paths["shots"], paths["hands"], paths["geometry"], paths["annotations"])
-        load_coarse_observations(inputs, path)
+                if arrays["confidence"].any() or arrays["source"].any() or np.isfinite(arrays["coordinates"]).any():
+                    raise EvidenceError("Geometry preparation is disabled; reused coordinates must remain unavailable.")
     if stage in ("roles", "bundle"):
         required = {"shots", "hands", "geometry", "annotations"}
         if not required <= paths.keys():
@@ -373,12 +327,6 @@ def _validate_report(stage, path, request, sources, paths):
             _, _, _, audio_hashes = load_audio_clock(sources["video"], request["audio"], paths["alignment"])
             expected = {**inputs["hashes"], **audio_hashes, "roles": sha256(paths["roles"]),
                         "roleArrays": roles["arraysSha256"]}
-            if "coarse" in paths:
-                expected.update(coarse=sha256(paths["coarse"]),
-                                coarseArrays=sha256(Path(paths["coarse"]).with_name("coarse.npz")))
-            if request["correspondenceReview"]:
-                expected.update(correspondenceReview=sha256(request["correspondenceReview"]),
-                                correspondenceReferenceGp=sources["gp"])
             if document.get("inputSha256") != expected or document.get("id") != request["id"]:
                 raise EvidenceError("Reused bundle differs from source dependencies or id.")
             if (document.get("inputRepresentation") != INPUT_REPRESENTATION
@@ -388,6 +336,9 @@ def _validate_report(stage, path, request, sources, paths):
             with np.load(Path(path).with_name("inputs.npz"), allow_pickle=False) as arrays:
                 if set(arrays.files) != {"structured", "structured_available", "pts", "audio_seconds", "technique_available", "segment_id"}:
                     raise EvidenceError("Bundle must contain only numeric structure, masks and timestamps; RGB/image arrays are forbidden.")
+                for start, stop in ((0, 98), (186, 194)):
+                    if arrays["structured_available"][..., start:stop].any() or arrays["structured"][..., start:stop].any():
+                        raise EvidenceError("Geometry and coarse input slots must remain zero and unavailable.")
             for name, value in document.get("inputPaths", {}).items():
                 if name not in expected or sha256(_path(value, file=True)) != expected[name]:
                     raise EvidenceError("Bundle inputPaths do not match its bound sources.")
@@ -401,13 +352,6 @@ def _validate_report(stage, path, request, sources, paths):
 
 
 def _preflight(request, sources):
-    if request["geometryReference"]:
-        reference = _json(request["geometryReference"])
-        if reference.get("kind") != "guitar-geometry-annotations" or reference.get("videoSha256") != sources["video"] or not annotations_ready(reference):
-            raise EvidenceError("Geometry reference must contain completed annotations from this exact source video.")
-        _artifacts(request["geometryReference"], "annotations")
-    if request["sourceMapping"]:
-        load_source_provenance(request["sourceMapping"], request["videoReceipt"], request["id"], request["video"], request["audio"])
     paths = {}
     for stage in STAGES:
         if stage in request["reuse"]:
@@ -417,13 +361,6 @@ def _preflight(request, sources):
         raise EvidenceError("Reused geometry needs completed, source-bound annotations.")
     if {"hands", "geometry", "annotations", "shots"} <= paths.keys():
         load_role_inputs(request["video"], paths["shots"], paths["hands"], paths["geometry"], paths["annotations"])
-    if request["correspondenceReview"]:
-        root = str(REPOSITORY_ROOT)
-        if root not in sys.path:
-            sys.path.insert(0, root)
-        from scripts.video_correspondence import load_correspondence_review
-        load_correspondence_review(request["correspondenceReview"], video_sha256=sources["video"],
-                                   source_gp_path=request["gp"])
 
 
 @contextmanager
@@ -447,16 +384,13 @@ class _Worker:
         self.request_path, self.request = request_path, request
         self.output = Path(request["outputDirectory"])
         self.progress("inputs: verifying source hashes, reusable artifacts and job identity...")
-        self.sources = {name: sha256(request[name]) for name in ("video", "audio", "gp")
-                        if request[name] is not None}
+        self.sources = {name: sha256(request[name]) for name in ("video", "audio")}
         _preflight(request, self.sources)
         files = {str(request_path): sha256(request_path)}
         files.update({request[n]: self.sources[n] for n in self.sources})
         for stage, path in request["reuse"].items():
             files.update(_artifacts(path, stage))
-        if request["geometryReference"]:
-            files.update(_artifacts(request["geometryReference"], "annotations"))
-        for name in ("handModel", "poseModel", "correspondenceReview", "sourceMapping", "videoReceipt"):
+        for name in ("handModel", "poseModel"):
             if request[name] and Path(request[name]).is_file():
                 files[request[name]] = sha256(request[name])
         identity = {"request": request, "files": files, "runtime": _runtime()}
@@ -502,7 +436,7 @@ class _Worker:
             values.update(_artifacts(path, name) if name in (*STAGES, *SHOT_STAGES) else {str(path): sha256(path)})
         return values
 
-    def stage(self, name, operation, *, dependencies=(), reuse=None, waiting=False):
+    def stage(self, name, operation, *, dependencies=(), reuse=None):
         self.progress(f"{name}: starting; verifying dependencies...")
         dependency_hashes = self.dependencies(dependencies)
         previous = self.ledger["stages"].get(name)
@@ -516,14 +450,6 @@ class _Worker:
             self.summary.append({"stage": name, "status": "reused", "provenance": previous["provenance"], "path": str(path)})
             self.progress(f"{name}: reused verified output.")
             return path
-        if previous and previous["status"] == "waiting":
-            if previous["dependencies"] != dependency_hashes:
-                raise EvidenceError(f"Stale pending {name} dependencies; use a NEW output directory.")
-            _verify_hashes({p: h for p, h in previous["artifacts"].items() if p != previous["path"]},
-                           f"{name} review images")
-            self.paths[name] = Path(previous["path"])
-            self.progress(f"{name}: waiting for review.")
-            return self.paths[name]
         if previous:
             if not self.reset_failed:
                 raise EvidenceError(f"Incomplete stage {name}; resume with run --request \"{self.request_path}\" --output <result.json> --reset-failed.")
@@ -552,38 +478,17 @@ class _Worker:
             hashes = _artifacts(path, name) if name in (*STAGES, *SHOT_STAGES) else {str(path): sha256(path)}
             self.check_sources()
             _verify_hashes(dependency_hashes, f"{name} dependency")
-            entry.update(status="waiting" if waiting else "complete", path=str(path), artifacts=hashes)
+            entry.update(status="complete", path=str(path), artifacts=hashes)
             self.save()
         except Exception as error:
             entry.update(status="failed", error=f"{type(error).__name__}: {error}")
             self.save()
             self.progress(f"{name}: failed: {error}")
             raise
-        if not waiting:
-            self.summary.append({"stage": name, "status": "reused" if reuse or entry["provenance"] == "cached" else "completed",
-                                 "provenance": entry["provenance"], "path": str(path)})
-        self.progress(f"{name}: {'waiting for review' if waiting else 'completed'} ({entry['provenance']}).")
+        self.summary.append({"stage": name, "status": "reused" if reuse or entry["provenance"] == "cached" else "completed",
+                             "provenance": entry["provenance"], "path": str(path)})
+        self.progress(f"{name}: completed ({entry['provenance']}).")
         return path
-
-    def finish_annotation(self, path):
-        document = _validate_report("annotations", path, self.request, self.sources, self.paths)
-        _annotation_image_paths(path, document, editable=path.is_relative_to(self.output))
-        with np.load(self.paths["hands"].with_name("hands.npz"), allow_pickle=False) as arrays:
-            pts = set(arrays["pts"].tolist())
-        if any(type(seed["keyframePts"]) is not int or seed["keyframePts"] not in pts
-               for row in document["shots"] for seed in (row, *row.get("additionalKeyframes", []))):
-            raise EvidenceError("Annotation seeds must be exact decoded source PTS, never interpolated frames.")
-        if not annotations_ready(document):
-            self.progress("annotations: waiting for review.")
-            return False
-        # Waiting annotations are the sole mutable input. Freeze their current bytes now.
-        entry = self.ledger["stages"]["annotations"]
-        if entry["status"] == "waiting":
-            entry.update(status="complete", artifacts=_artifacts(path, "annotations"))
-            self.save()
-            self.summary.append({"stage": "annotations", "status": "completed", "provenance": "reviewed", "path": str(path)})
-            self.progress("annotations: reviewed output completed.")
-        return True
 
     def action(self, stage, reason, command, path):
         self.check_sources()
@@ -604,7 +509,7 @@ class _Worker:
                 "actions": list(actions), "stageSummary": self.summary, "sourceTimePolicy": SOURCE_TIME_POLICY}
 
 
-def _annotation_image_paths(path, document, *, editable=False):
+def _annotation_image_paths(path, document):
     paths = []
     rows = document.get("shots")
     if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
@@ -617,10 +522,8 @@ def _annotation_image_paths(path, document, *, editable=False):
             if not isinstance(seed.get("keyframeImage"), str):
                 raise EvidenceError("Geometry keyframeImage must be a relative path string.")
             relative = Path(seed["keyframeImage"])
-            if relative.is_absolute() or editable and ".." in relative.parts:
+            if relative.is_absolute() or ".." in relative.parts:
                 raise EvidenceError("Geometry review keyframes must be local relative image paths.")
-            # Historical reviewed packages reference sibling keyframe directories.
-            # Normalize dot components, but never resolve a symlink before checking it.
             absolute = Path(os.path.abspath(Path(path).parent / relative))
             paths.append(_path(absolute, file=True, private=True))
     return paths
@@ -651,9 +554,7 @@ def _timeline(video, shots_path, directory, hands_path=None):
                            "timestampSource": "validated-cached-hand-observations"})
             return path
     with av.open(str(video)) as container:
-        if len(container.streams.video) != 1:
-            raise EvidenceError("Exactly one source video stream is required.")
-        stream = container.streams.video[0]
+        stream = video_stream(container)
         time_base = Fraction(stream.time_base)
         if [time_base.numerator, time_base.denominator] != shots["timeBase"]:
             raise EvidenceError("Source and shot time bases differ.")
@@ -740,7 +641,7 @@ def _select_interval(video, original_path, timeline_path, clips, directory):
     directory.mkdir()
     boundaries = {r["startPts"]: r for r in rows}
     with av.open(str(video)) as container:
-        stream = container.streams.video[0]
+        stream = video_stream(container)
         container.seek(start, stream=stream, backward=True)
         for frame in container.decode(stream):
             if frame.pts >= end:
@@ -786,14 +687,14 @@ def _unavailable_annotations(shots_path, directory):
             "shotId": shot["shotId"], "startPts": shot["startPts"], "endPtsExclusive": shot["endPtsExclusive"],
             "keyframePts": shot["startPts"], "keyframeImage": relative,
             "state": "calibration_unstable", "geometry": None,
-            "reviewNote": "No existing calibration; keep independent hand evidence without geometric guesses.",
+            "reviewNote": "Geometry disabled; independent hand evidence only.",
         })
     report = {
         "schemaVersion": 1, "kind": "guitar-geometry-annotations", "visibility": "private",
         "videoSha256": shots["videoSha256"], "shotsSha256": sha256(shots_path),
         "pointOrder": list(GEOMETRY_POINTS), "coordinateSpace": "normalized_full_frame", "shots": rows,
         "reviewComplete": False, "preparationComplete": True, "preparationMethod": AUTOMATIC_PREPARATION_METHOD,
-        "geometryPolicy": "existing-only; no detector, geometric proposal or manual annotation required",
+        "geometryPolicy": "disabled; reserved coordinates remain unavailable",
         "proposalSummary": {"autoAcceptedShotIds": [], "unavailableShotIds": [row["shotId"] for row in rows], "reviewRequiredShotIds": []},
         "trainingPerformed": False,
     }
@@ -819,18 +720,14 @@ def _unavailable_geometry(shots_path, hands_path, annotations_path, directory):
         "timeBase": shots["timeBase"], "frameCount": count, "shotCount": shots["shotCount"],
         "pointOrder": list(GEOMETRY_POINTS), "stateEncoding": STATE_CODES, "arrays": "geometry.npz", "arraysSha256": sha256(arrays),
         "framesWithCoordinateFrame": 0, "coordinateFrameCoverage": 0., "trainingPerformed": False,
-        "geometryPolicy": "existing-only; unavailable coordinates from native hand timestamps, no tracking or interpolation",
+        "geometryPolicy": "disabled; unavailable coordinates from native hand timestamps, no tracking or interpolation",
     }
     path = directory / "geometry.json"
     _atomic(path, report)
     return path
 
 
-def _align(video, audio, directory, request):
-    if request["sourceMapping"]:
-        return align_retained_source(
-            video, audio, directory / "alignment.json", mapping_path=request["sourceMapping"],
-            receipt_path=request["videoReceipt"], pair_id=request["id"])[0]
+def _align(video, audio, directory):
     path, document = align_soundtrack(video, audio, directory / "alignment.json")
     # FFT correlation can exceed its mathematical bound by machine roundoff.
     score = document["correlation"]
@@ -846,11 +743,6 @@ def _cached(worker, stage, operation):
     identity = {"stage": stage, "sources": {n: worker.sources[n] for n in names},
                 "configuration": "existing-api-defaults",
                 "runtime": worker.ledger["identity"]["runtime"]}
-    if stage == "alignment" and worker.request["sourceMapping"]:
-        identity["retainedSource"] = {
-            "id": worker.request["id"], "mappingSha256": sha256(worker.request["sourceMapping"]),
-            "receiptSha256": sha256(worker.request["videoReceipt"]),
-        }
     batches = PRIVATE_OUTPUT_ROOT / "batches"
     batch_root = batches / worker.output.relative_to(batches).parts[0]
     directory = batch_root / ".stage-cache" / stage / _digest(identity)
@@ -896,7 +788,7 @@ def _run(worker):
     r, p = worker.request, worker.paths
     reuse = r["reuse"]
     alignment = worker.stage("alignment", lambda _d: _cached(
-        worker, "alignment", lambda d: _align(r["video"], r["audio"], d, r)),
+        worker, "alignment", lambda d: _align(r["video"], r["audio"], d)),
                              reuse=reuse.get("alignment"))
     if "alignment" in worker.receipt:
         entry = worker.receipt["alignment"]
@@ -912,14 +804,12 @@ def _run(worker):
         _verify_hashes(entry["artifacts"], "reviewed shots")
         inspection = p["inspection"] = Path(entry["path"])
     _validate_report("shots", inspection, r, worker.sources, p)
-    imported_review = ("annotations" in reuse and _json(reuse["annotations"]).get("reviewComplete") is True
-                       and _json(reuse["annotations"]).get("shotsSha256") == sha256(inspection))
-    reviewed_cuts = imported_review or worker.receipt.get("shots", {}).get("reviewedShotsSha256") == sha256(inspection)
+    reviewed_cuts = worker.receipt.get("shots", {}).get("reviewedShotsSha256") == sha256(inspection)
     if r["reviewMode"] == "automatic" and not reviewed_cuts:
         automatic = _json(inspection).get("automaticReview", {})
         if automatic.get("method") != "conservative-cut-boundaries-v1":
             if any(name in reuse for name in ("hands", "geometry", "roles")):
-                raise EvidenceError("Unreviewed cached observations cannot be assigned new automatic cuts. Supply their reviewed annotations or omit those observation reuse entries.")
+                raise EvidenceError("Unreviewed cached observations cannot be assigned new automatic cuts. Accept their shot boundaries or omit observation reuse entries.")
             inspection = worker.stage("automatic-inspection", lambda d: prepare_automatic_shots(
                 r["video"], p["inspection"], d)[0], dependencies=("inspection",))
             p["inspection"] = inspection
@@ -953,37 +843,9 @@ def _run(worker):
 
     hands_path = worker.stage("hands", hands, dependencies=("shots",), reuse=reuse.get("hands"))
     _validate_report("hands", hands_path, r, worker.sources, p)
-    imported_annotations = None if r["geometryMode"] == "disabled" else reuse.get("annotations")
-    if imported_annotations and (
-        not annotations_ready(_json(imported_annotations))
-        or _json(imported_annotations).get("shotsSha256") != sha256(shots)
-    ):
-        imported_annotations = None
-    def prepare_annotations(d):
-        if r["reviewMode"] == "automatic":
-            if r["geometryMode"] in ("disabled", "existing-only"):
-                return _unavailable_annotations(shots, d)
-            from automatic_geometry import prepare_automatic_geometry
-            return prepare_automatic_geometry(
-                r["video"], shots, hands_path, d, existing_annotations_path=r["geometryReference"] or reuse.get("annotations"))[0]
-        path, document = prepare_geometry_annotations(r["video"], shots, d,
-                                                      existing_annotations_path=reuse.get("annotations"))
-        if reuse.get("annotations"):
-            document["reviewComplete"] = False
-            _atomic(path, document)
-        return path
-
-    annotations = worker.stage(
-        "annotations", prepare_annotations,
-        dependencies=("shots", "hands") if r["reviewMode"] == "automatic" else ("shots",),
-        reuse=imported_annotations, waiting=not bool(imported_annotations) and r["reviewMode"] == "manual")
-    if not worker.finish_annotation(annotations):
-        return worker.action("annotations", "Review geometry/visibility for every shot in the local annotator; save, then rerun this request.",
-                             [sys.executable, str(Path(__file__).with_name("cli.py")), "annotate-geometry",
-                              "--annotations", str(annotations)], annotations)
-    no_geometry = (r["reviewMode"] == "automatic" and r["geometryMode"] in ("disabled", "existing-only")
-                   and all(row["geometry"] is None for row in _json(annotations)["shots"]))
-    geometry = worker.stage("geometry", lambda d: _unavailable_geometry(shots, hands_path, annotations, d) if no_geometry else track_geometry(r["video"], shots, annotations, d)[0],
+    annotations = worker.stage("annotations", lambda d: _unavailable_annotations(shots, d),
+                               dependencies=("shots", "hands"), reuse=reuse.get("annotations"))
+    geometry = worker.stage("geometry", lambda d: _unavailable_geometry(shots, hands_path, annotations, d),
                             dependencies=("shots", "annotations"), reuse=reuse.get("geometry"))
     _validate_report("geometry", geometry, r, worker.sources, p)
     roles = worker.stage("roles", lambda d: assign_hand_roles(
@@ -991,40 +853,16 @@ def _run(worker):
         config=RoleConfig(plucking_screen_side=r["pluckingScreenSide"]))[0],
         dependencies=("shots", "hands", "geometry", "annotations"), reuse=reuse.get("roles"))
     _validate_report("roles", roles, r, worker.sources, p)
-    def coarse(d):
-        from coarse_context import prepare_coarse_context
-        return prepare_coarse_context(r["video"], shots, hands_path, geometry, d,
-                                      pts_range=(clips[0]["startPts"], clips[-1]["endPtsExclusive"]))[0]
-    context = None
-    if r["coarseContext"]:
-        context = worker.stage("coarse", coarse, dependencies=("shots", "hands", "geometry", "alignment", "timeline"), reuse=reuse.get("coarse"))
-        scope = _json(context).get("scope")
-        if scope is not None and (scope["startPts"] > clips[0]["startPts"] or scope["endPtsExclusive"] < clips[-1]["endPtsExclusive"]):
-            raise EvidenceError("Reused coarse context does not cover the requested clip envelope; omit coarse reuse to rebuild.")
     bundle = worker.stage("bundle", lambda d: prepare_paired_inputs(
         r["video"], shots, hands_path, geometry, annotations, roles, r["audio"], alignment, d, clips,
-        pair_id=r["id"], correspondence_review_path=r["correspondenceReview"],
-        reference_gp_path=r["gp"] if r["correspondenceReview"] else None, coarse_path=context)[0],
-        dependencies=("shots", "hands", "geometry", "annotations", "roles", "alignment") + (("coarse",) if context else ()),
+        pair_id=r["id"])[0],
+        dependencies=("shots", "hands", "geometry", "annotations", "roles", "alignment"),
         reuse=reuse.get("bundle"))
     bundle_document = _validate_report("bundle", bundle, r, worker.sources, p)
     if bundle_document["clips"] != request_clips(clips):
         raise EvidenceError("Reused bundle clip scope differs from requested clips.")
-    document = _json(annotations)
-    proposal_summary = document.get("proposalSummary", {})
-    optional = []
-    with np.load(Path(hands_path).with_name("hands.npz"), allow_pickle=False) as arrays:
-        for shot_id in proposal_summary.get("reviewRequiredShotIds", []):
-            exposure = int(((arrays["shot_id"] == shot_id) & (arrays["hand_count"] > 0)).sum())
-            if exposure:
-                optional.append({
-                    "stage": "geometry-exception", "optional": True, "shotId": shot_id,
-                    "reason": "Geometry is unavailable or uncertain here. Optional review can add evidence; it is not an instruction to annotate every shot.",
-                    "path": str(annotations), "priority": exposure, "observedHandFrames": exposure,
-                })
-    result = worker.result("ready", optional)
+    result = worker.result("ready")
     result["reviewMode"] = r["reviewMode"]
-    result["geometryProposalSummary"] = proposal_summary
     return result
 
 
@@ -1044,8 +882,6 @@ def review_request(request_path, *, accept_shots=False, add_cuts=(), alignment_o
         raise EvidenceError("Added cut seconds must be finite and positive.")
     if alignment_offset is not None and (type(alignment_offset) not in (int, float) or not math.isfinite(alignment_offset)):
         raise EvidenceError("Alignment offset must be finite.")
-    if alignment_offset is not None and request["sourceMapping"]:
-        raise EvidenceError("This job uses retained source sample bounds. An explicit timing override requires a new job without sourceMapping.")
     with _lock(Path(request["outputDirectory"])):
         worker = _Worker(request_path, request)
         entries = worker.ledger["stages"]
@@ -1114,7 +950,7 @@ def _result_path(path, result, request_path):
     output = Path(request.get("outputDirectory", ""))
     if path.is_relative_to(output) or path in {Path(v) for v in result.get("artifacts", {}).values()}:
         raise EvidenceError("Result must be outside stage output directories and input artifacts.")
-    protected = [request.get(n) for n in ("video", "audio", "gp", "handModel", "poseModel", "correspondenceReview", "sourceMapping", "videoReceipt", "geometryReference")]
+    protected = [request.get(n) for n in ("video", "audio", "handModel", "poseModel")]
     protected.extend(request.get("reuse", {}).values())
     if path in {Path(p) for p in protected if p}:
         raise EvidenceError("Result cannot overwrite any source.")
@@ -1142,7 +978,7 @@ def main(argv=None):
     review.add_argument("--request", required=True)
     review.add_argument("--output")
     review.add_argument("--accept-shots", action="store_true")
-    review.add_argument("--add-cut", "--add-cut-seconds", type=float, action="append", default=[])
+    review.add_argument("--add-cut", type=float, action="append", default=[])
     review.add_argument("--alignment-offset", type=float)
     args = parser.parse_args(argv)
     if args.command == "review" and args.output is None:
@@ -1164,10 +1000,8 @@ def main(argv=None):
             try:
                 request = _json(args.request)
                 sources = {}
-                for name in ("video", "audio", "gp"):
+                for name in ("video", "audio"):
                     value = request.get(name)
-                    if name == "gp" and value is None:
-                        continue
                     if isinstance(value, str) and Path(value).is_file():
                         sources[name] = sha256(_path(value, file=True))
                     else:

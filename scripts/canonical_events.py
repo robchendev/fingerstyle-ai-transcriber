@@ -310,6 +310,7 @@ def normalized_performance_text(score, conventions):
 
 def gesture_events(score, rules, segments, conventions=None):
     gestures, unresolved, rests = [], [], []
+    convention_prefix = conventions.get("id", "owner") if conventions is not None else "owner"
     performed, suppressed = normalized_performance_text(score, conventions)
     filtered = []
     for visit, beat, onset in performed:
@@ -332,17 +333,18 @@ def gesture_events(score, rules, segments, conventions=None):
         owner_wrist = conventions is not None and normalized_text(beat["text"]) == "O"
         if owner_wrist:
             gestures.append({
-                "id": f"{performance_id}:owner-uppercase-O", "technique": "wrist_thump",
+                "id": f"{performance_id}:{convention_prefix}-uppercase-O", "technique": "wrist_thump",
                 "attributes": {}, "voiceIndex": beat["voiceIndex"], "onsetQuarter": onset,
                 "durationQuarter": None, "writtenBeatId": beat["id"], "visitIndex": visit["visitIndex"],
                 "graceMode": beat["graceMode"], "scoreOnsetKnown": beat["graceMode"] is None,
-                "symbolicNoteIds": [], "interpretationRuleId": "owner-uppercase-O",
-                "evidenceBeatIds": [], "evidenceSource": "owner-notation-conventions",
+                "symbolicNoteIds": [], "interpretationRuleId": f"{convention_prefix}-uppercase-O",
+                "evidenceBeatIds": [], "evidenceSource": f"{convention_prefix}-notation-conventions",
             })
             matched = [rule for rule in matched if not (rule["technique"] == "wrist_thump" and "O" in rule_tokens(rule))]
         dead_ids = [f"p{visit['visitIndex']}:{note['id']}" for note in beat["notes"] if note["techniques"]["dead"]]
         text = normalized_text(beat["text"])
-        if not matched and not owner_wrist and "O" not in text.split() and is_percussive_hit_text(text):
+        short_text_policy = conventions is None or conventions.get("shortTextIsPercussiveHit", True)
+        if short_text_policy and not matched and not owner_wrist and "O" not in text.split() and is_percussive_hit_text(text):
             matched.append({
                 "id": "owner-short-text-hit", "technique": "percussive_hit",
                 "attributes": {}, "evidenceBeatIds": [],
@@ -412,7 +414,7 @@ def gesture_events(score, rules, segments, conventions=None):
                     conventional.setdefault("percussive_hit" if ghost else "thumb_slap", []).append(identifier)
             for technique, identifiers in conventional.items():
                 known = beat["graceMode"] is None and all(segments[identifier][0]["isAttack"] is True for identifier in identifiers)
-                rule_id = "owner-ghost-X-generic" if technique == "percussive_hit" else "owner-plain-X-thumb"
+                rule_id = f"{convention_prefix}-ghost-X-generic" if technique == "percussive_hit" else f"{convention_prefix}-plain-X-thumb"
                 gestures.append({
                     "id": f"{performance_id}:{rule_id}", "technique": technique, "attributes": {},
                     "voiceIndex": beat["voiceIndex"], "onsetQuarter": onset, "durationQuarter": None,
@@ -420,7 +422,7 @@ def gesture_events(score, rules, segments, conventions=None):
                     "scoreOnsetKnown": known, "symbolicNoteIds": identifiers,
                     "sourcePitchedNoteIds": [], "contextPitchedNoteIds": [],
                     "labelMask": {"gesture": True, "fingering": False, "pitch": False, "onset": known},
-                    "interpretationRuleId": rule_id, "evidenceBeatIds": [], "evidenceSource": "owner-notation-conventions",
+                    "interpretationRuleId": rule_id, "evidenceBeatIds": [], "evidenceSource": f"{convention_prefix}-notation-conventions",
                 })
             classified = {identifier for identifiers in conventional.values() for identifier in identifiers}
             dead_ids = [identifier for identifier in dead_ids if identifier not in classified]
@@ -493,7 +495,11 @@ def canonicalize(score, annotations=None, conventions=None):
         "provenance": {"sourceGpSha256": score["sourceGpSha256"], "fretConvention": instrument["fretConvention"], "ruleIds": [rule["id"] for rule in rules], "referenceBeatIds": [beat["id"] for beat in score["scoreEvents"] if beat["referenceOnly"]], "percussiveHitTextDetectionMaxLen": percussive_hit_text_max_len()},
     }
     if conventions is not None:
-        for name in ("plainXIsThumbSlap", "ghostXIsPercussiveHit"):
+        if "id" in conventions:
+            if not isinstance(conventions["id"], str) or not conventions["id"].strip():
+                raise CanonicalLabelError("Notation convention id must be a nonempty string.")
+            output["provenance"]["notationConventionsId"] = conventions["id"]
+        for name in ("plainXIsThumbSlap", "ghostXIsPercussiveHit", "shortTextIsPercussiveHit"):
             if name in conventions:
                 if type(conventions[name]) is not bool:
                     raise CanonicalLabelError(f"{name} must be an explicit boolean.")

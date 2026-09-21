@@ -1,8 +1,7 @@
-"""Local PyTorch commands. Training is an explicit explicit operation."""
+"""Local PyTorch commands. Training is an explicitly requested operation."""
 
 import argparse
 from collections import Counter
-from copy import deepcopy
 from dataclasses import asdict, fields, replace
 from datetime import datetime
 import math
@@ -180,8 +179,6 @@ def preflight(args):
     torch.set_num_threads(config["data"]["num_threads"])
     seed_everything(training.seed)
     log_progress(f"Preflight: configuration loaded | CPU threads {config['data']['num_threads']} | no training.")
-    if getattr(args, "audio_checkpoint", None):
-        raise HarnessError("--audio-checkpoint is obsolete: paired preflight uses a fresh joint model, without loading trained weights.")
     if args.forward:
         log_progress("Preflight: initializing untrained acoustic model...")
     model = FingerstyleTranscriber(model_config).eval() if args.forward else None
@@ -339,12 +336,6 @@ def train(args):
         training = replace(training, max_seconds=max_hours * 3600)
         config = {**config, "training": asdict(training)}
     budget = TrainingBudget(training.max_seconds, started_at=started)
-    if getattr(args, "audio_checkpoint", None):
-        raise HarnessError("--audio-checkpoint is obsolete: paired training initializes acoustic, numeric-video and fusion weights together from scratch.")
-    if "video" not in config and not args.resume:
-        raise HarnessError("Fresh training is joint-only and requires a numeric paired video index. Create the configuration with config --video-index INDEX; pure audio/GP training is not supported.")
-    if getattr(args, "initialize_from", None):
-        raise HarnessError("Joint paired training starts from scratch or resumes its own joint checkpoint; --initialize-from is not supported.")
     checkpoint = load_checkpoint(args.resume) if args.resume else None
     run_dir = private_output(args.run_dir, args.data_root)
     if args.resume:
@@ -454,66 +445,24 @@ def _train_with_budget(args, config, features, model_config, training, run_dir, 
     if "video" in config:
         result["videoCoverage"] = {"train": train_data.video_coverage, "validation": validation_data.video_coverage}
         result["trainingMode"] = "joint-audio-numeric-video-from-scratch"
+    else:
+        result["trainingMode"] = "audio-from-scratch"
     return result
 
 
-def initialize_model(model, target_config, checkpoint_path, manifest_sha256):
-    from .transcriber_model import FingerstyleTranscriber, ModelConfig, initialize_v4_from_model
-    from .transcriber_runtime import load_checkpoint
-
-    checkpoint_path = Path(checkpoint_path).resolve()
-    checkpoint = load_checkpoint(checkpoint_path)
-    source = ModelConfig(**checkpoint["identity"]["model"])
-    source_values, target_values = asdict(source), asdict(target_config)
-    source_version = source_values.pop("architecture_version")
-    target_version = target_values.pop("architecture_version")
-    if checkpoint["identity"]["manifest_sha256"] != manifest_sha256 or checkpoint["global_step"] <= 0:
-        raise HarnessError("Initialization requires a trained checkpoint from the same release.")
-    if target_version == 4 and source_version in (2, 3):
-        with torch.random.fork_rng(devices=[]):
-            source_model = FingerstyleTranscriber(source)
-            source_model.load_state_dict(checkpoint["model_state"], strict=True)
-            transfer = initialize_v4_from_model(model, source_model)
-        return {
-            **transfer, "kind": "corrected-v4-supervision-with-reset-technique-heads",
-            "checkpointSha256": sha256(checkpoint_path), "sourceGlobalStep": checkpoint["global_step"],
-            "copiedParameterTensors": len(transfer["copiedParameters"]),
-            "newParameterTensors": [
-                key for key in model.state_dict() if any(key.startswith(f"heads.{name}.") for name in transfer["resetHeads"])
-            ],
-            "optimizerStateImported": False,
-        }
-    if target_version != source_version + 1 or source_values != target_values:
-        raise HarnessError("Initialization requires compatible consecutive architecture versions differing only by architecture_version.")
-    current = model.state_dict()
-    state = checkpoint["model_state"]
-    new_keys = set(current) - set(state)
-    if set(state) != set(current) - new_keys or any(current[key].shape != value.shape for key, value in state.items()):
-        raise HarnessError("Source checkpoint parameters do not exactly match the shared target model.")
-    current.update(state)
-    model.load_state_dict(current, strict=True)
-    return {
-        "kind": "architecture-transfer-with-new-random-heads",
-        "checkpointSha256": sha256(checkpoint_path),
-        "sourceArchitectureVersion": source_version,
-        "targetArchitectureVersion": target_version,
-        "sourceGlobalStep": checkpoint["global_step"],
-        "copiedParameterTensors": len(state),
-        "newParameterTensors": sorted(new_keys),
-        "optimizerStateImported": False,
-    }
 
 
-def checkpoint_model(path, device_name):
+def checkpoint_model(path, device_name, *, allow_inference=True):
     from .transcriber_model import FingerstyleTranscriber, ModelConfig
-    from .transcriber_runtime import load_checkpoint, resolve_device
-    checkpoint = load_checkpoint(path)
-    if checkpoint["global_step"] <= 0:
-        raise HarnessError("Inference/evaluation requires a checkpoint with actual training steps, not random initialization.")
-    counts = checkpoint.get("resume_state", checkpoint["history"][-1] if checkpoint["history"] else {})
-    if "video" in checkpoint["identity"] and counts.get("optimizer_updates") == 0:
-        raise HarnessError("Joint inference/evaluation requires actual optimizer updates, not only skipped batches.")
-    identity = checkpoint["identity"]
+    from .transcriber_runtime import INFERENCE_FORMAT, checkpoint_identity, load_checkpoint, resolve_device
+    checkpoint = load_checkpoint(path, allow_inference=allow_inference)
+    identity = checkpoint_identity(checkpoint)
+    if checkpoint.get("format") != INFERENCE_FORMAT:
+        if checkpoint["global_step"] <= 0:
+            raise HarnessError("Inference/evaluation requires a checkpoint with actual training steps, not random initialization.")
+        counts = checkpoint.get("resume_state", checkpoint["history"][-1] if checkpoint["history"] else {})
+        if "video" in identity and counts.get("optimizer_updates") == 0:
+            raise HarnessError("Joint inference/evaluation requires actual optimizer updates, not only skipped batches.")
     model = FingerstyleTranscriber(ModelConfig(**identity["model"]))
     if "video" in identity:
         model = _wrap_video_model(model, {"video": {"model": identity["video"]["config"]}})
@@ -538,7 +487,7 @@ def _evaluation_video_config(args, identity, config):
 def evaluate(args):
     from .transcriber_model import ModelConfig
     from .transcriber_runtime import evaluate_model, TrainingConfig
-    model, checkpoint, device = checkpoint_model(args.checkpoint, args.device)
+    model, checkpoint, device = checkpoint_model(args.checkpoint, args.device, allow_inference=False)
     identity = checkpoint["identity"]
     config = default_config()
     _evaluation_video_config(args, identity, config)
@@ -571,7 +520,7 @@ def evaluate_decoded_events(args):
 
     checkpoint_hash = sha256(Path(args.checkpoint))
     implementation = {path.name: sha256(path) for path in Path(__file__).parent.glob("*.py")}
-    model, checkpoint, device = checkpoint_model(args.checkpoint, args.device)
+    model, checkpoint, device = checkpoint_model(args.checkpoint, args.device, allow_inference=False)
     identity = checkpoint["identity"]
     config = default_config()
     _evaluation_video_config(args, identity, config)
@@ -650,11 +599,13 @@ def inference_metadata(value):
 def infer(args):
     from .transcriber_model import decode_events
     from .transcriber_events import OutputTimeline
+    from .transcriber_runtime import checkpoint_identity
     model, checkpoint, device = checkpoint_model(args.checkpoint, args.device)
+    identity = checkpoint_identity(checkpoint)
     torch.set_num_threads(4)
     metadata = read_json(Path(args.metadata))
     tempos, meters = inference_metadata(metadata)
-    config = FeatureConfig(**checkpoint["identity"]["features"])
+    config = FeatureConfig(**identity["features"])
     audio_path = Path(args.audio).resolve()
     if audio_path.suffix.lower() not in (".mp3", ".flac", ".wav"):
         raise HarnessError("Inference accepts local MP3, FLAC or WAV audio.")
@@ -665,7 +616,7 @@ def infer(args):
         raise HarnessError("Inference audio must be nonempty, at most 15 minutes, and have one to eight channels.")
     video_bundle = None
     if getattr(args, "video_bundle", None):
-        if "video" not in checkpoint["identity"]:
+        if "video" not in identity:
             raise HarnessError("--video-bundle requires a paired-video checkpoint.")
         from .paired_video import load_inference_video
 
@@ -711,12 +662,12 @@ def infer(args):
         "schemaVersion": 1, "kind": "fingerstyle-transcription-hypotheses", "visibility": "private", "distributionAuthorized": False,
         "audioSha256": audio_hash, "checkpointSha256": sha256(Path(args.checkpoint)),
         "audioDurationSeconds": duration,
-        "modelArchitectureVersion": checkpoint["identity"].get("model", {}).get("architecture_version", 1),
+        "modelArchitectureVersion": identity.get("model", {}).get("architecture_version", 1),
         "metadata": metadata, "timeUnit": "input-audio-seconds", "notatedDurationUnit": "quarter-note",
         "gpWriterImplemented": True, "gpWrittenByThisCommand": False, "modelTrainingPerformedByThisCommand": False,
         **events,
     }
-    if "video" in checkpoint["identity"]:
+    if "video" in identity:
         report["pairedVideo"] = {"provided": video_bundle is not None, "inputIdentity": video_bundle.identity if video_bundle is not None else None, "audioOnlyFallback": video_bundle is None, "architectureVersion": model.video_config.architecture_version, "inputSchemaVersion": model.video_config.input_schema_version, "featureDimension": model.video_config.structured_dim, "audioOnlyPolicy": "jointly-learned-audio-path"}
     publish_json(private_output(args.output, args.data_root), report)
     print({"notes": len(report["notes"]), "percussionHypotheses": len(report["percussion"]), "gpWritten": False})
@@ -729,63 +680,12 @@ def export_gp(args):
 
     predictions_path = Path(args.predictions).resolve()
     predictions = read_json(predictions_path)
-    playing_beat_identity = sha256(Path(args.beat_evidence).resolve()) if args.playing_evidence and args.beat_evidence else None
     beat_evidence = read_json(Path(args.beat_evidence).resolve()) if args.beat_evidence else None
-    if playing_beat_identity is not None and sha256(Path(args.beat_evidence).resolve()) != playing_beat_identity:
-        raise HarnessError("Beat evidence changed while loading playing-evidence score timing.")
     full_path = private_output(args.full_output, args.data_root)
     single_path = private_output(args.single_output, args.data_root)
     if full_path.suffix.lower() != ".gp" or single_path.suffix.lower() != ".gp" or full_path == single_path:
         raise HarnessError("GP outputs require two different .gp paths under the private runs directory.")
     before = sha256(predictions_path)
-    hand_evidence_identity = None
-    playing_options = {}
-    if args.playing_evidence:
-        from .playing_evidence import load_playing_evidence
-
-        if args.hand_position_evidence or "handPositionEvidence" in predictions:
-            raise HarnessError("Playing evidence conflicts with hand-position evidence; do not silently replace it.")
-        if not args.beat_evidence:
-            raise HarnessError("Playing evidence requires --beat-evidence for the exact exported score timing.")
-        playing_options["playing_evidence"] = load_playing_evidence(Path(args.playing_evidence).resolve(), predictions)
-    if args.hand_position_evidence:
-        if not args.beat_evidence:
-            raise HarnessError("Hand-position evidence requires the exact beat-evidence file used for score timing.")
-        evidence_path = Path(args.hand_position_evidence).resolve()
-        hand_evidence = read_json(evidence_path)
-        required = {"schemaVersion", "kind", "audioSha256", "beatEvidenceSha256", "evidenceType", "observations"}
-        if (
-            not isinstance(hand_evidence, dict)
-            or not required <= hand_evidence.keys()
-            or hand_evidence.keys() - required - {"sourceVideoSha256"}
-            or type(hand_evidence["schemaVersion"]) is not int or hand_evidence["schemaVersion"] != 1
-            or hand_evidence["kind"] != "hand-position-evidence"
-            or hand_evidence["evidenceType"] not in ("visual", "reference-oracle")
-            or not isinstance(hand_evidence["observations"], list)
-        ):
-            raise HarnessError("Expected version-1 hand-position evidence with explicit visual/reference-oracle provenance.")
-        hash_fields = ["audioSha256", "beatEvidenceSha256"]
-        if "sourceVideoSha256" in hand_evidence:
-            hash_fields.append("sourceVideoSha256")
-        if any(
-            not isinstance(hand_evidence[field], str) or len(hand_evidence[field]) != 64
-            or any(character not in "0123456789abcdefABCDEF" for character in hand_evidence[field])
-            for field in hash_fields
-        ):
-            raise HarnessError("Hand-position evidence identities must be SHA-256 hex digests.")
-        if (
-            hand_evidence["audioSha256"].lower() != str(predictions.get("audioSha256", "")).lower()
-            or hand_evidence["beatEvidenceSha256"].lower() != sha256(Path(args.beat_evidence)).lower()
-        ):
-            raise HarnessError("Hand-position evidence is bound to different audio or beat evidence.")
-        if "handPositionEvidence" in predictions:
-            raise HarnessError("Predictions already contain hand-position evidence; do not silently replace it.")
-        predictions = deepcopy(predictions)
-        predictions["handPositionEvidence"] = hand_evidence["observations"]
-        hand_evidence_identity = {
-            key: value for key, value in hand_evidence.items() if key != "observations"
-        }
-        hand_evidence_identity.update(fileSha256=sha256(evidence_path), observationCount=len(hand_evidence["observations"]))
     profile = DraftProfile(
         note_threshold=args.draft_note_threshold,
         percussion_threshold=args.draft_percussion_threshold,
@@ -808,44 +708,18 @@ def export_gp(args):
         strict_note_confidence=args.strict_note_confidence,
         rhythm_policy=args.rhythm_policy,
     )
-    arranger = arranger_identity = None
-    if args.fingering_arranger:
-        from .fingering_arranger import load_arranger
-
-        arranger, arranger_checkpoint = load_arranger(args.fingering_arranger)
-        arranger_identity = {
-            "checkpointSha256": sha256(args.fingering_arranger),
-            "manifestSha256": arranger_checkpoint["manifestSha256"],
-        }
-    completer = completer_identity = None
-    if args.symbolic_completer:
-        from .symbolic_completer import load_completer
-
-        completer, completer_checkpoint = load_completer(args.symbolic_completer)
-        completer_identity = {
-            "checkpointSha256": sha256(args.symbolic_completer),
-            "manifestSha256": completer_checkpoint["manifestSha256"],
-        }
     report = write_gp_outputs(
         args.template, predictions, full_path, single_path, profile=profile,
         beat_evidence=beat_evidence, include_unsupported_tail=args.include_beat_unsupported_tail,
-        arranger=arranger, completer=completer, completion_threshold=args.symbolic_completion_threshold,
-        completion_technique_threshold=args.symbolic_completion_technique_threshold,
         progress=log_progress,
-        **playing_options,
     )
     if sha256(predictions_path) != before:
         raise HarnessError("Prediction hypotheses changed during GP export.")
-    if args.playing_evidence:
-        report["playingEvidence"]["input"]["beatEvidenceSha256"] = playing_beat_identity
     report.update(
         visibility="private",
         predictionsSha256=before,
         fullOutputSha256=sha256(full_path),
         singleOutputSha256=sha256(single_path),
-        fingeringArranger=arranger_identity,
-        symbolicCompleter=completer_identity,
-        handPositionEvidenceInput=hand_evidence_identity,
     )
     report_path = private_output(args.report, args.data_root)
     publish_json(report_path, report)
@@ -909,10 +783,10 @@ def add_draft_arguments(parser):
 def argument_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    configure = commands.add_parser("config", help="Write a local configuration; fresh training requires --video-index.")
+    configure = commands.add_parser("config", help="Write a local audio configuration; add --video-index for joint audio/video training.")
     configure.add_argument("--output", default="runs/config.json")
     configure.add_argument("--video-index", help="Source-bound numeric paired index for fresh joint acoustic/video/fusion training (default acoustic architecture v4); no audio checkpoint.")
-    configure.add_argument("--manifest", help="Exact release for --video-index when an existing schema-2 index lacks manifestPath; its hash must match.")
+    configure.add_argument("--manifest", help="Training release manifest; when --video-index is supplied, its release identity must match.")
     for name in ("preflight", "train", "evaluate", "evaluate-events"):
         command = commands.add_parser(name)
         command.add_argument("--data-root", default=str(ROOT))
@@ -944,7 +818,7 @@ def argument_parser():
                 command.add_argument("--grace-threshold", type=float, default=.5)
     inference = commands.add_parser("infer")
     inference.add_argument("--data-root", default=str(ROOT))
-    inference.add_argument("--checkpoint", required=True)
+    inference.add_argument("--checkpoint", default=str(ROOT / "models" / "transcriber.pt"))
     inference.add_argument("--audio", required=True)
     inference.add_argument("--metadata", required=True)
     inference.add_argument("--output", default="runs/predictions.json")
@@ -966,12 +840,6 @@ def argument_parser():
     export.add_argument("--predictions", required=True)
     export.add_argument("--template", required=True)
     export.add_argument("--beat-evidence", help="Private analyze-beats output for beat-anchored constrained rhythm inference.")
-    export.add_argument("--fingering-arranger", help="Optional trained symbolic arranger checkpoint; training is a separate reviewer command.")
-    export.add_argument("--hand-position-evidence", help="Optional audio/beat-hash-bound visual or explicitly labeled reference-oracle hand-position sidecar.")
-    export.add_argument("--playing-evidence", help="Optional private guitar-playing-evidence report; requires --beat-evidence. Soft fret ranges only; gesture hypotheses are reported, never encoded automatically.")
-    export.add_argument("--symbolic-completer", help="Optional GP-trained missing-onset/chord checkpoint; training is a separate reviewer command.")
-    export.add_argument("--symbolic-completion-threshold", type=float, default=.8)
-    export.add_argument("--symbolic-completion-technique-threshold", type=float, default=.8)
     export.add_argument("--full-output", default="runs/transcription.full-voices.gp")
     export.add_argument("--single-output", default="runs/transcription.single-voice.gp")
     export.add_argument("--report", default="runs/gp-output.json")
@@ -999,7 +867,7 @@ def main(argv=None):
                 config["video"] = {"index": args.video_index, "model": asdict(VideoConfig())}
                 log_progress("Configuration: paired index validated.")
             elif args.manifest:
-                raise HarnessError("config --manifest requires --video-index; fresh public training is joint-only.")
+                config["data"]["manifest"] = args.manifest
             output_path = private_output(args.output)
             log_progress(f"Configuration: writing {output_path}...")
             publish_json(output_path, config)

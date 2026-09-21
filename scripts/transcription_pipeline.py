@@ -22,7 +22,7 @@ STATE_NAME = "transcription-state.json"
 SUMMARY_NAME = "transcription.json"
 SOURCE_OPTIONS = ("audio", "metadata", "checkpoint", "template", "beat_checkpoint",
                   "video", "video_python", "hand_model", "pose_model",
-                  "fingering_arranger", "symbolic_completer", "ffmpeg", "ffprobe")
+                  "ffmpeg", "ffprobe")
 
 
 def add_commands(commands):
@@ -47,8 +47,6 @@ def add_commands(commands):
     command.add_argument("--hand-model", help="Existing cached MediaPipe hand model.")
     command.add_argument("--pose-model", help="Optional existing cached MediaPipe pose model.")
     command.add_argument("--plucking-screen-side", choices=("geometry", "left", "right"), default="geometry")
-    command.add_argument("--fingering-arranger", help="Optional trained arranger, passed unchanged to export-gp.")
-    command.add_argument("--symbolic-completer", help="Optional trained completer, passed unchanged to export-gp.")
     add_draft_arguments(command)
     for name in ("transcribe-status", "transcribe-review"):
         command = commands.add_parser(name, help="Inspect a source-bound job." if name.endswith("status") else "Record a video review and resume the same transcription job.")
@@ -58,7 +56,6 @@ def add_commands(commands):
             command.add_argument("--accept-shots", action="store_true")
             command.add_argument("--add-cut", type=float, action="append", default=[])
             command.add_argument("--alignment-offset", type=float)
-            command.add_argument("--annotate-geometry", action="store_true")
 
 
 def _path(value, root, *, existing=False):
@@ -114,10 +111,10 @@ def _options(args, root, directory):
 def _implementation(video):
     scripts = Path(__file__).parent
     modules = (
-        "transcription_pipeline.py", "audio_tools.py", "transcriber.py", "dataset_io.py", "prepare_training_data.py",
+        "transcription_pipeline.py", "audio_tools.py", "local_media.py", "transcriber.py", "dataset_io.py", "prepare_training_data.py",
         "transcriber_audio.py", "transcriber_model.py", "transcriber_video.py", "video_features.py", "transcriber_runtime.py", "transcriber_events.py",
-        "draft_cleanup.py", "stroke_normalization.py", "gp_output.py", "gp_events.py", "gp_normalization.py",
-        "canonical_events.py", "beat_tracking.py", "fingering_arranger.py", "symbolic_completer.py",
+        "draft_cleanup.py", "stroke_normalization.py", "gp_output.py", "gp_stylesheet.py", "gp_events.py", "gp_normalization.py",
+        "canonical_events.py", "beat_tracking.py",
         "voice_optimizer.py", "technique_supervision.py", "connection_supervision.py",
         "percussion_supervision.py", "inspect_gp_files.py", "settings.py",
     )
@@ -281,44 +278,26 @@ def _audio_input(state):
 
 
 def _soundtrack_timeline(options):
+    from .local_media import soundtrack_timeline
+
     streams = json.loads(run_media([
         options["ffprobe"], "-v", "error", "-show_entries",
-        "stream=index,codec_type,sample_rate,channels,time_base", "-of", "json", options["video"],
+        "stream=index,codec_type:stream_disposition=attached_pic", "-of", "json", options["video"],
     ])).get("streams", [])
     audio = [stream for stream in streams if stream.get("codec_type") == "audio"]
     if not audio:
         raise HarnessError("The video has no audio stream. Supply a separate --audio file.")
     if len(audio) != 1:
         raise HarnessError("The video has multiple audio streams. Supply --audio explicitly to select the intended performance.")
-    if not any(stream.get("codec_type") == "video" for stream in streams):
+    if not any(stream.get("codec_type") == "video" and not stream.get("disposition", {}).get("attached_pic", 0) for stream in streams):
         raise HarnessError("--video must contain a video stream; use --audio for audio-only media.")
-    stream = audio[0]
-    frames = json.loads(run_media([
-        options["ffprobe"], "-v", "error", "-threads", "1", "-select_streams", str(stream["index"]),
-        "-show_frames", "-show_entries", "frame=pts,nb_samples", "-of", "json", options["video"],
-    ])).get("frames", [])
-    if not frames:
-        raise HarnessError("The video soundtrack contains no decodable audio frames.")
     try:
-        rate, channels = int(stream["sample_rate"]), int(stream["channels"])
-        time_base = Fraction(stream["time_base"])
-        if rate <= 0 or channels <= 0 or time_base <= 0:
-            raise ValueError("Invalid soundtrack rate, channels or time base.")
-        first_pts = int(frames[0]["pts"])
-        first = first_pts * time_base
-        count = 0
-        for frame in frames:
-            samples = int(frame["nb_samples"])
-            position = int(frame["pts"]) * time_base
-            # Coarse container time bases can round otherwise continuous sample timestamps.
-            if samples <= 0 or abs(position - first - Fraction(count, rate)) > time_base + Fraction(1, rate):
-                raise HarnessError("The video soundtrack has discontinuous timestamps; a single audio/video offset would be unsafe. Supply synchronized --audio explicitly.")
-            count += samples
-    except (KeyError, TypeError, ValueError, ZeroDivisionError) as error:
+        stream = soundtrack_timeline(options["video"], options["ffprobe"])
+    except ValueError as error:
         raise HarnessError(f"Cannot establish the embedded soundtrack's sample timeline: {error}") from error
-    return {"streamIndex": int(stream["index"]), "sampleRate": rate, "channels": channels,
-            "sampleCount": count, "firstPts": first_pts, "timeBase": [time_base.numerator, time_base.denominator],
-            "videoStartSecondsForAudioZero": float(first)}
+    return {"streamIndex": stream["index"], "sampleRate": stream["sampleRate"], "channels": stream["channels"],
+            "sampleCount": stream["sampleCount"], "firstPts": stream["firstDecodedPts"], "timeBase": stream["timeBase"],
+            "videoStartSecondsForAudioZero": float(stream["firstDecodedPts"] * Fraction(*stream["timeBase"]))}
 
 
 def _extract_audio(attempt, state):
@@ -397,10 +376,10 @@ def _video_request(directory, state):
         raise HarnessError("Video preparation output must not contain any source inputs.")
     request = {
         "schemaVersion": 1, "kind": "paired-video-preparation-request", "id": "input",
-        "audio": _audio_input(state)["path"], "video": options["video"], "gp": None,
+        "audio": _audio_input(state)["path"], "video": options["video"],
         "outputDirectory": str(output),
         "pluckingScreenSide": options["plucking_screen_side"], "reuse": {},
-        "handModel": options["hand_model"], "poseModel": options["pose_model"], "correspondenceReview": None,
+        "handModel": options["hand_model"], "poseModel": options["pose_model"],
     }
     if not options["audio"]:
         alignment = regular_path(output.parent / "soundtrack-alignment.json")
@@ -461,7 +440,7 @@ def _prepare_video(directory, state, review_flags=None):
         state["status"] = result["status"]
         state["actions"] = []
         for action in result.get("actions", []):
-            review = {"annotations": ["--annotate-geometry"], "shots": ["--accept-shots"],
+            review = {"shots": ["--accept-shots"],
                       "alignment": ["--alignment-offset", "<SECONDS>"]}.get(action.get("stage"))
             if review:
                 action = {**action, "workerCommand": action.get("command"),
@@ -490,18 +469,20 @@ def _prepare_video(directory, state, review_flags=None):
 
 def _checkpoint(path, *, require_video):
     from .transcriber import video_model_config
-    from .transcriber_runtime import load_checkpoint
+    from .transcriber_runtime import INFERENCE_FORMAT, checkpoint_identity, load_checkpoint
 
-    checkpoint = load_checkpoint(path)
-    if checkpoint["global_step"] <= 0:
-        raise HarnessError("Transcription requires a trained checkpoint, not random initialization.")
-    if require_video and "video" not in checkpoint["identity"]:
+    checkpoint = load_checkpoint(path, allow_inference=True)
+    identity = checkpoint_identity(checkpoint)
+    if require_video and "video" not in identity:
         raise HarnessError("--video requires a paired-trained joint checkpoint. Historical audio-only checkpoints cannot consume video.")
-    if "video" in checkpoint["identity"]:
-        video_model_config(checkpoint["identity"]["video"]["config"])
-    counts = checkpoint.get("resume_state", checkpoint["history"][-1] if checkpoint["history"] else {})
-    if "video" in checkpoint["identity"] and counts.get("optimizer_updates") == 0:
-        raise HarnessError("Joint transcription requires actual optimizer updates; this checkpoint only skipped unsupervised or zero-gradient batches.")
+    if "video" in identity:
+        video_model_config(identity["video"]["config"])
+    if checkpoint.get("format") != INFERENCE_FORMAT:
+        if checkpoint["global_step"] <= 0:
+            raise HarnessError("Transcription requires a trained checkpoint, not random initialization.")
+        counts = checkpoint.get("resume_state", checkpoint["history"][-1] if checkpoint["history"] else {})
+        if "video" in identity and counts.get("optimizer_updates") == 0:
+            raise HarnessError("Joint transcription requires actual optimizer updates; this checkpoint only skipped unsupervised or zero-gradient batches.")
     return checkpoint
 
 
@@ -560,9 +541,6 @@ def _execute(directory, state, *, review_flags=None):
                        "--beat-evidence", evidence, "--template", options["template"],
                        "--full-output", str(outputs["fullVoices"]), "--single-output", str(outputs["singleVoice"]),
                        "--report", str(outputs["gpReport"])]
-            for name in ("fingering_arranger", "symbolic_completer"):
-                if options[name]:
-                    command.extend(("--" + name.replace("_", "-"), options[name]))
             for name, value in options["draft_profile"].items():
                 if value is None:
                     continue
@@ -644,17 +622,6 @@ def review_transcription(args):
             flags.extend(("--add-cut", str(seconds)))
         if args.alignment_offset is not None:
             flags.extend(("--alignment-offset", str(args.alignment_offset)))
-        if args.annotate_geometry:
-            if flags:
-                raise HarnessError("Geometry annotation is separate from shot/alignment review.")
-            result = read_json(state["videoResult"])
-            annotation = regular_path(result.get("artifacts", {}).get("annotations", ""))
-            if not annotation.is_relative_to(Path(state["videoDirectory"])) or not annotation.is_file():
-                raise HarnessError("This job has no owned pending geometry annotations.")
-            completed = subprocess.run([state["options"]["video_python"], str(ROOT / "scripts" / "video-evidence" / "cli.py"),
-                                        "annotate-geometry", "--annotations", str(annotation)], cwd=ROOT, check=False)
-            if completed.returncode:
-                raise HarnessError(f"Geometry annotation exited with code {completed.returncode}; no transcription was substituted.")
-        elif not flags:
-            raise HarnessError("Choose --accept-shots, --alignment-offset, or --annotate-geometry.")
+        if not flags:
+            raise HarnessError("Choose --accept-shots or --alignment-offset.")
         return _execute(directory, state, review_flags=flags or None)

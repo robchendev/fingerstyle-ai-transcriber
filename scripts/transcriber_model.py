@@ -9,7 +9,7 @@ This module neither trains a model nor writes notation or downloads weights.
 
 from bisect import bisect_left
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 import math
 from numbers import Integral, Real
 from typing import TypedDict
@@ -271,35 +271,6 @@ class FingerstyleTranscriber(nn.Module):
         return outputs
 
 
-def initialize_v4_from_model(model, source):
-    """Explicit transfer, never resume or reinterpret v3 slide-class rows."""
-    if not isinstance(model, FingerstyleTranscriber) or not isinstance(source, FingerstyleTranscriber):
-        raise TypeError("Transfer requires FingerstyleTranscriber model instances.")
-    if model.config.architecture_version != 4 or source.config.architecture_version not in (2, 3):
-        raise ValueError("Corrected transfer supports architecture v2/v3 to a fresh v4 model only.")
-    expected, actual = asdict(model.config), asdict(source.config)
-    expected.pop("architecture_version")
-    actual.pop("architecture_version")
-    if expected != actual:
-        raise ValueError("Transfer requires identical non-version model configuration.")
-    reset = ("heads.connection_logits.", "heads.note_technique_logits.", "heads.bend_curve.", "heads.grace")
-    state = model.state_dict()
-    copied = []
-    for name, value in source.state_dict().items():
-        if name.startswith(reset):
-            continue
-        if name not in state or state[name].shape != value.shape:
-            raise ValueError(f"Incompatible transfer parameter: {name}")
-        state[name] = value
-        copied.append(name)
-    model.load_state_dict(state, strict=True)
-    return {
-        "sourceArchitectureVersion": source.config.architecture_version,
-        "targetArchitectureVersion": 4, "supervisionVersion": SUPERVISION_VERSION,
-        "copiedParameters": copied,
-        "resetHeads": ["connection_logits", "note_technique_logits", "bend_curve", *_GRACE_HEADS.values()],
-        "optimizerTransferred": False,
-    }
 
 
 def _validate_outputs(outputs: Mapping[str, Tensor], *, batched: bool) -> tuple[int, ...]:

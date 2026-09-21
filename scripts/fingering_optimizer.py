@@ -16,7 +16,6 @@ MAX_RAPID_POSITION_SHIFT = 5
 RAPID_SHIFT_WINDOW_QUARTER = Fraction(1)
 PHRASE_WINDOW_ONSETS = 12
 PHRASE_COMMIT_ONSETS = 6
-HAND_POSITION_EVIDENCE_WEIGHT = 64
 
 
 def _onset(note):
@@ -83,48 +82,6 @@ def _hand_position(fretted):
     return sorted(fretted)[len(fretted) // 2]
 
 
-def _hand_evidence(document):
-    values = document.get("handPositionEvidence", [])
-    if not isinstance(values, list):
-        raise HarnessError("handPositionEvidence must be a list of per-chord soft hand ranges.")
-    by_onset = {}
-    fields = {"scoreOnsetQuarter", "minimumFret", "maximumFret", "confidence", "source"}
-    for value in values:
-        if not isinstance(value, dict) or set(value) != fields:
-            raise HarnessError("Hand evidence requires scoreOnsetQuarter, minimumFret, maximumFret, confidence, and source.")
-        onset = value["scoreOnsetQuarter"]
-        if not isinstance(onset, list) or len(onset) != 2 or any(type(part) is not int for part in onset) or onset[1] <= 0:
-            raise HarnessError("Hand evidence requires an integer rational score onset with positive denominator.")
-        if any(type(value[field]) is not int for field in ("minimumFret", "maximumFret")) or not 0 <= value["minimumFret"] <= value["maximumFret"] <= MAX_FRET:
-            raise HarnessError("Hand evidence requires an ordered fret0-24 range.")
-        confidence = value["confidence"]
-        if type(confidence) not in (int, float) or not math.isfinite(confidence) or not 0 <= confidence <= 1:
-            raise HarnessError("Hand evidence confidence must be finite and from zero to one.")
-        if not isinstance(value["source"], str) or not value["source"].strip():
-            raise HarnessError("Hand evidence requires a nonempty provenance source.")
-        onset = Fraction(*onset)
-        if onset in by_onset:
-            raise HarnessError("Hand evidence must contain at most one range per score onset.")
-        by_onset[onset] = value
-    return by_onset
-
-
-def _hand_evidence_report(evidence, position, indices, *, missing_chord=False):
-    distance = None if position is None else max(
-        0, evidence["minimumFret"] - position, position - evidence["maximumFret"],
-    )
-    weight = round(HAND_POSITION_EVIDENCE_WEIGHT * evidence["confidence"])
-    status = "satisfied" if distance == 0 else "soft_conflict"
-    if weight == 0:
-        status = "zero_weight"
-    if position is None:
-        status = "no_chord_at_evidence_onset" if missing_chord else "no_non_open_contacts"
-    return {
-        **deepcopy(evidence), "selectedPosition": position, "distanceOutsideRange": distance,
-        "weight": weight, "status": status, "noteIndices": sorted(indices),
-    }
-
-
 def _grace_spec(note, tuning, capo):
     grace = note.get("grace")
     if grace is None:
@@ -156,7 +113,7 @@ def _grace_spec(note, tuning, capo):
     }
 
 
-def _note_candidates(index, note, tuning, capo, harmonic_reports, evidence_reports):
+def _note_candidates(index, note, tuning, capo, harmonic_reports):
     harmonic = note.get("harmonic")
     if harmonic is not None:
         values = [(note["string"], note["fret"])] if 1 <= note["string"] <= 6 and 0 <= note["fret"] <= MAX_FRET else []
@@ -177,24 +134,7 @@ def _note_candidates(index, note, tuning, capo, harmonic_reports, evidence_repor
         })
     else:
         values = _candidates(note["soundingPitchMidi"], tuning, capo)
-    allowed = note.get("allowedFingeringCandidates")
-    if allowed is None:
-        return values, values
-    if not isinstance(allowed, list) or any(
-        not isinstance(value, dict) or set(value) != {"string", "fret"}
-        or type(value["string"]) is not int or type(value["fret"]) is not int
-        or not 1 <= value["string"] <= 6 or not 0 <= value["fret"] <= MAX_FRET
-        for value in allowed
-    ):
-        raise HarnessError("allowedFingeringCandidates must be a list of six-string, fret0-24 {string, fret} positions.")
-    allowed = {(value["string"], value["fret"]) for value in allowed}
-    if harmonic is None and any(value not in values for value in allowed):
-        raise HarnessError("Fingering evidence candidates must preserve the note's sounding pitch.")
-    masked = [value for value in values if value in allowed]
-    if not masked and values:
-        evidence_reports.append({"index": index, "reason": "evidence_has_no_compatible_position", "policy": "relaxed_to_preserve_pitch"})
-        masked = values
-    return values, masked
+    return values
 
 
 def _maximum_retention(group, candidates):
@@ -243,10 +183,6 @@ def _motion_weight(left, right):
 
 def _candidate_cost(note, candidate, values):
     string, fret = candidate
-    logits = note.get("arrangerStringLogits")
-    learned = 0 if logits is None else round(20 * min(
-        15, max(logits[6 - value[0]] for value in values) - logits[6 - string],
-    ))
     provisional = (note["string"], note["fret"])
     prior = 0
     if provisional in values:
@@ -254,7 +190,7 @@ def _candidate_cost(note, candidate, values):
             24 * (string != provisional[0]) + 2 * abs(fret - provisional[1])
         ))
     # There is deliberately no absolute-fret/low-position reward.
-    return learned + prior + (2 if _hand_fret(note, candidate) else 0)
+    return prior + (2 if _hand_fret(note, candidate) else 0)
 
 
 def _solve_window(window, committed, groups_by_index, token_indices, previous_hand):
@@ -326,13 +262,6 @@ def _solve_window(window, committed, groups_by_index, token_indices, previous_ha
             model.add(span == high - low).only_enforce_if(has_fret)
             model.add(span == 0).only_enforce_if(has_fret.Not())
             cost(span, 3, MAX_FRETTED_SPAN)
-            evidence = group["handEvidence"]
-            if evidence is not None:
-                distance = model.new_int_var(0, MAX_FRET, f"hand_evidence_distance_{chord_number}")
-                model.add(distance >= evidence["minimumFret"] - position).only_enforce_if(has_fret)
-                model.add(distance >= position - evidence["maximumFret"]).only_enforce_if(has_fret)
-                model.add(distance == 0).only_enforce_if(has_fret.Not())
-                cost(distance, round(HAND_POSITION_EVIDENCE_WEIGHT * evidence["confidence"]), MAX_FRET)
         prior_group = window[chord_number - 1] if chord_number else previous_hand
         if prior_group is not None:
             prior_position = positions[prior_group["onset"]] if chord_number else prior_group["position"]
@@ -417,25 +346,7 @@ def _provenance(index, note, onset):
 
 
 def optimize_fingerings(document):
-    """Return a copy and report, never replacing pitches to make motion easier.
-
-    Optional per-note ``allowedFingeringCandidates`` is a list of exactly
-    ``{"string": int, "fret": int}`` dictionaries. Positions must preserve the
-    ordinary sounding pitch. Contradictory masks are explicitly relaxed before
-    they can reduce a chord's maximum physically retainable pitch count.
-
-    Optional document-level ``handPositionEvidence`` contains one soft range per
-    chord: ``{"scoreOnsetQuarter": [int, int], "minimumFret": int,
-    "maximumFret": int, "confidence": float, "source": str}``. It penalizes the
-    upper median non-open contact's distance outside fret0-24 bounds, never
-    overriding pitch retention or bound connection pairs. Source identifies
-    provenance (including reference-derived diagnostics), not a learned input.
-
-    Retained calibrated ``grace`` gestures require their source sounding pitch
-    on the chosen main-note string. Source frets are recomputed, including for
-    harmonic anchors. Conflicting gestures are suppressed and reported rather
-    than sacrificing main pitches or silently rebinding their identities.
-    """
+    """Assign pitch-preserving phrase fingerings and report unresolved conflicts."""
     if not isinstance(document, dict) or not isinstance(document.get("metadata"), dict) or not isinstance(document.get("notes"), list):
         raise HarnessError("Fingering optimization requires hypothesis metadata and notes.")
     tuning = document["metadata"].get("openStringMidi")
@@ -443,19 +354,13 @@ def optimize_fingerings(document):
     if not isinstance(tuning, list) or len(tuning) != 6 or any(type(value) is not int for value in tuning) or type(capo) is not int or not 0 <= capo <= MAX_FRET:
         raise HarnessError("Fingering optimization requires six-string tuning and full capo.")
     result = deepcopy(document)
-    hand_evidence = _hand_evidence(result)
     grouped = defaultdict(list)
     token_indices = {}
     for index, note in enumerate(result["notes"]):
         if not isinstance(note, dict) or any(type(note.get(field)) is not int for field in ("soundingPitchMidi", "string", "fret")):
             raise HarnessError("Fingering optimization requires integer pitch, string and fret hypotheses.")
-        if hand_evidence and note.get("scoreOnsetQuarter") is None:
-            raise HarnessError("Score-aligned hand evidence requires rhythm-inferred score onsets on every note.")
         if type(note.get("confidence")) not in (int, float) or not math.isfinite(note["confidence"]) or not 0 <= note["confidence"] <= 1:
             raise HarnessError("Fingering optimization requires finite confidence from zero to one.")
-        logits = note.get("arrangerStringLogits")
-        if logits is not None and (not isinstance(logits, list) or len(logits) != 6 or any(type(value) not in (int, float) or not math.isfinite(value) for value in logits)):
-            raise HarnessError("Arranger string logits must contain six finite numeric values.")
         seconds = note.get("onsetSeconds")
         if seconds is not None and (type(seconds) not in (int, float) or not math.isfinite(seconds)):
             raise HarnessError("Fingering optimization requires finite onset seconds.")
@@ -469,7 +374,7 @@ def optimize_fingerings(document):
             raise HarnessError("Connection origin tokens must be nonempty strings.")
         grouped[_onset(note)].append((index, note))
     removed, changes, difficult, movements = [], [], [], []
-    harmonic_reports, evidence_reports, connection_conflicts, hand_reports, grace_reports = [], [], [], [], []
+    harmonic_reports, connection_conflicts, grace_reports = [], [], []
     groups, groups_by_index = [], {}
     for onset, values in sorted(grouped.items()):
         unique, duplicates = _deduplicate(values)
@@ -477,28 +382,16 @@ def optimize_fingerings(document):
         seconds = [note["onsetSeconds"] for _, note in values if note.get("onsetSeconds") is not None]
         group = {
             "onset": onset, "seconds": min(seconds) if seconds else None,
-            "notes": dict(unique), "candidates": {}, "handEvidence": hand_evidence.get(onset), "graces": {},
+            "notes": dict(unique), "candidates": {}, "graces": {},
         }
-        unrestricted = {}
         for index, note in unique:
-            unrestricted[index], group["candidates"][index] = _note_candidates(
-                index, note, tuning, capo, harmonic_reports, evidence_reports,
+            group["candidates"][index] = _note_candidates(
+                index, note, tuning, capo, harmonic_reports,
             )
             grace = _grace_spec(note, tuning, capo)
             if grace is not None:
                 group["graces"][index] = grace
-        witness = _maximum_retention(group, unrestricted)
-        masked_witness = _maximum_retention(group, group["candidates"])
-        if len(masked_witness) < len(witness):
-            evidence_reports.append({
-                "onsetQuarter": _rational(onset), "reason": "evidence_reduces_chord_pitch_retention",
-                "noteIndices": sorted(index for index in unrestricted if unrestricted[index] != group["candidates"][index]),
-                "unrestrictedRetainedCount": len(witness), "maskedRetainedCount": len(masked_witness),
-                "policy": "relaxed_to_preserve_pitch",
-            })
-            group["candidates"] = unrestricted
-        else:
-            witness = masked_witness
+        witness = _maximum_retention(group, group["candidates"])
         if group["graces"]:
             grace_candidates = {
                 index: [
@@ -580,10 +473,6 @@ def optimize_fingerings(document):
                     note["grace"]["sourcePitchMidi"] = grace["sourcePitch"]
         fretted = [_hand_fret(group["notes"][index], candidate) for index, candidate in assignments.items()]
         fretted = [fret for fret in fretted if fret]
-        if group["handEvidence"] is not None:
-            hand_reports.append(_hand_evidence_report(
-                group["handEvidence"], _hand_position(fretted) if fretted else None, assignments,
-            ))
         if fretted:
             position = _hand_position(fretted)
             if previous_hand is not None:
@@ -614,10 +503,6 @@ def optimize_fingerings(document):
                     "fret": fret, "strings": sorted(strings, reverse=True),
                     "noteIndices": sorted(index for index, value in assignments.items() if value[1] == fret),
                 })
-    hand_reports.extend(
-        _hand_evidence_report(evidence, None, [], missing_chord=True)
-        for onset, evidence in hand_evidence.items() if onset not in grouped
-    )
     for index, original in enumerate(document["notes"]):
         origin_token = original.get("_connectionOriginToken")
         if origin_token is None:
@@ -676,20 +561,15 @@ def optimize_fingerings(document):
         "sourceNoteCount": len(document["notes"]), "retainedNoteCount": len(result["notes"]),
         "changedCount": len(changes), "removedCount": len(removed),
         "difficultChordCount": len(difficult), "difficultMovementCount": len(movements),
-        "harmonicPositionCount": len(harmonic_reports), "evidenceConflictCount": len(evidence_reports),
+        "harmonicPositionCount": len(harmonic_reports),
         "connectionConflictCount": len(connection_conflicts),
         "graceFingeringCount": len(grace_reports),
         "graceChangedCount": sum(value["changed"] for value in grace_reports),
         "graceConflictCount": sum(value["status"] == "suppressed" for value in grace_reports),
-        "handPositionEvidencePolicy": "soft_median_range_never_drop_or_override_connections",
-        "handPositionEvidenceCount": len(hand_reports),
-        "handPositionEvidenceConflictCount": sum(value["status"] == "soft_conflict" for value in hand_reports),
-        "unusedHandPositionEvidenceCount": sum(value["status"] not in ("satisfied", "soft_conflict") for value in hand_reports),
         "statuses": dict(sorted(statuses.items())),
         "changes": changes, "removed": removed, "difficultChords": difficult,
         "difficultMovements": movements, "harmonicPositions": harmonic_reports,
-        "evidenceConflicts": evidence_reports, "connectionConflicts": connection_conflicts,
-        "handPositionEvidence": hand_reports,
+        "connectionConflicts": connection_conflicts,
         "graceFingerings": grace_reports,
         "rawHypothesesModified": False,
     }

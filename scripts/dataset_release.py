@@ -56,8 +56,6 @@ def _validate_authorization(manifest, records):
     reviewer = authorization["reviewer"]
     if not isinstance(reviewer, str) or not reviewer.strip() or any(authorization.get(field) is not True for field in ("authorizedUse", "approveExperimentalRangesAndSplit", "groupingConfirmed")) or authorization.get("distributionAuthorized") is not False:
         raise ValueError("Invalid release reviewer or batch authorization decisions.")
-    if any(value.get("trainingExecution") != "explicit-command" for value in (manifest, authorization)):
-        raise ValueError("Dataset preparation does not authorize automatic training.")
     groups = validation_groups(manifest)
     if authorization["version"] != manifest["version"] or validation_groups(authorization) != groups:
         raise ValueError("Batch authorization references a different release or validation group list.")

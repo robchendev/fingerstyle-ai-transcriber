@@ -11,7 +11,7 @@ import stat
 import time
 import uuid
 from collections.abc import Mapping, Sized
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, fields, is_dataclass
 from pathlib import Path
 
 import numpy as np
@@ -22,6 +22,8 @@ from torch.utils.data import BatchSampler, DataLoader, SequentialSampler
 
 
 SCHEMA_VERSION = 2
+INFERENCE_FORMAT = "fingerstyle-inference"
+INFERENCE_SCHEMA_VERSION = 1
 _PRIOR_NAMES = frozenset({"harmonic_sparsity", "percussion_sparsity"})
 _NOTE_ONSET_STATS = ("note_onset_positive", "note_onset_negative")
 _PERCUSSION_STATS = ("percussion_positive", "percussion_negative")
@@ -595,10 +597,66 @@ def _validate_checkpoint(payload):
     return payload
 
 
-def load_checkpoint(path, *, expected_identity=None):
+def checkpoint_identity(payload):
+    """Return model inputs without inventing training identity for an export."""
+    if payload.get("format") != INFERENCE_FORMAT:
+        return payload["identity"]
+    identity = {"model": payload["model_config"], "features": payload["feature_config"]}
+    if payload["video_config"] is not None:
+        identity["video"] = {"config": payload["video_config"]}
+    return identity
+
+
+def _validate_inference_checkpoint(payload):
+    from .transcriber_audio import FeatureConfig
+    from .transcriber_model import FingerstyleTranscriber, ModelConfig
+    from .transcriber_video import AudioVideoTranscriber, VideoConfig
+
+    _keys(payload, {"format", "schema_version", "model_config", "video_config", "feature_config", "model_state"}, "inference checkpoint")
+    if payload["format"] != INFERENCE_FORMAT or type(payload["schema_version"]) is not int or payload["schema_version"] != INFERENCE_SCHEMA_VERSION:
+        raise ValueError("Unsupported inference checkpoint format or version")
+    configs = {}
+    for key, cls in (("model_config", ModelConfig), ("feature_config", FeatureConfig), ("video_config", VideoConfig)):
+        values = payload[key]
+        if key == "video_config" and values is None:
+            continue
+        _keys(values, {field.name for field in fields(cls)}, key)
+        if any(type(value) not in (int, float) for value in values.values()):
+            raise ValueError(f"{key} requires numeric configuration values")
+        try:
+            configs[key] = cls(**values)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"Invalid {key}: {error}") from error
+    if configs["model_config"].n_mels != configs["feature_config"].n_mels:
+        raise ValueError("Inference feature and model dimensions disagree")
+    # Shape validation must neither allocate another model nor consume RNG state.
+    with torch.device("meta"):
+        model = FingerstyleTranscriber(configs["model_config"])
+        if "video_config" in configs:
+            model = AudioVideoTranscriber(model, configs["video_config"])
+    expected = model.state_dict()
+    state = payload["model_state"]
+    _keys(state, expected, "inference model state")
+    for name, value in state.items():
+        if type(value) is not torch.Tensor or value.requires_grad:
+            raise ValueError(f"Inference parameter {name} must be a detached tensor")
+        _tensor(value, f"model_state.{name}")
+        if value.device.type != "cpu" or value.shape != expected[name].shape or value.dtype != expected[name].dtype:
+            raise ValueError(f"Inference parameter {name} has incompatible shape, dtype or device")
+    return payload
+
+
+
+
+def load_checkpoint(path, *, expected_identity=None, allow_inference=False):
     """Read only the versioned tensor/primitive format; never enable pickle."""
     with _regular_file(path).open("rb") as stream:
         payload = torch.load(stream, weights_only=True, map_location="cpu")
+    if isinstance(payload, dict) and "format" in payload:
+        _validate_inference_checkpoint(payload)
+        if not allow_inference or expected_identity is not None:
+            raise ValueError("Inference-only checkpoints cannot resume training or provide training identity")
+        return payload
     _validate_checkpoint(payload)
     if expected_identity is not None and not _json_equal(payload["identity"], _identity(expected_identity)):
         raise ValueError("Checkpoint identity differs from the requested data/model/config identity")
@@ -1238,7 +1296,7 @@ def _evaluate_events(model, evaluator, *, metric=None, budget=None):
 
 def run_training(model, train_loader, validation_loader, config, run_dir, identity, *, resume=None, progress=None,
                  event_evaluator=None, started_at=None, deadline=None, checkpoint_reserve_seconds=120.):
-    """Perform bounded AdamW updates only when explicitly called by the owner.
+    """Perform AdamW updates only when explicitly requested.
 
     Epochs and max_steps are total ceilings. Exact resume requires unchanged,
     deterministic map-style loaders with private generators and zero workers.

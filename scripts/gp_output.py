@@ -1286,7 +1286,10 @@ def _multivoice(root, enabled):
 
 
 def _build_variant(template_raw, notes, percussion, techniques, measures, tuning, capo, tempo, *, simplified, notated_tempo_changes=None, initial_tempo=None):
+    from .gp_stylesheet import clear_template_attribution
+
     root, payloads, comment = _parse_archive(template_raw)
+    payloads, cleared_attribution = clear_template_attribution(root, payloads)
     before = _template_invariant(root)
     offsets = _prototype_pitch_offsets(root)
     preference = root.findtext("./MasterBars/MasterBar/Key/TransposeAs", "Sharps")
@@ -1313,6 +1316,7 @@ def _build_variant(template_raw, notes, percussion, techniques, measures, tuning
     if any(issue["code"] in {"underfull_measure", "overfull_measure"} for issue in decoded["issues"]):
         raise HarnessError("Generated GP contains an incomplete measure voice.")
     return output, {
+        "clearedTemplateAttribution": cleared_attribution,
         "keyAccidentalCount": key_count,
         "displayedNoteAccidentalCount": accidental_count,
         "measureCount": len(measures),
@@ -1343,7 +1347,7 @@ def _atomic_bytes(path, content):
             temporary.unlink()
 
 
-def write_gp_outputs(template_path, predictions, full_path, single_path, *, profile=DraftProfile(), beat_evidence=None, include_unsupported_tail=False, arranger=None, completer=None, completion_threshold=.8, completion_technique_threshold=.8, playing_evidence=None, progress=None):
+def write_gp_outputs(template_path, predictions, full_path, single_path, *, profile=DraftProfile(), beat_evidence=None, include_unsupported_tail=False, progress=None):
     def emit(message):
         if progress is not None:
             progress(f"GP export: {message}")
@@ -1358,15 +1362,6 @@ def write_gp_outputs(template_path, predictions, full_path, single_path, *, prof
     template_hash = hashlib.sha256(template_raw).hexdigest()
     if Path(full_path).absolute() == Path(single_path).absolute():
         raise HarnessError("Full-voice and single-voice GP outputs require different paths.")
-    playing_report = None
-    if playing_evidence is not None:
-        from .playing_evidence import apply_playing_evidence, validate_playing_evidence
-
-        if beat_evidence is None:
-            raise HarnessError("Playing evidence requires beat evidence for the exact exported score timing.")
-        if "handPositionEvidence" in predictions:
-            raise HarnessError("Playing evidence conflicts with existing hand-position evidence.")
-        validate_playing_evidence(playing_evidence, predictions)
     emit("template and inputs ready; filtering note, percussion and technique candidates...")
     cleaned, cleanup = clean_hypotheses(predictions, profile)
     emit(f"confidence filtering completed ({len(cleaned['notes'])} note candidates).")
@@ -1384,44 +1379,12 @@ def write_gp_outputs(template_path, predictions, full_path, single_path, *, prof
 
         cleaned, stroke_normalization = normalize_downstroke_bursts(cleaned)
         emit("downstroke normalization completed.")
-    if playing_evidence is not None:
-        cleaned, playing_report = apply_playing_evidence(cleaned, playing_evidence, audio_predictions=predictions)
     cleaned = _bind_connection_origins(cleaned)
-    arranger_applied = False
-    if arranger is not None:
-        from .fingering_arranger import apply_arranger
-
-        emit("applying the selected fingering arranger...")
-        cleaned = apply_arranger(arranger, cleaned)
-        emit("fingering arranger completed.")
-        arranger_applied = True
     from .fingering_optimizer import optimize_fingerings
 
     emit("optimizing playable fingering candidates...")
     cleaned, fingering_optimization = optimize_fingerings(cleaned)
     emit("fingering optimization completed.")
-    completion = None
-    fingering_before_completion = None
-    if completer is not None:
-        from .symbolic_completer import complete_document
-
-        fingering_before_completion = fingering_optimization
-        emit("applying the selected symbolic completer...")
-        cleaned, completion = complete_document(
-            completer, cleaned, threshold=max(completion_threshold, profile.note_threshold) if profile.strict_note_confidence else completion_threshold,
-            technique_threshold=completion_technique_threshold,
-        )
-        if completion["addedCount"] or completion["replacedCount"] or completion["removedCount"]:
-            for index, note in enumerate(cleaned["notes"]):
-                if "_connectionToken" not in note:
-                    note["_connectionToken"] = f"completed-note-{index}"
-            if playing_evidence is not None:
-                cleaned.pop("handPositionEvidence", None)
-                cleaned, playing_report = apply_playing_evidence(cleaned, playing_evidence, audio_predictions=predictions)
-            if arranger is not None:
-                cleaned = apply_arranger(arranger, cleaned)
-            cleaned, fingering_optimization = optimize_fingerings(cleaned)
-        emit("symbolic completion and fingering reconciliation completed.")
     suppressed_rasgueado = [event for event in cleaned.get("techniques", []) if event["technique"] == "rasgueado"]
     cleaned["techniques"] = [event for event in cleaned.get("techniques", []) if event["technique"] != "rasgueado"]
     tuning, capo, tempo, audio_end, raw_notes, raw_percussion, raw_techniques, rhythm_counts, structured = _validate_predictions(cleaned)
@@ -1468,9 +1431,6 @@ def write_gp_outputs(template_path, predictions, full_path, single_path, *, prof
         "draftCleanup": cleanup,
         "rhythmInference": rhythm_inference,
         "fingeringOptimization": fingering_optimization,
-        "fingeringBeforeCompletion": fingering_before_completion,
-        "fingeringArrangerApplied": arranger_applied,
-        "symbolicCompletion": completion,
         "strokePolicy": "Never emit native GP Rasgueado. Normalize supported overly dense downstroke groups to a-m-i ending on a beat; preserve other note candidates and never synthesize missing strokes from a compound score alone.",
         "strokeNormalization": stroke_normalization,
         "suppressedPostprocessingRasgueado": suppressed_rasgueado,
@@ -1503,13 +1463,6 @@ def write_gp_outputs(template_path, predictions, full_path, single_path, *, prof
         "linearPerformanceOrder": True,
         "trainingPerformed": False,
     }
-    if playing_report is not None:
-        playing_report.update(
-            appliedPositionRangeCount=fingering_optimization["handPositionEvidenceCount"],
-            positionConflictCount=fingering_optimization["handPositionEvidenceConflictCount"],
-            positionOptimization=fingering_optimization["handPositionEvidence"],
-        )
-        report["playingEvidence"] = playing_report
     try:
         json.dumps(report, allow_nan=False)
     except (TypeError, ValueError) as error:

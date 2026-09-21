@@ -3,14 +3,12 @@
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
-from copy import deepcopy
 from functools import partial
 import os
 import math
 from pathlib import Path
 import subprocess
 import sys
-from uuid import uuid4
 
 from .dataset_io import ROOT, publish_json, read_json, sha256
 from .dataset_release import candidate_digest, validate_release
@@ -22,7 +20,7 @@ from .training_windows import projected_targets
 
 
 MANIFEST_KIND = "paired-preparation-batch"
-REUSE_STAGES = {"alignment", "shots", "hands", "annotations", "geometry", "roles", "coarse", "bundle"}
+REUSE_STAGES = {"alignment", "shots", "hands", "roles", "bundle"}
 
 
 def _path(value, root, label, *, existing=False):
@@ -39,7 +37,7 @@ def load_batch(path, *, root=ROOT):
     path = regular_path(path)
     raw = read_json(path)
     required = {"schemaVersion", "kind", "records"}
-    optional = {"workspace", "releaseManifest", "releaseVersion", "acceptOwnerConventions", "ffmpegDirectory", "videoPython", "handModel", "poseModel", "sourceMapping", "reviewMode", "reviewBudget", "workers", "geometryMode", "coarseContext"}
+    optional = {"workspace", "releaseManifest", "releaseVersion", "acceptConventions", "ffmpegDirectory", "videoPython", "handModel", "poseModel", "reviewMode", "reviewBudget", "workers"}
     if isinstance(raw, dict) and "imageSize" in raw:
         raise ValueError("RGB crop inputs are no longer supported. Remove imageSize and prepare new structure-only bundles.")
     if not isinstance(raw, dict) or not required <= raw.keys() or raw.keys() - required - optional or type(raw["schemaVersion"]) is not int or raw["schemaVersion"] != 1 or raw["kind"] != MANIFEST_KIND:
@@ -56,38 +54,29 @@ def load_batch(path, *, root=ROOT):
     result["workers"] = raw.get("workers", 1)
     if type(result["workers"]) is not int or not 1 <= result["workers"] <= 8:
         raise ValueError("workers must be an integer from 1 to 8.")
-    result["geometryMode"] = raw.get("geometryMode", "existing-only")
-    if result["geometryMode"] not in ("disabled", "existing-only", "automatic"):
-        raise ValueError("geometryMode must be disabled, existing-only or automatic.")
-    result["coarseContext"] = raw.get("coarseContext", False)
-    if type(result["coarseContext"]) is not bool:
-        raise ValueError("coarseContext must be an explicit boolean.")
-    if result["geometryMode"] == "disabled" and (result["coarseContext"] or result["reviewMode"] != "automatic"):
-        raise ValueError("Disabled geometry requires automatic masked preparation with coarseContext=false.")
     result["workspace"] = str(workspace_path(_path(raw.get("workspace", "data"), root, "workspace")))
     if not Path(result["workspace"]).is_relative_to(Path(root).resolve()):
         raise ValueError("Paired batch workspace must be inside the project private root so the existing paired loader can bind its release.")
-    result["acceptOwnerConventions"] = raw.get("acceptOwnerConventions", False)
-    if type(result["acceptOwnerConventions"]) is not bool:
-        raise ValueError("acceptOwnerConventions must be an explicit boolean.")
+    result["acceptConventions"] = raw.get("acceptConventions", False)
+    if type(result["acceptConventions"]) is not bool:
+        raise ValueError("acceptConventions must be an explicit boolean.")
     if "releaseManifest" in raw:
         result["releaseManifest"] = str(_path(raw["releaseManifest"], root, "release manifest", existing=True))
     else:
         safe_id(raw["releaseVersion"])
-    result["videoPython"] = str(_path(raw.get("videoPython", "scripts\\video-evidence\\.venv\\Scripts\\python.exe"), root, "video Python", existing=True))
-    result["handModel"] = str(_path(raw.get("handModel", "runs\\video-evidence\\models\\hand_landmarker.task"), root, "hand model"))
-    pose = raw.get("poseModel", "runs\\video-evidence\\models\\pose_landmarker_lite.task")
+    result["videoPython"] = str(_path(raw.get("videoPython", os.environ.get("VIDEO_PYTHON", "scripts\\video-evidence\\.venv\\Scripts\\python.exe")), root, "video Python", existing=True))
+    result["handModel"] = str(_path(raw.get("handModel"), root, "hand model"))
+    pose = raw.get("poseModel")
     result["poseModel"] = str(_path(pose, root, "pose model")) if pose is not None else None
     result["ffmpegDirectory"] = str(_path(raw["ffmpegDirectory"], root, "FFmpeg directory")) if raw.get("ffmpegDirectory") else None
-    result["sourceMapping"] = str(_path(raw["sourceMapping"], root, "source mapping", existing=True)) if "sourceMapping" in raw else None
     if not isinstance(raw["records"], list) or not raw["records"]:
         raise ValueError("Batch records must be a nonempty list.")
     records, identifiers, groups = [], set(), {}
     for record in raw["records"]:
-        fields = {"id", "groupId", "split", "gp", "audio", "video"}
-        extras = {"title", "clips", "pluckingScreenSide", "reuse", "correspondenceReview", "videoReceipt", "geometryReference"}
+        fields = {"id", "groupId", "split", "gp", "video", "pluckingScreenSide"}
+        extras = {"audio", "title", "clips", "reuse"}
         if not isinstance(record, dict) or not fields <= record.keys() or record.keys() - fields - extras:
-            raise ValueError("Each batch record requires id, groupId, split, gp, audio and video.")
+            raise ValueError("Each batch record requires id, groupId, split, gp, trimmed local video and pluckingScreenSide; audio is optional.")
         identifier = safe_id(record["id"])
         if identifier.casefold() in identifiers:
             raise ValueError("Batch IDs must be unique, including case.")
@@ -99,18 +88,14 @@ def load_batch(path, *, root=ROOT):
             raise ValueError("A related recording group cannot cross training and validation.")
         groups[group] = split
         row = dict(record)
-        for name in ("gp", "audio", "video"):
+        for name in ("gp", "video", *(("audio",) if "audio" in record else ())):
             row[name] = str(_path(record[name], root, f"{identifier} {name}", existing=True))
-        if result["sourceMapping"]:
-            receipt = record.get("videoReceipt", str(Path(row["video"]).with_name("receipt.json")))
-            row["videoReceipt"] = str(_path(receipt, root, f"{identifier} video receipt", existing=True))
-        elif "videoReceipt" in row:
-            raise ValueError("videoReceipt requires a sourceMapping to bind retained audio timing.")
-        if Path(row["gp"]).suffix.lower() != ".gp" or len({row[name] for name in ("gp", "audio", "video")}) != 3:
+        media = [row[name] for name in ("gp", "audio", "video") if name in row]
+        if Path(row["gp"]).suffix.lower() != ".gp" or len(set(media)) != len(media):
             raise ValueError("Supply distinct original GP, trimmed audio and video files.")
-        side = row.get("pluckingScreenSide", "geometry")
-        if side not in ("geometry", "left", "right"):
-            raise ValueError("pluckingScreenSide must be geometry, left or right.")
+        side = row["pluckingScreenSide"]
+        if side not in ("left", "right"):
+            raise ValueError("pluckingScreenSide must explicitly be left or right.")
         row["pluckingScreenSide"] = side
         if "clips" in row:
             previous = None
@@ -124,25 +109,34 @@ def load_batch(path, *, root=ROOT):
         if not isinstance(reuse, dict) or reuse.keys() - REUSE_STAGES:
             raise ValueError("Unknown reusable video stage.")
         row["reuse"] = {name: str(_path(value, root, f"{identifier} reusable {name}", existing=True)) for name, value in reuse.items()}
-        if result["geometryMode"] == "disabled" and set(row["reuse"]) & {"geometry", "roles", "coarse", "bundle"}:
-            raise ValueError("geometryMode=disabled requires rebuilding geometry masks, roles and bundles; reuse only source timing, shots, hands and read-only annotation provenance.")
-        if result["geometryMode"] == "disabled" and result["coarseContext"]:
-            raise ValueError("geometryMode=disabled cannot enable experimental coarseContext.")
-        if row.get("correspondenceReview") is not None:
-            row["correspondenceReview"] = str(_path(row["correspondenceReview"], root, "correspondence review", existing=True))
-        if row.get("geometryReference") is not None:
-            row["geometryReference"] = str(_path(row["geometryReference"], root, "reviewed geometry reference", existing=True))
         records.append(row)
     result["records"] = records
     return result
 
 
-def _output_directory(path, root):
+def _output_directory(path, root, *, create=True):
     directory = _path(str(path), root, "batch output")
     if not directory.is_relative_to(Path(root).resolve() / "runs" / "video-evidence"):
         raise ValueError("Batch output must stay under private runs\\video-evidence.")
-    directory.mkdir(parents=True, exist_ok=True)
+    if create:
+        directory.mkdir(parents=True, exist_ok=True)
     return directory
+
+
+def _media_inputs(batch, directory, *, create):
+    from .local_media import prepare_soundtrack
+
+    records = []
+    for record in batch["records"]:
+        row = dict(record)
+        if "audio" not in row:
+            audio, receipt = prepare_soundtrack(
+                row["video"], directory / "source-cache",
+                ffmpeg_dir=batch["ffmpegDirectory"], create=create,
+            )
+            row.update(audio=str(audio), audioOrigin=str(receipt))
+        records.append(row)
+    return {**batch, "records": records}
 
 
 @contextmanager
@@ -162,12 +156,10 @@ def _lock(directory):
 
 
 def _source_hashes(batch):
-    hashes = {record["id"]: {name: sha256(record[name]) for name in ("gp", "audio", "video")} for record in batch["records"]}
+    hashes = {record["id"]: {name: sha256(record[name]) for name in ("gp", "audio", "video") if name in record} for record in batch["records"]}
     for record in batch["records"]:
-        if record.get("videoReceipt"):
-            hashes[record["id"]]["videoReceipt"] = sha256(record["videoReceipt"])
-        if record.get("geometryReference"):
-            hashes[record["id"]]["geometryReference"] = sha256(record["geometryReference"])
+        if record.get("audioOrigin"):
+            hashes[record["id"]]["audioOrigin"] = sha256(record["audioOrigin"])
     video_groups = {}
     for record in batch["records"]:
         digest = hashes[record["id"]]["video"]
@@ -178,13 +170,16 @@ def _source_hashes(batch):
     return hashes
 
 
-def _bind_state(directory, manifest_path, batch):
-    path = directory / "batch-state.json"
+def _identity(manifest_path, batch):
     identity = {"manifestSha256": sha256(manifest_path), "configurationSha256": candidate_digest(batch), "sources": _source_hashes(batch)}
     if batch.get("releaseManifest"):
         identity["releaseManifestSha256"] = sha256(batch["releaseManifest"])
-    if batch.get("sourceMapping"):
-        identity["sourceMappingSha256"] = sha256(batch["sourceMapping"])
+    return identity
+
+
+def _bind_state(directory, manifest_path, batch):
+    path = directory / "batch-state.json"
+    identity = _identity(manifest_path, batch)
     if path.exists():
         state = read_json(regular_path(path))
         if state.get("identity") != identity or state.get("kind") != "paired-preparation-state":
@@ -229,20 +224,14 @@ def _worker(request_path, result_path, video_python, *, review_flags=None, runne
 def _request(batch, source, canonical, directory):
     result = {
         "schemaVersion": 1, "kind": "paired-video-preparation-request", "id": source["id"],
-        "video": source["video"], "audio": canonical["audio"], "gp": source["gp"],
+        "video": source["video"], "audio": canonical["audio"],
         "outputDirectory": str(directory / "video"),
         "reviewMode": batch["reviewMode"],
-        "geometryMode": batch["geometryMode"], "coarseContext": batch["coarseContext"],
         "pluckingScreenSide": source["pluckingScreenSide"], "reuse": source["reuse"],
         "handModel": batch["handModel"], "poseModel": batch["poseModel"],
-        "correspondenceReview": source.get("correspondenceReview"),
     }
     if "clips" in source:
         result["clips"] = source["clips"]
-    if batch.get("sourceMapping"):
-        result.update(sourceMapping=batch["sourceMapping"], videoReceipt=source["videoReceipt"])
-    if source.get("geometryReference"):
-        result["geometryReference"] = source["geometryReference"]
     return result
 
 
@@ -323,7 +312,7 @@ def paired_coverage(manifest_path, index_path, *, root=ROOT):
         "splits": result, "missingUsableTrainingPositiveClasses": [name for name in names if totals["train"][1][name] == 0],
         "interpretation": "Unique projected positive GP occurrences inside approved audio ranges; usable means an aligned structured plucking observation outside local mismatch masks. Not an accuracy score or musical acceptance gate; no overlap-window double counting.",
         "nativeRasgueadoPolicy": "Only explicit native markers counted; physical a-m-i patterns are not silently relabeled.",
-        "geometryPolicy": "Stable coarse context supports broad hand movement without exact calibration. Its local reference is not a fret number or nut/joint coordinate; body-relative context is independently masked. Coarse, calibrated, and independent-hand coverage are distinct. Known-plucking positive counts never label unassigned hands as plucking.",
+        "geometryPolicy": "Geometry and coarse-context slots are unavailable. Only independent-hand evidence is prepared; unknown roles stay unassigned.",
     }
 
 
@@ -335,8 +324,7 @@ def _summary(directory, state):
         "records": state.get("records", {}), "actions": state.get("actions", []),
         "coverage": state.get("coverage"), "identity": state["identity"],
         "optionalReviewCount": state.get("optionalReviewCount", 0),
-        "revisions": state.get("revisions", []),
-        "readinessPolicy": "Ready means existing-loader compatible inputs, not sufficient class coverage or musical quality. Uncertain automatic geometry stays unavailable; optional review is bounded, not mandatory corpus annotation. No LLM or training is invoked.",
+        "readinessPolicy": "Ready means existing-loader compatible inputs, not sufficient class coverage or musical quality. Optional shot review is bounded. No LLM or training is invoked.",
     }
     lines = [f"Batch status: {state['status']}", report["readinessPolicy"], ""]
     for action in report["actions"]:
@@ -357,7 +345,7 @@ def _summary(directory, state):
             lines.append(f"Guitar-relative versus independent-hand evidence: {values['visualCoverage']}")
         lines.append("Training classes without known-plucking positive evidence: " + ", ".join(report["coverage"]["missingUsableTrainingPositiveClasses"]))
     if report["optionalReviewCount"]:
-        lines.append(f"Optional geometry opportunities: {report['optionalReviewCount']}; only the configured bounded shortlist is shown above. Do not annotate every shot.")
+        lines.append(f"Optional shot reviews: {report['optionalReviewCount']}; only the configured bounded shortlist is shown above.")
     if report["indexPath"]:
         lines.append(f"Paired input index: {report['indexPath']}")
     next_actions = directory / "next-actions.txt"
@@ -371,14 +359,30 @@ def _summary(directory, state):
 
 
 def run_batch(manifest_path, output_directory, *, root=ROOT, runner=subprocess.run, progress=partial(print, flush=True)):
-    from .batch_canonical import ensure_canonical
-
     progress("Loading batch manifest...")
     manifest_path = _path(str(manifest_path), root, "batch manifest", existing=True)
     batch = load_batch(manifest_path, root=root)
     directory = _output_directory(output_directory, root)
     progress(f"Loaded {len(batch['records'])} records | workers {batch['workers']}. Verifying source hashes and saved job identity...")
-    with _lock(directory), _running_state(directory, manifest_path, batch) as state:
+    with _lock(directory):
+        state_path = regular_path(directory / "batch-state.json")
+        if state_path.is_file():
+            identity = read_json(state_path).get("identity", {})
+            sources = _source_hashes(batch)
+            saved = identity.get("sources", {})
+            if identity.get("manifestSha256") != sha256(manifest_path) or any(
+                any(saved.get(identifier, {}).get(key) != digest for key, digest in hashes.items())
+                for identifier, hashes in sources.items()
+            ):
+                raise ValueError("Batch configuration or source files changed. Use a new output directory.")
+        batch = _media_inputs(batch, directory, create=True)
+        return _run_prepared_batch(manifest_path, directory, batch, root=root, runner=runner, progress=progress)
+
+
+def _run_prepared_batch(manifest_path, directory, batch, *, root, runner, progress):
+    from .batch_canonical import ensure_canonical
+
+    with _running_state(directory, manifest_path, batch) as state:
         progress("Source hashes and job identity verified.")
         progress("Canonical GP/audio preparation or frozen-release reuse...")
         canonical = ensure_canonical(batch, root=root)
@@ -413,7 +417,7 @@ def run_batch(manifest_path, output_directory, *, root=ROOT, runner=subprocess.r
                     result = _worker(request_path, result_path, batch["videoPython"], runner=logged_runner)
             if result.get("id") != identifier:
                 raise ValueError("Video worker returned a different recording identity.")
-            expected = {"video": sha256(record["video"]), "audio": sha256(available[identifier]["audio"]), "gp": sha256(record["gp"])}
+            expected = {"video": sha256(record["video"]), "audio": sha256(available[identifier]["audio"])}
             if result.get("inputSha256") != expected:
                 raise ValueError("Video worker input identity differs from canonical sources.")
             return identifier, result
@@ -422,12 +426,6 @@ def run_batch(manifest_path, output_directory, *, root=ROOT, runner=subprocess.r
             state["records"][identifier] = result
             for action in result.get("actions", []):
                 action = {**action, "id": identifier}
-                if action.get("optional") and action["stage"] == "geometry-exception":
-                    action["command"] = [
-                        sys.executable, "-m", "scripts.prepare_training_data", "batch-review",
-                        "--manifest", str(manifest_path), "--output-directory", str(directory),
-                        "--id", identifier, "--annotate-geometry", "--geometry-shot", str(action["shotId"] + 1),
-                    ]
                 actions.append(action)
             if result["status"] == "ready":
                 bundle = result.get("artifacts", {}).get("bundle")
@@ -495,8 +493,6 @@ def run_batch(manifest_path, output_directory, *, root=ROOT, runner=subprocess.r
         progress("Verifying final source identities...")
         if state["identity"]["sources"] != _source_hashes(batch) or state["identity"]["manifestSha256"] != sha256(manifest_path):
             raise ValueError("Batch source files changed while preparing inputs.")
-        if batch.get("sourceMapping") and state["identity"]["sourceMappingSha256"] != sha256(batch["sourceMapping"]):
-            raise ValueError("Retained source mapping changed while preparing inputs.")
         report = _summary(directory, state)
         progress(f"Batch {state['status']}; summary saved: {directory / 'summary.json'}")
         return report
@@ -505,78 +501,35 @@ def run_batch(manifest_path, output_directory, *, root=ROOT, runner=subprocess.r
 def batch_status(manifest_path, output_directory, *, root=ROOT):
     manifest_path = _path(str(manifest_path), root, "batch manifest", existing=True)
     batch = load_batch(manifest_path, root=root)
-    directory = _output_directory(output_directory, root)
-    with _lock(directory):
-        state = _bind_state(directory, manifest_path, batch)
-        if state["status"] == "pending" and not state.get("actions"):
-            state["actions"] = [{
-                "stage": "start", "reason": "Run or resume this batch.",
-                "command": [sys.executable, "-m", "scripts.prepare_training_data", "batch", "--manifest", str(manifest_path), "--output-directory", str(directory)],
-            }]
-        if state["status"] == "ready":
-            manifest, records, bindings = validate_release(Path(state["manifestPath"]))
-            PairedVideoIndex(Path(state["indexPath"]), bindings[Path(state["manifestPath"])], records, root=root)
-        return _summary(directory, state)
+    directory = _output_directory(output_directory, root, create=False)
+    state_path = regular_path(directory / "batch-state.json")
+    if not state_path.is_file():
+        return {"status": "pending", "trainingPerformed": False, "actions": [{
+            "stage": "start", "reason": "Run this batch to prepare local sources.",
+            "command": [sys.executable, "-m", "scripts.prepare_training_data", "batch", "--manifest", str(manifest_path), "--output-directory", str(directory)],
+        }]}
+    batch = _media_inputs(batch, directory, create=False)
+    state = read_json(state_path)
+    if state.get("kind") != "paired-preparation-state" or state.get("identity") != _identity(manifest_path, batch):
+        raise ValueError("Batch configuration or source files changed. Use a new output directory.")
+    if state["status"] == "ready":
+        manifest, records, bindings = validate_release(Path(state["manifestPath"]))
+        PairedVideoIndex(Path(state["indexPath"]), bindings[Path(state["manifestPath"])], records, root=root)
+    return {**state, "trainingPerformed": False, "nextActionsPath": str(directory / "next-actions.txt")}
 
 
-def _review_automatic_geometry(manifest_path, batch, directory, state, identifier, annotations, shot, runner):
-    revision = directory / "reviews" / f"{identifier}-{uuid4().hex[:10]}"
-    revision.mkdir(parents=True)
-    revised_annotations = revision / "annotations.json"
-    command = [
-        batch["videoPython"], str(ROOT / "scripts" / "video-evidence" / "cli.py"),
-        "annotate-geometry", "--annotations", str(annotations), "--output", str(revised_annotations),
-        "--exceptions-only",
-    ]
-    if shot is not None:
-        command.extend(["--shot-id", str(shot - 1)])
-    completed = runner(command, check=False)
-    if completed.returncode or not revised_annotations.is_file():
-        raise ValueError("Optional geometry review did not publish a revision; original preparation remains unchanged.")
-    original, reviewed = read_json(annotations), read_json(revised_annotations)
-    if any(reviewed.get(name) != original.get(name) for name in ("videoSha256", "shotsSha256", "pointOrder", "coordinateSpace")):
-        raise ValueError("Reviewed geometry lost its original source binding.")
-    document = deepcopy(read_json(manifest_path))
-    for row in document["records"]:
-        artifacts = state["records"].get(row["id"], {}).get("artifacts", {})
-        reuse = {**row.get("reuse", {}), **{name: value for name, value in artifacts.items() if name in REUSE_STAGES}}
-        if row["id"] == identifier:
-            reuse["annotations"] = str(revised_annotations)
-            for name in ("geometry", "roles", "coarse", "bundle"):
-                reuse.pop(name, None)
-        row["reuse"] = reuse
-    revised_manifest = revision / "batch.json"
-    publish_json(revised_manifest, document)
-    output = directory.with_name(f"{directory.name}-review-{revision.name}")
-    resume = [
-        sys.executable, "-m", "scripts.prepare_training_data", "batch", "--manifest", str(revised_manifest),
-        "--output-directory", str(output),
-    ]
-    result = {"id": identifier, "annotations": str(revised_annotations), "manifestPath": str(revised_manifest),
-              "outputDirectory": str(output), "command": resume, "originalPreparation": "unchanged"}
-    state.setdefault("revisions", []).append(result)
-    from .prepare_training_data import write_bytes
-
-    instructions = "& " + " ".join("'" + str(value).replace("'", "''") + "'" for value in resume)
-    write_bytes(revision / "next-actions.txt", (instructions + "\n").encode("utf-8"))
-    result["nextActionsPath"] = str(revision / "next-actions.txt")
-    _summary(directory, state)
-    return result
-
-
-def review_batch(manifest_path, output_directory, identifier, *, reviewer=None, accept_score=False, ranges=(), anchors=(), exclude_ranges=(), acknowledge_uncertainty=False, percussion_complete=False, video_flags=None, annotate_geometry=False, geometry_shot=None, root=ROOT, runner=subprocess.run):
+def review_batch(manifest_path, output_directory, identifier, *, reviewer=None, accept_score=False, ranges=(), anchors=(), exclude_ranges=(), acknowledge_uncertainty=False, percussion_complete=False, video_flags=None, root=ROOT, runner=subprocess.run):
     from .batch_canonical import review_canonical
 
     manifest_path = _path(str(manifest_path), root, "batch manifest", existing=True)
     batch = load_batch(manifest_path, root=root)
     if identifier not in {row["id"] for row in batch["records"]}:
         raise ValueError("Review ID is not in this batch.")
-    if sum((bool(accept_score), bool(video_flags), bool(annotate_geometry))) != 1:
-        raise ValueError("Choose exactly one score review, video review or geometry annotation action.")
-    if geometry_shot is not None and (not annotate_geometry or type(geometry_shot) is not int or geometry_shot < 1):
-        raise ValueError("geometry-shot requires annotation review and a positive one-based shot number.")
+    if sum((bool(accept_score), bool(video_flags))) != 1:
+        raise ValueError("Choose exactly one score or video review action.")
     directory = _output_directory(output_directory, root)
     with _lock(directory):
+        batch = _media_inputs(batch, directory, create=False)
         state = _bind_state(directory, manifest_path, batch)
         if accept_score:
             result = review_canonical(batch, identifier, reviewer=reviewer, ranges=list(ranges), anchors=list(anchors), exclude_ranges=list(exclude_ranges), acknowledge_uncertainty=acknowledge_uncertainty, percussion_complete=percussion_complete, accept=True, root=root)
@@ -584,29 +537,7 @@ def review_batch(manifest_path, output_directory, identifier, *, reviewer=None, 
             request_path, result_path = directory / identifier / "request.json", directory / identifier / "result.json"
             if not request_path.is_file():
                 raise ValueError("Run the batch first to prepare source-bound review assets.")
-            if annotate_geometry:
-                if not result_path.is_file():
-                    raise ValueError("No geometry review request has been prepared.")
-                previous = read_json(result_path)
-                annotations = previous.get("artifacts", {}).get("annotations")
-                if not annotations:
-                    raise ValueError("Complete earlier video review actions before annotating guitar geometry.")
-                annotation_path = regular_path(annotations)
-                annotation_document = read_json(annotation_path)
-                if annotation_document.get("preparationMethod") == "automatic-geometry-v1":
-                    return _review_automatic_geometry(
-                        manifest_path, batch, directory, state, identifier, annotation_path, geometry_shot, runner)
-                if not annotation_path.is_relative_to(directory / identifier / "video"):
-                    raise ValueError("Batch review never edits reused external annotations. Use a new batch without that reuse entry.")
-                command = [batch["videoPython"], str(ROOT / "scripts" / "video-evidence" / "cli.py"), "annotate-geometry", "--annotations", str(annotation_path)]
-                if geometry_shot is not None:
-                    command.extend(["--shot-id", str(geometry_shot - 1)])
-                completed = runner(command, check=False)
-                if completed.returncode:
-                    raise ValueError("Geometry annotation did not complete; saved work is retained.")
-                result = {"id": identifier, "reviewComplete": read_json(annotation_path).get("reviewComplete"), "annotations": str(annotation_path)}
-            else:
-                result = _worker(request_path, result_path, batch["videoPython"], review_flags=video_flags, runner=runner)
+            result = _worker(request_path, result_path, batch["videoPython"], review_flags=video_flags, runner=runner)
         state["status"] = "review-updated-rerun-batch"
         _summary(directory, state)
         return result
@@ -619,6 +550,7 @@ def finalize_batch(manifest_path, output_directory, reviewer, *, root=ROOT):
     batch = load_batch(manifest_path, root=root)
     directory = _output_directory(output_directory, root)
     with _lock(directory):
+        batch = _media_inputs(batch, directory, create=False)
         state = _bind_state(directory, manifest_path, batch)
         result = finalize_canonical(batch, reviewer=reviewer, root=root)
         state["status"] = "release-published-rerun-batch"
@@ -627,7 +559,7 @@ def finalize_batch(manifest_path, output_directory, reviewer, *, root=ROOT):
 
 
 def train_batch(manifest_path, output_directory, *, epochs=3, max_steps=None, max_hours=None, cpu_threads=None, video_dropout=.2, device="auto", root=ROOT, runner=subprocess.run, train_command=None):
-    """Prepare paired inputs, then execute one owner-invoked joint training run."""
+    """Prepare paired inputs, then execute one explicitly invoked joint training run."""
     from . import transcriber
     from .transcriber_runtime import load_checkpoint
     from .transcriber_video import VideoConfig

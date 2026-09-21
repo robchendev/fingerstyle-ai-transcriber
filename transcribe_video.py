@@ -1,4 +1,4 @@
-"""Transcribe a local video using musical settings supplied on the command line."""
+"""Transcribe local audio or video with explicit command-line musical settings."""
 
 import argparse
 from fractions import Fraction
@@ -61,8 +61,10 @@ def cutoff(value):
 
 
 def argument_parser():
-    parser = argparse.ArgumentParser(description="Local video to Guitar Pro with explicit fixed tuning, full capo, tempo and meter. No metadata sidecar, trimming, training or automatic GP opening.")
-    parser.add_argument("--video", required=True, help="Path to the already-trimmed local performance video.")
+    parser = argparse.ArgumentParser(description="Local audio or video to Guitar Pro with explicit fixed tuning, full capo, tempo and meter. No metadata sidecar, trimming, training or automatic GP opening.")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--video", help="Path to the already-trimmed local performance video.")
+    source.add_argument("--audio", help="Local MP3, FLAC or WAV; use the model's audio-only path.")
     parser.add_argument("--note-cutoff", type=cutoff, required=True)
     parser.add_argument("--x-cutoff", type=cutoff, required=True, help="Thumb-slap X cutoff, separate from other percussion.")
     parser.add_argument("--output-directory", required=True, help="Dedicated job folder under this repository's runs directory.")
@@ -72,7 +74,12 @@ def argument_parser():
     parser.add_argument("--beat-unit", type=ratio, required=True, help="BPM unit as a fraction of a whole note: 1/4 for quarter notes, 3/8 for dotted quarters.")
     parser.add_argument("--time-signature", type=ratio, required=True, help="Meter, e.g. 4/4 or 6/8.")
     parser.add_argument("--plucking-screen-side", choices=("geometry", "left", "right"), help="Override the hand-side setting in the local preset for this video.")
-    parser.add_argument("--settings", default=str(ROOT / "runs" / "transcription-settings.json"), help="Existing local model/template/export preset.")
+    parser.add_argument("--settings", help="Optional local version-1 model/template/export preset; explicit options take precedence.")
+    parser.add_argument("--checkpoint", help="Model checkpoint; defaults to models/transcriber.pt when not provided by settings.")
+    parser.add_argument("--template", help="User-supplied modern GP or GPT template; required unless settings supplies it.")
+    parser.add_argument("--beat-checkpoint", help="User-provisioned local Beat This! checkpoint; required unless settings supplies it. Never downloaded automatically.")
+    parser.add_argument("--device", help="Transcriber device (default: cpu).")
+    parser.add_argument("--beat-device", help="Beat tracker device (default: cpu).")
     parser.add_argument("--dry-run", action="store_true", help="Preview validated arguments without writing files or running conversion.")
     return parser
 
@@ -87,19 +94,21 @@ def prepare(args):
     transcriber.inference_metadata(metadata)
     if Fraction(*args.beat_unit) not in TEMPO_BEAT_UNITS.values():
         raise HarnessError("GP export supports beat units " + ", ".join(map(str, TEMPO_BEAT_UNITS.values())) + ".")
-    video = regular_path(args.video)
     output = regular_path(args.output_directory)
-    settings_path = regular_path(args.settings)
-    settings = read_json(settings_path)
-    required = {"schemaVersion", "checkpoint", "template", "beatCheckpoint", "device", "beatDevice", "pluckingScreenSide", "exportProfile"}
-    if not isinstance(settings, dict) or not required <= settings.keys() or settings.keys() - required or type(settings["schemaVersion"]) is not int or settings["schemaVersion"] != 1:
-        raise HarnessError("Expected version-1 model settings with checkpoint, template, beatCheckpoint, device, beatDevice, pluckingScreenSide and exportProfile.")
-    paths = {"video": video}
+    settings = read_json(regular_path(args.settings)) if args.settings is not None else {"schemaVersion": 1}
+    allowed = {"schemaVersion", "checkpoint", "template", "beatCheckpoint", "device", "beatDevice", "pluckingScreenSide", "exportProfile"}
+    if not isinstance(settings, dict) or settings.keys() - allowed or type(settings.get("schemaVersion")) is not int or settings["schemaVersion"] != 1:
+        raise HarnessError("Expected version-1 settings with optional checkpoint, template, beatCheckpoint, device, beatDevice, pluckingScreenSide and exportProfile.")
+    paths = {name: regular_path(getattr(args, name)) for name in ("video", "audio") if getattr(args, name) is not None}
     for key, option in (("checkpoint", "checkpoint"), ("template", "template"), ("beatCheckpoint", "beat-checkpoint")):
-        if not isinstance(settings[key], str) or not settings[key]:
-            raise HarnessError(f"Model setting {key} must be a file path.")
-        path = Path(settings[key])
-        paths[option] = regular_path(path if path.is_absolute() else ROOT / path)
+        explicit = getattr(args, option.replace("-", "_"))
+        value = explicit if explicit is not None else settings.get(key)
+        if value is None and key == "checkpoint":
+            value = str(ROOT / "models" / "transcriber.pt")
+        if not isinstance(value, str) or not value:
+            raise HarnessError(f"Provide --{option} or a {key} file path in --settings.")
+        path = Path(value)
+        paths[option] = regular_path(path if explicit is not None or path.is_absolute() else ROOT / path)
     for path in paths.values():
         if not path.is_file():
             raise HarnessError(f"Required local input is missing: {path}")
@@ -114,11 +123,12 @@ def prepare(args):
     for option, path in paths.items():
         values.extend(("--" + option, str(path)))
     for key, option in (("device", "device"), ("beatDevice", "beat-device"), ("pluckingScreenSide", "plucking-screen-side")):
-        if not isinstance(settings[key], str) or not settings[key]:
+        explicit = getattr(args, option.replace("-", "_"))
+        value = explicit if explicit is not None else settings.get(key, "geometry" if key == "pluckingScreenSide" else "cpu")
+        if not isinstance(value, str) or not value:
             raise HarnessError(f"Model setting {key} must be a nonempty string.")
-        value = (args.plucking_screen_side or settings[key]) if key == "pluckingScreenSide" else settings[key]
         values.extend(("--" + option, value))
-    profile = settings["exportProfile"]
+    profile = settings.get("exportProfile", {})
     if not isinstance(profile, dict) or profile.keys() - PROFILE_FLAGS - PROFILE_VALUES:
         raise HarnessError("Unsupported preset option in exportProfile; note/X cutoffs and input/output paths must come from the command.")
     for name, value in profile.items():

@@ -34,6 +34,7 @@ from .score_alignment import AlignmentInputError, ScoreClock, candidate_mapping,
 CONVENTIONS = {
     "schemaVersion": 1, "uppercaseOIsWristThump": True, "simultaneousTextPriority": "lowest-voice-index",
     "plainXIsThumbSlap": True, "ghostXIsPercussiveHit": True,
+    "id": "fingerstyle-v1", "shortTextIsPercussiveHit": False,
 }
 CONFIRMATIONS = {
     "authorize_use": "authorizedUse", "confirm_pitch": "recordingAndTargetPitchConfirmed",
@@ -144,7 +145,7 @@ def selection(workspace, identifiers=None):
 
 def rules_template():
     return {
-        "schemaVersion": 1, "acceptOwnerConventions": False, "rules": [],
+        "schemaVersion": 1, "acceptConventions": False, "rules": [],
         "confirmFixedTuningCapoText": False, "confirmFullCapoMetadata": False, "fineTarget": None,
     }
 
@@ -266,7 +267,7 @@ def convert_audio(source, destination, ffmpeg_dir=None):
     if suffix in {".flac", ".wav", ".aif", ".aiff"}:
         with sf.SoundFile(source) as stream:
             if stream.subtype not in {"PCM_U8", "PCM_S8", "PCM_16", "PCM_24"}:
-                raise ValueError("FLAC preparation supports integer PCM up to 24 bits; float/32-bit PCM requires an explicit owner-created source conversion, not silent quantization.")
+                raise ValueError("FLAC preparation supports integer PCM up to 24 bits; float/32-bit PCM requires an explicit source conversion, not silent quantization.")
             if not 1 <= stream.channels <= 8 or not 0 < len(stream) / stream.samplerate <= 900:
                 raise ValueError("Local preparation supports nonempty audio up to fifteen minutes and eight channels.")
             expected = (stream.samplerate, stream.channels, len(stream))
@@ -362,7 +363,7 @@ def prepare_pair(workspace, pair, *, accept_conventions=False, ffmpeg_dir=None):
     directory.mkdir(parents=True, exist_ok=True)
     rules_path = regular_path(directory / "rules.json")
     rules = read_json(rules_path) if rules_path.exists() else rules_template()
-    if not isinstance(rules, dict) or set(rules) - set(rules_template()) or not (set(rules_template()) - {"fineTarget", "confirmFullCapoMetadata"}) <= set(rules) or rules["schemaVersion"] != 1 or type(rules["acceptOwnerConventions"]) is not bool or type(rules["confirmFixedTuningCapoText"]) is not bool or type(rules.get("confirmFullCapoMetadata", False)) is not bool or not isinstance(rules["rules"], list) or rules.get("fineTarget") not in (None, "last-musical-measure"):
+    if not isinstance(rules, dict) or set(rules) - set(rules_template()) or not (set(rules_template()) - {"fineTarget", "confirmFullCapoMetadata"}) <= set(rules) or rules["schemaVersion"] != 1 or type(rules["acceptConventions"]) is not bool or type(rules["confirmFixedTuningCapoText"]) is not bool or type(rules.get("confirmFullCapoMetadata", False)) is not bool or not isinstance(rules["rules"], list) or rules.get("fineTarget") not in (None, "last-musical-measure"):
         raise ValueError("rules.json requires schemaVersion:1, accepted conventions, boolean reviewed capo confirmations, rules:list and optional fineTarget:null|'last-musical-measure'.")
     state_path = regular_path(directory / "preparation.json")
     prior = read_json(state_path) if state_path.exists() else None
@@ -370,10 +371,10 @@ def prepare_pair(workspace, pair, *, accept_conventions=False, ffmpeg_dir=None):
         load_current(workspace, pair)
         return {"id": pair["id"], "status": "reused"}
     if accept_conventions:
-        rules["acceptOwnerConventions"] = True
+        rules["acceptConventions"] = True
     write_json(rules_path, rules)
-    if not rules["acceptOwnerConventions"]:
-        raise ValueError("Review the documented owner-v1 notation conventions; explicitly pass --accept-owner-conventions only if they apply. Otherwise this normalizer is not appropriate for the source.")
+    if not rules["acceptConventions"]:
+        raise ValueError("Review the documented fingerstyle-v1 notation conventions; explicitly pass --accept-conventions only if O=wrist thump, X=thumb slap and ghost X=percussive hit apply. Otherwise this normalizer is not appropriate for the source.")
     binding = input_binding(workspace, pair, rules)
     source_gp, source_audio = source_paths(workspace, pair)
     staging = regular_path(directory / f".preparing-{uuid4().hex}")
@@ -639,7 +640,7 @@ def release_dataset(workspace, version, validation_groups, identifiers=None, *, 
         approval = deepcopy(review["approval"])
         split = "validation" if pair["groupId"] in validation_groups else "train"
         if any(approval.get(field) is not True for field in CONFIRMATIONS.values()) or approval.get("split") not in (None, split) or approval.get("groupId") != pair["groupId"]:
-            raise ValueError(f"{pair['id']}: missing manual source/notation/use/group/range approval, or reviewed split differs from --validation-group.")
+            raise ValueError(f"{pair['id']}: missing source/notation/use/group/range approval, or reviewed split differs from --validation-group.")
         labels, normalization, clock, _ = score_positions(directory)
         candidate = review["candidate"]
         validate_mapping(candidate["denseMapping"], clock, state["audio"]["sampleCount"] / state["audio"]["sampleRate"])
@@ -648,7 +649,7 @@ def release_dataset(workspace, version, validation_groups, identifiers=None, *, 
             raise ValueError(f"{pair['id']}: explicitly --acknowledge-uncertainty after reviewing the retained masks/issues, or quarantine the pair.")
         ranges = effective_ranges(review["requestedClipRanges"], review["excludedClipRanges"], candidate["denseMapping"])
         if ranges != approval.get("approvedClipRanges") or approval.get("candidateSha256") != candidate_digest(candidate) or approval.get("sourceGpSha256") != state["inputs"]["sourceGpSha256"] or approval.get("audioSha256") != state["audio"]["sha256"]:
-            raise ValueError("Manual approval no longer matches this source, candidate or approved ranges.")
+            raise ValueError("Approval no longer matches this source, candidate or approved ranges.")
         rate = state["audio"]["sampleRate"]
         spans = range_sample_bounds(ranges, rate)
         notes, gestures = projected_targets(labels, candidate, clock)
@@ -664,7 +665,7 @@ def release_dataset(workspace, version, validation_groups, identifiers=None, *, 
             "schemaVersion": 1, "kind": "local-training-targets", "id": pair["id"],
             "canonical": labels, "normalization": normalization, "candidate": candidate, "windows": windows,
             "approval": approval, "sourceAudioSha256": state["inputs"]["sourceAudioSha256"],
-            "preparationSha256": candidate_digest(state), "trainingExecution": "explicit-command",
+            "preparationSha256": candidate_digest(state),
             "preparationRuntime": state["inputs"]["runtime"], "preparationImplementation": state["inputs"]["implementation"],
         }
         entry = {
@@ -683,7 +684,7 @@ def release_dataset(workspace, version, validation_groups, identifiers=None, *, 
         "schemaVersion": 1, "kind": "local-release-authorization", "reviewer": reviewer,
         "version": version, "validationGroups": validation_groups, "authorizedUse": True,
         "approveExperimentalRangesAndSplit": True, "groupingConfirmed": True,
-        "distributionAuthorized": False, "trainingExecution": "explicit-command",
+        "distributionAuthorized": False,
         "selectedScope": release_scope([(entry, payloads[entry["id"]]) for entry in entries]),
     }
     authorization["sha256"] = candidate_digest(authorization)
@@ -693,7 +694,7 @@ def release_dataset(workspace, version, validation_groups, identifiers=None, *, 
         "schemaVersion": 1, "kind": "local-training-dataset", "trainingReady": True,
         "visibility": "private", "distributionAuthorized": False,
         "entries": entries, "counts": {"windowsBySplit": counts}, "version": version,
-        "trainingExecution": "explicit-command", "validationGroups": validation_groups,
+        "validationGroups": validation_groups,
         "releaseAuthorization": authorization,
     }
     releases = regular_path(workspace / "releases")
@@ -717,7 +718,7 @@ def release_dataset(workspace, version, validation_groups, identifiers=None, *, 
         for pair in selected:
             load_current(workspace, pair)
         if any(sha256(regular_path(path)) != digest for path, digest in review_hashes.items()):
-            raise ValueError("Manual review changed during release.")
+            raise ValueError("Review changed during release.")
         if destination.exists():
             previous, _, _ = validate_release(destination / "manifest.json")
             if previous != manifest:
@@ -728,7 +729,7 @@ def release_dataset(workspace, version, validation_groups, identifiers=None, *, 
     finally:
         if staging.exists():
             shutil.rmtree(staging)
-    return {"manifestPath": str(destination / "manifest.json"), "trainingReady": True, "counts": manifest["counts"], "releaseAuthorization": authorization, "trainingExecution": "explicit-command"}
+    return {"manifestPath": str(destination / "manifest.json"), "trainingReady": True, "counts": manifest["counts"], "releaseAuthorization": authorization}
 
 
 def status(workspace):
@@ -742,7 +743,7 @@ def status(workspace):
             rows.append({**identity, "status": "reviewed" if approved else "needs-review"})
         except (OSError, ValueError) as error:
             rows.append({**identity, "status": "blocked", "reason": str(error)})
-    return {"workspace": str(workspace), "pairs": rows, "trainingExecution": "explicit-command"}
+    return {"workspace": str(workspace), "pairs": rows}
 
 
 def parser():
@@ -759,7 +760,7 @@ def parser():
     add.add_argument("--audio", required=True, type=Path)
     prepare = commands.add_parser("prepare", help="Inspect, normalize, convert once and propose deterministic DSP timing.")
     prepare.add_argument("--ids", nargs="+")
-    prepare.add_argument("--accept-owner-conventions", action="store_true", help="Explicitly accept documented owner-v1 text/percussion/repeat conventions for these sources.")
+    prepare.add_argument("--accept-conventions", action="store_true", help="Explicitly accept O=wrist thump, X=thumb slap, ghost X=percussive hit and documented repeat/text conventions for these sources.")
     prepare.add_argument("--ffmpeg-dir")
     invalidation = commands.add_parser("invalidate", help="Deliberately retire mutable approval; frozen releases stay unchanged.")
     invalidation.add_argument("--id", required=True)
@@ -784,9 +785,8 @@ def parser():
     review.add_argument("--listen", action="store_true", help="Open requested cue WAVs in the Windows default player.")
     proposal = commands.add_parser("propose", help="Write a private dataset proposal without approving sources, releasing data or running training.")
     proposal.add_argument("--name", required=True)
-    proposal.add_argument("--validation-group-count", type=int, default=10, help="Target number of independent validation relationship groups, not recordings (default: 10).")
-    proposal.add_argument("--validation-ids", nargs="+", help="Explicit validation recording IDs; their complete relationship groups stay together.")
-    release = commands.add_parser("release", help="Freeze a private self-contained release; NEVER runs training.")
+    proposal.add_argument("--validation-ids", nargs="+", required=True, help="Validation recording IDs; their complete relationship groups stay together.")
+    release = commands.add_parser("release", help="Freeze a private self-contained release without training.")
     release.add_argument("--version", required=True)
     release.add_argument("--validation-group", dest="validation_groups", action="append", required=True, help="Existing relationship group to hold out; repeat for multiple independent groups.")
     release.add_argument("--ids", nargs="+", help="Explicit subset; omit uncertain pairs rather than fabricating approval.")
@@ -794,7 +794,7 @@ def parser():
     release.add_argument("--authorize-release", action="store_true", help="Explicitly authorize the chosen validation groups and ALL selected pairs/ranges (all pairs unless --ids is supplied).")
     commands.add_parser("status", help="Report stale, blocked and reviewed pairs without running training.")
     for name in ("batch", "batch-status", "batch-review", "batch-release", "batch-train"):
-        batch = commands.add_parser(name, help="Explicit explicit preparation and training pipeline." if name == "batch-train" else "Repeatable GP/audio/video preparation; never starts training.")
+        batch = commands.add_parser(name, help="Explicit preparation and joint training pipeline." if name == "batch-train" else "Repeatable GP/trimmed-video preparation; never starts training.")
         batch.add_argument("--manifest", required=True, type=Path)
         batch.add_argument("--output-directory", required=True, type=Path)
         if name == "batch-release":
@@ -813,8 +813,6 @@ def parser():
             action.add_argument("--accept-score", action="store_true", help="Explicitly accept reviewed score/audio pairing, notation, grouping and supplied ranges.")
             action.add_argument("--accept-shots", action="store_true", help="Accept the inspected video shot boundaries.")
             action.add_argument("--alignment-offset", type=float, help="Explicit reviewed video start time for trimmed audio zero.")
-            action.add_argument("--annotate-geometry", action="store_true", help="Open local guitar landmark annotation; no LLM or JSON editing.")
-            batch.add_argument("--geometry-shot", type=int, help="Review one one-based shot number rather than the entire video.")
             batch.add_argument("--range", dest="ranges", action="append", default=[], metavar="START:END")
             batch.add_argument("--anchor", action="append", default=[])
             batch.add_argument("--exclude-range", action="append", default=[])
@@ -855,7 +853,7 @@ def main(argv=None):
                     accept_score=args.accept_score, ranges=args.ranges, anchors=args.anchor,
                     exclude_ranges=args.exclude_range, acknowledge_uncertainty=args.acknowledge_uncertainty,
                     percussion_complete=args.confirm_percussion_completeness,
-                    video_flags=flags, annotate_geometry=args.annotate_geometry, geometry_shot=args.geometry_shot,
+                    video_flags=flags,
                 )
             print(json.dumps(output, ensure_ascii=False, allow_nan=False, indent=2))
             return 0
@@ -865,7 +863,7 @@ def main(argv=None):
         elif args.command == "add":
             output = add_pair(workspace, args.id, args.group, args.gp, args.audio, args.performer, title=args.title)
         elif args.command == "prepare":
-            output = [prepare_pair(workspace, pair, accept_conventions=args.accept_owner_conventions, ffmpeg_dir=args.ffmpeg_dir) for pair in selection(workspace, args.ids)]
+            output = [prepare_pair(workspace, pair, accept_conventions=args.accept_conventions, ffmpeg_dir=args.ffmpeg_dir) for pair in selection(workspace, args.ids)]
         elif args.command == "invalidate":
             invalidate(workspace, selection(workspace, [args.id])[0], args.reason)
             output = {"id": args.id, "status": "invalidated", "frozenReleases": "unchanged"}
@@ -875,8 +873,7 @@ def main(argv=None):
             from .dataset_proposal import propose_dataset
 
             output = propose_dataset(
-                workspace, args.name, validation_group_count=args.validation_group_count,
-                validation_ids=args.validation_ids, progress=lambda message: print(message, flush=True),
+                workspace, args.name, validation_ids=args.validation_ids, progress=lambda message: print(message, flush=True),
             )
         elif args.command == "release":
             output = release_dataset(workspace, args.version, args.validation_groups, args.ids, reviewer=args.reviewer, authorize_release=args.authorize_release)

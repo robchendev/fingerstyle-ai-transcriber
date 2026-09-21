@@ -19,8 +19,8 @@ def _inputs(batch, root):
         raise ValueError("Supply one existing releaseManifest or one new releaseVersion.")
     if "releaseVersion" in batch:
         preparation.safe_id(batch["releaseVersion"])
-    if type(batch.get("acceptOwnerConventions", False)) is not bool:
-        raise ValueError("acceptOwnerConventions must be an explicit boolean.")
+    if type(batch.get("acceptConventions", False)) is not bool:
+        raise ValueError("acceptConventions must be an explicit boolean.")
     if not batch.get("records"):
         raise ValueError("A canonical batch needs explicitly selected records.")
     identifiers, groups, sources = set(), {}, {}
@@ -142,9 +142,9 @@ def _preparation_action(workspace, record, error, ffmpeg_dir):
     reason = str(error)
     action, path = "prepare-canonical", workspace / "pairs" / record["id"] / "rules.json"
     arguments = ["--ids", record["id"]]
-    if "--accept-owner-conventions" in reason:
-        action = "review-owner-conventions"
-        arguments.append("--accept-owner-conventions")
+    if "--accept-conventions" in reason:
+        action = "review-conventions"
+        arguments.append("--accept-conventions")
         reason += " Run the suggested command only after confirming that the documented conventions fit this source."
     elif "capo_or_tuning_text_requires_review" in reason:
         action = "review-capo-tuning-text"
@@ -187,7 +187,7 @@ def _review_reasons(report, directory, state, record):
 
 
 def ensure_canonical(batch, *, root=ROOT):
-    """Prepare proposals only; existing manual decisions and frozen releases are reused."""
+    """Prepare canonical inputs, retaining existing reviews and frozen releases."""
     workspace = _inputs(batch, root)
     manifest_path = _manifest_path(batch, workspace)
     if "releaseManifest" in batch or manifest_path.is_file():
@@ -224,7 +224,7 @@ def ensure_canonical(batch, *, root=ROOT):
                 continue
             try:
                 preparation.prepare_pair(
-                    workspace, pair, accept_conventions=batch.get("acceptOwnerConventions", False),
+                    workspace, pair, accept_conventions=batch.get("acceptConventions", False),
                     ffmpeg_dir=batch.get("ffmpegDirectory"),
                 )
             except (OSError, ValueError, AcquisitionError, GpInspectionError, AlignmentInputError) as error:
@@ -285,7 +285,7 @@ def ensure_canonical(batch, *, root=ROOT):
 
 def review_canonical(batch, identifier, *, reviewer=None, ranges=(), anchors=(), exclude_ranges=(),
                      acknowledge_uncertainty=False, percussion_complete=False, accept=False, root=ROOT):
-    """Inspect by default; only an explicit manual acceptance records review decisions."""
+    """Inspect or record source-bound review decisions."""
     workspace = _inputs(batch, root)
     manifest_path = _manifest_path(batch, workspace)
     if "releaseManifest" in batch or manifest_path.exists():

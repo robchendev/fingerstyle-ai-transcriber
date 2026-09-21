@@ -35,6 +35,8 @@ def prepare(args):
     options = state["options"]
     if options != state["identity"]["options"]:
         raise HarnessError("Source options differ from the recorded identity.")
+    if any(options.get(name) for name in ("fingering_arranger", "symbolic_completer", "playing_evidence", "hand_position_evidence")):
+        raise HarnessError("This saved job used unsupported optional export models or evidence; its export settings cannot be reproduced.")
     hashes = {str(state_path): sha256(state_path), str(summary_path): state["summarySha256"]}
     paths = {}
     for stage, key in (("inference", "predictions"), ("beats", "beatEvidence")):
@@ -44,7 +46,7 @@ def prepare(args):
             raise HarnessError(f"Invalid saved {stage} output.")
         hashes[str(path)] = saved["hashes"][str(path)]
         paths[key] = path
-    for name in ("template", "fingering_arranger", "symbolic_completer"):
+    for name in ("template",):
         value = options.get(name)
         if value is not None:
             path = regular_path(value)
@@ -64,9 +66,6 @@ def prepare(args):
         "--template", str(paths["template"]), "--full-output", str(output / "transcription.full-voices.gp"),
         "--single-output", str(output / "transcription.single-voice.gp"), "--report", str(output / "gp-output.json"),
     ]
-    for key in ("fingering_arranger", "symbolic_completer"):
-        if key in paths:
-            values.extend(("--" + key.replace("_", "-"), str(paths[key])))
     for key, value in profile.items():
         if isinstance(value, bool):
             if value:

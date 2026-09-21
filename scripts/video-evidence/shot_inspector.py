@@ -18,7 +18,7 @@ import av
 import cv2
 import numpy as np
 
-from core import EvidenceError, PRIVATE_OUTPUT_ROOT, frames_in_shot_range, private_output, publish_json, sha256
+from core import EvidenceError, frames_in_shot_range, private_output, publish_json, sha256, video_stream
 from geometry import _cleanup
 
 
@@ -397,10 +397,7 @@ def _frame_end(frame, stream):
 
 
 def _video_stream(container, report):
-    streams = list(container.streams.video)
-    if len(streams) != 1:
-        raise EvidenceError("Shot inspection requires exactly one video stream.")
-    stream = streams[0]
+    stream = video_stream(container)
     if stream.time_base is None or _fraction(stream.time_base) != report["timeBase"] or stream.index != report["videoStreamIndex"]:
         raise EvidenceError("Inspection stream and native source time base differ.")
     return stream
@@ -450,10 +447,7 @@ def inspect_shots(video_path, output_directory, config=ShotConfig(), review_path
     output = _safe_directory(output_directory)
     container = av.open(str(video_path))
     try:
-        streams = [stream for stream in container.streams if stream.type == "video"]
-        if len(streams) != 1:
-            raise EvidenceError("Shot inspection requires exactly one video stream.")
-        stream = streams[0]
+        stream = video_stream(container)
         if stream.time_base is None:
             raise EvidenceError("Video stream has no presentation time base.")
         time_base = Fraction(stream.time_base)

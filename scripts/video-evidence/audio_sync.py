@@ -1,21 +1,26 @@
-"""Align a downloaded source-video soundtrack to the already-trimmed audio."""
+"""Align a local source-video soundtrack to already-trimmed audio."""
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
+import shutil
 import subprocess
 
 import numpy as np
 from scipy.signal import correlate
 
-from catalog import check_audio_asset, source_for_pair, source_video_id
 from core import EvidenceError, publish_json, sha256
-from intake import ffmpeg_executables
+
+
+def installed_tools():
+    paths = [shutil.which(name) for name in ("ffmpeg", "ffprobe")]
+    if not all(paths):
+        raise EvidenceError("Existing FFmpeg/FFprobe on PATH are required; preparation never downloads tools.")
+    return tuple(Path(path).resolve() for path in paths)
 
 
 def _decode_mono(path, sample_rate):
-    ffmpeg, _ = ffmpeg_executables()
+    ffmpeg, _ = installed_tools()
     command = [
         str(ffmpeg), "-v", "error", "-i", str(path), "-map", "0:a:0",
         "-ac", "1", "-ar", str(sample_rate), "-f", "f32le", "-",
@@ -54,43 +59,6 @@ def _normalized_valid_correlation(source, clip):
     source_energy = window_square - window_sum * window_sum / len(clip)
     denominator = np.sqrt(np.maximum(source_energy * target_energy, 1e-24))
     return numerator / denominator
-
-
-def load_source_provenance(mapping_path, receipt_path, pair_id, video_path, audio_path):
-    mapping = json.loads(Path(mapping_path).read_text(encoding="utf-8"))
-    if not isinstance(mapping, dict) or type(mapping.get("schemaVersion")) is not int or mapping["schemaVersion"] != 2 or mapping.get("kind") != "active-pair-video-sources":
-        raise EvidenceError("Retained trims require a version2 source mapping; migrate the archived catalog into a new file.")
-    url = source_for_pair(mapping, pair_id)
-    row = next(row for row in mapping["pairs"] if row["pairId"] == pair_id)
-    asset = check_audio_asset(row.get("audioAsset"), audio_path)
-    receipt = json.loads(Path(receipt_path).read_text(encoding="utf-8"))
-    if (not isinstance(receipt, dict) or receipt.get("kind") != "authorized-source-video" or type(receipt.get("schemaVersion")) is not int or receipt["schemaVersion"] != 1
-            or receipt.get("videoSha256") != sha256(video_path)
-            or receipt.get("videoFile") != Path(video_path).name):
-        raise EvidenceError("Source-video receipt does not bind the supplied video.")
-    if not isinstance(receipt.get("metadata"), dict) or receipt["metadata"].get("id") != asset["sourceVideoId"] or source_video_id(url) != asset["sourceVideoId"]:
-        raise EvidenceError("Source-video receipt ID differs from the retained audio's original video.")
-    return {
-        "pairId": pair_id, "mappingSha256": sha256(mapping_path),
-        "videoReceiptSha256": sha256(receipt_path), "audioAsset": asset,
-    }
-
-
-def align_retained_source(video_path, audio_path, output_path, *, mapping_path, receipt_path, pair_id):
-    provenance = load_source_provenance(mapping_path, receipt_path, pair_id, video_path, audio_path)
-    asset = provenance["audioAsset"]
-    first = asset["sourceSampleBounds"]["startSample"]
-    report = {
-        "schemaVersion": 1, "kind": "video-to-trimmed-audio-alignment", "visibility": "private",
-        "videoSha256": sha256(video_path), "trimmedAudioSha256": asset["sha256"],
-        "method": "retained-source-samples", "sourceProvenance": provenance,
-        "sampleRate": asset["sampleRate"], "trimmedAudioDurationSeconds": asset["sampleCount"] / asset["sampleRate"],
-        "videoStartSecondsForTrimmedAudioZero": first / asset["sampleRate"],
-        "mapping": "trimmedAudioSample = sourceTimeSeconds * sampleRate - retainedStartSample",
-        "correlation": None, "status": "supported", "reviewRequired": False,
-        "rate": [1, 1], "trainingPerformed": False,
-    }
-    return publish_json(output_path, report), report
 
 
 def align_soundtrack(video_path, trimmed_audio_path, output_path, *, sample_rate=8000, envelope_rate=200):

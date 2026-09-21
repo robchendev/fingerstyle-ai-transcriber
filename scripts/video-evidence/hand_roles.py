@@ -2,7 +2,6 @@
 
 from dataclasses import asdict, dataclass
 from fractions import Fraction
-import html
 import itertools
 import json
 import math
@@ -14,7 +13,6 @@ import numpy as np
 
 from core import EvidenceError, GuitarCoordinateFrame, sha256
 from geometry import GEOMETRY_POINTS, STATE_CODES, _cleanup, _publish, _safe_directory, annotations_ready, validate_geometry_annotations
-from hand_review import HAND_CONNECTIONS
 from hand_tracking import same_hand_landmarks
 
 
@@ -546,121 +544,3 @@ def load_role_observations(inputs, roles_path):
         if np.any((arrays["role"] == code).sum(-1) > 1):
             raise EvidenceError("A role is assigned to two hands in the same frame.")
     return report, arrays
-
-
-def review_hand_roles(video_path, shots_path, hands_path, geometry_path, annotations_path, roles_path, output_directory):
-    inputs = load_role_inputs(video_path, shots_path, hands_path, geometry_path, annotations_path)
-    roles_path = Path(roles_path)
-    report, arrays = load_role_observations(inputs, roles_path)
-    array_path = roles_path.with_name("roles.npz")
-    selected = {}
-    detected = np.isfinite(inputs["hand"]["image_landmarks"][..., :2]).all(-1).any(-1)
-    for shot in inputs["documents"]["shots"]["shots"]:
-        indices = np.flatnonzero(arrays["shot_id"] == shot["shotId"])
-        best = max(indices, key=lambda i: (int(arrays["role_available"][i].sum()), float(arrays["role_confidence"][i].sum()), -abs(i - int(indices[len(indices) // 2]))))
-        choices = [("start", indices[0]), ("middle", indices[len(indices) // 2]), ("best", best), ("end", indices[-1])]
-        unknown = [i for i in indices if (detected[i] & ~arrays["role_available"][i]).any()]
-        if unknown:
-            choices.append(("unknown", unknown[len(unknown) // 2]))
-        for label, index in choices:
-            pts = int(arrays["pts"][index])
-            if pts not in selected:
-                selected[pts] = {"shotId": shot["shotId"], "index": int(index), "sample": label, "path": f"review\\shot-{shot['shotId']:04d}-{label}-pts-{pts}.jpg"}
-    output = _safe_directory(output_directory, "hand-role review")
-    complete = False
-    roles_hash = sha256(roles_path)
-    array_hash = sha256(array_path)
-    try:
-        remaining = dict(selected)
-        thumbnails = []
-        with av.open(str(video_path)) as container:
-            stream = container.streams.video[0]
-            if Fraction(stream.time_base) != Fraction(*report["timeBase"]):
-                raise EvidenceError("Decoded video time base differs from observations.")
-            for frame in container.decode(stream):
-                if frame.pts is None:
-                    raise EvidenceError("Review frame has no presentation timestamp.")
-                choice = remaining.pop(int(frame.pts), None)
-                if choice is None:
-                    continue
-                index = choice["index"]
-                image = frame.to_ndarray(format="bgr24")
-                image = cv2.resize(image, (1280, round(image.shape[0] * 1280 / image.shape[1])), interpolation=cv2.INTER_AREA)
-                height, width = image.shape[:2]
-                colors = {0: (170, 170, 170), 1: (90, 230, 90), 2: (60, 170, 255)}
-                coords = inputs["geometry"]["coordinates"][index]
-                conf = inputs["geometry"]["confidence"][index]
-                for a, b, color in ((1, 0, (255, 230, 40)), (2, 3, (230, 100, 240))):
-                    if min(conf[a], conf[b]) > 0:
-                        cv2.arrowedLine(image, tuple(np.rint(coords[a] * [width, height]).astype(int)), tuple(np.rint(coords[b] * [width, height]).astype(int)), color, 2, cv2.LINE_AA)
-                for hand in range(2):
-                    points = inputs["hand"]["image_landmarks"][index, hand, :, :2]
-                    valid = np.isfinite(points).all(-1)
-                    if not valid.any():
-                        continue
-                    role = int(arrays["role"][index, hand])
-                    color = colors[role]
-                    pixels = np.rint(np.where(valid[:, None], points, 0) * [width, height]).astype(int)
-                    for a, b in HAND_CONNECTIONS:
-                        if valid[a] and valid[b]:
-                            cv2.line(image, tuple(pixels[a]), tuple(pixels[b]), color, 2, cv2.LINE_AA)
-                    for point in pixels[valid]:
-                        cv2.circle(image, tuple(point), 3, color, -1, cv2.LINE_AA)
-                    if valid[0] and sum(valid[list(PALM)]) >= 3 and sum(valid[list(TIPS)]) >= 2:
-                        anchors = (
-                            points[0], np.median(points[list(PALM)][valid[list(PALM)]], axis=0),
-                            np.median(points[list(TIPS)][valid[list(TIPS)]], axis=0),
-                        )
-                        for anchor in anchors:
-                            pixel = tuple(np.rint(anchor * [width, height]).astype(int))
-                            cv2.circle(image, pixel, 8, color, 2, cv2.LINE_AA)
-                    name = next(name for name, code in ROLE_CODES.items() if code == role)
-                    reason = next(name for name, code in REASON_CODES.items() if code == int(arrays["reason"][index, hand]))
-                    scores = arrays["role_scores"][index, hand]
-                    label = f"{name} c={arrays['role_confidence'][index, hand]:.2f} track={arrays['track_id'][index, hand]} F/P={scores[0]:.2f}/{scores[1]:.2f}"
-                    if arrays["assignment_source"][index, hand] == ASSIGNMENT_SOURCES["reviewed_screen_order"]:
-                        label = f"{name} source=reviewed-screen-order track={arrays['track_id'][index, hand]} F/P={scores[0]:.2f}/{scores[1]:.2f}"
-                    y = 78 + hand * 48
-                    cv2.putText(image, label, (18, y), cv2.FONT_HERSHEY_SIMPLEX, .65, (0, 0, 0), 4, cv2.LINE_AA)
-                    cv2.putText(image, label, (18, y), cv2.FONT_HERSHEY_SIMPLEX, .65, color, 2, cv2.LINE_AA)
-                    if not role:
-                        cv2.putText(image, reason, (18, y + 22), cv2.FONT_HERSHEY_SIMPLEX, .5, color, 1, cv2.LINE_AA)
-                title = f"Shot {choice['shotId'] + 1} | {choice['sample']} | PTS {frame.pts} | geometry {arrays['geometry_confidence'][index]:.2f}"
-                cv2.putText(image, title, (18, 32), cv2.FONT_HERSHEY_SIMPLEX, .7, (0, 0, 0), 4, cv2.LINE_AA)
-                cv2.putText(image, title, (18, 32), cv2.FONT_HERSHEY_SIMPLEX, .7, (255, 255, 255), 2, cv2.LINE_AA)
-                path = output / choice["path"]
-                path.parent.mkdir(exist_ok=True)
-                if not cv2.imwrite(str(path), image, [cv2.IMWRITE_JPEG_QUALITY, 91]):
-                    raise EvidenceError(f"Unable to write role review image: {path}")
-                if choice["sample"] == "middle":
-                    thumbnails.append(cv2.resize(image, (320, 180)))
-                if not remaining:
-                    break
-        if remaining:
-            raise EvidenceError(f"Role review could not decode requested PTS: {sorted(remaining)}")
-        if thumbnails:
-            columns = 5
-            canvas = np.zeros((math.ceil(len(thumbnails) / columns) * 180, columns * 320, 3), np.uint8)
-            for i, image in enumerate(thumbnails):
-                canvas[(i // columns) * 180:(i // columns + 1) * 180, (i % columns) * 320:(i % columns + 1) * 320] = image
-            if not cv2.imwrite(str(output / "overview.jpg"), canvas):
-                raise EvidenceError("Unable to write role overview.")
-        if any(sha256(path) != inputs["hashes"][name] for name, path in inputs["paths"].items()) or sha256(roles_path) != roles_hash or sha256(array_path) != array_hash:
-            raise EvidenceError("Role review inputs changed during rendering.")
-        review = {
-            "schemaVersion": 1, "kind": "guitar-hand-role-review", "visibility": "private",
-            "inputSha256": inputs["hashes"], "rolesSha256": roles_hash, "roleArraysSha256": array_hash,
-            "shotCount": report["shotCount"], "images": list(selected.values()),
-            "reviewRequired": True, "roleAccuracyMeasured": False, "trainingPerformed": False,
-        }
-        _publish(output / "review.json", review)
-        panels = "\n".join(f'<figure id="shot-{item["shotId"] + 1}-{item["sample"]}"><figcaption>Shot {item["shotId"] + 1}: {html.escape(item["sample"])}</figcaption><img loading="lazy" width="960" src="{html.escape(item["path"].replace(chr(92), "/"))}"></figure>' for item in selected.values())
-        navigation = " ".join(f'<a href="#shot-{i + 1}-start">{i + 1}</a>' for i in range(report["shotCount"]))
-        side = report["config"].get("plucking_screen_side", "geometry")
-        method = "Guitar-relative geometric roles." if side == "geometry" else f"Reviewed two-hand layout: plucking screen-{html.escape(side)}; fretting opposite. Single-hand frames use guitar geometry."
-        (output / "index.html").write_text(f'<!doctype html><meta charset="utf-8"><title>Private hand-role review</title><h1>Hand roles - owner review</h1><p>Green: fretting. Orange: plucking. Grey: unknown. {method} Role identity does not establish available fret/contact coordinates. Scores are not calibrated probabilities or contact evidence.</p><nav>Shots: {navigation}</nav>{panels}', encoding="utf-8")
-        complete = True
-        return output / "review.json", review
-    finally:
-        if not complete:
-            _cleanup(output)

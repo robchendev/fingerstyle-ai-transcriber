@@ -9,7 +9,6 @@ import sys
 import numpy as np
 
 from core import EvidenceError, GuitarCoordinateFrame, sha256
-from coarse_context import POLICY as COARSE_POLICY, load_coarse_observations
 from geometry import GEOMETRY_POINTS, STATE_CODES, _cleanup, _publish, _safe_directory, automatic_cut_intervals, cut_uncertainty_mask
 from hand_motion import load_audio_clock, validate_clips
 from hand_roles import PALM, load_role_inputs, load_role_observations
@@ -122,7 +121,7 @@ class _PalmTracker:
         return result
 
 
-def structured_observations(inputs, roles, clips, coarse=None):
+def structured_observations(inputs, roles, clips):
     hand, geometry, shots = inputs["hand"], inputs["geometry"], inputs["documents"]["shots"]
     # Audio trims can end between video frames; the producer also enforces the exact audio-clock bounds.
     selected, clip_ids = validate_clips(clips, hand["pts"], shots, allow_partial_end=True)
@@ -219,14 +218,9 @@ def structured_observations(inputs, roles, clips, coarse=None):
                     if norm >= MINIMUM_PALM_PIXELS:
                         values[184:186] = direction / norm
                         masks[184:186] = True
-            if code and coarse is not None:
-                for start, stop in ((0, 2), (4, 8)):
-                    values[186 + start:186 + stop] = coarse["features"][i, slot, start:stop]
-                    masks[186 + start:186 + stop] = coarse["available"][i, slot, start:stop]
             key = (
                 int(clip_ids[i]), int(hand["shot_id"][i]), int(roles["track_id"][i, slot]) if code else -1,
                 int(hand["detection_source"][i]), identities.get(slot), frame is not None if code else False, tuple(valid),
-                int(coarse["context_id"][i]) if code and coarse is not None else -1,
             )
             prior = previous[role]
             continuous = not boundary and prior is not None and prior[0] == i - 1 and prior[2] == key
@@ -248,13 +242,6 @@ def structured_observations(inputs, roles, clips, coarse=None):
                 if palm is not None and prior[3] is not None:
                     values[182:184] = (palm["pixels"][0] - prior[3]["pixels"][0]) / prior[3]["scale"] / elapsed
                     masks[182:184] = True
-                if code and coarse is not None:
-                    coarse_mask = masks[186:188] & output["structured_available"][before, role, 186:188]
-                    coarse_mask &= coarse["available"][i, slot, 2:4]
-                    values[188:190][coarse_mask] = (
-                        values[186:188][coarse_mask] - output["structured"][before, role, 186:188][coarse_mask]
-                    ) / elapsed
-                    masks[188:190] = coarse_mask
             else:
                 output["segment_id"][local, role] = next_segment
                 next_segment += 1
@@ -276,7 +263,7 @@ def structured_observations(inputs, roles, clips, coarse=None):
 
 def prepare_paired_inputs(video_path, shots_path, hands_path, geometry_path, annotations_path,
                           roles_path, audio_path, alignment_path, output_directory, clips, *,
-                          pair_id=None, correspondence_review_path=None, reference_gp_path=None, coarse_path=None):
+                          pair_id=None):
     if pair_id is not None and (not isinstance(pair_id, str) or not pair_id.strip()):
         raise EvidenceError("Pair ID must be a nonempty string.")
     for path in (video_path, shots_path, hands_path, geometry_path, annotations_path, roles_path, audio_path, alignment_path):
@@ -287,41 +274,17 @@ def prepare_paired_inputs(video_path, shots_path, hands_path, geometry_path, ann
              "trimmedAudio": Path(audio_path).absolute(), "alignment": Path(alignment_path).absolute()}
     clock, duration, alignment, audio_hashes = load_audio_clock(inputs["hashes"]["video"], audio_path, alignment_path)
     hashes = {**inputs["hashes"], **audio_hashes, "roles": sha256(roles_path), "roleArrays": role_report["arraysSha256"]}
-    coarse = None
-    if coarse_path is not None:
-        coarse_report, coarse = load_coarse_observations(inputs, coarse_path)
-        paths.update(coarse=_source_path(coarse_path), coarseArrays=_source_path(Path(coarse_path).absolute().with_name("coarse.npz")))
-        hashes.update(coarse=sha256(paths["coarse"]), coarseArrays=coarse_report["arraysSha256"])
-    policy = None
-    if bool(correspondence_review_path) != bool(reference_gp_path):
-        raise EvidenceError("Correspondence review requires its original GP identity, and vice versa.")
-    if correspondence_review_path:
-        root = str(Path(__file__).resolve().parents[2])
-        if root not in sys.path:
-            sys.path.insert(0, root)
-        from scripts.video_correspondence import CorrespondenceError, load_correspondence_review
-
-        paths.update(correspondenceReview=_source_path(correspondence_review_path), correspondenceReferenceGp=_source_path(reference_gp_path))
-        try:
-            policy = load_correspondence_review(correspondence_review_path, video_sha256=hashes["video"], source_gp_path=reference_gp_path)
-        except CorrespondenceError as error:
-            raise EvidenceError(str(error)) from error
-        hashes.update(correspondenceReview=policy["reviewSha256"], correspondenceReferenceGp=policy["sourceGpSha256"])
     for path in paths.values():
         _source_path(path)
     if len(set(paths.values())) != len(paths):
         raise EvidenceError("Paired-input source paths must not alias one another.")
-    arrays, indices = structured_observations(inputs, roles, clips, coarse)
+    arrays, indices = structured_observations(inputs, roles, clips)
     time_base = Fraction(*inputs["documents"]["shots"]["timeBase"])
     for clip in clips:
         if clock.map_pts(clip["startPts"], time_base) < 0 or Fraction(clock.map_pts(clip["endPtsExclusive"], time_base), clock.sample_rate) > duration:
             raise EvidenceError("Paired clip falls outside the aligned trimmed audio.")
     arrays["audio_seconds"] = np.asarray([clock.map_pts(int(pts), time_base) / clock.sample_rate for pts in arrays["pts"]], np.float64)
     arrays["technique_available"] = np.ones(len(indices), bool)
-    if policy:
-        video_seconds = arrays["pts"] * float(time_base)
-        for interval in policy["intervals"]:
-            arrays["technique_available"] &= ~((video_seconds >= interval["startVideoSeconds"]) & (video_seconds <= interval["endVideoSeconds"]))
     output = _safe_directory(output_directory, "paired video inputs")
     complete = False
     try:
@@ -341,7 +304,7 @@ def prepare_paired_inputs(video_path, shots_path, hands_path, geometry_path, ann
             "coordinatePolicy": "Source-pixel aspect correction; neckBody origin=(0,0), nut=(1,0); perpendicular fretboard-width cross axis.",
             "handCoordinatePolicy": "Observed wrist-centered source-pixel XY; median wrist-to-valid-MCP(5,9,13,17) distance, at least three MCPs and eight source pixels. Wrist velocity uses prior scale and includes camera motion, not guitar contact.",
             "handIdentityPolicy": "Adjacent source-pixel palm matching; ambiguous identity, missing hand, clip, shot, cut, detector change or >90ms gap resets motion. Unknown playing roles remain anonymous; anatomical handedness is not used.",
-            "coarseCoordinatePolicy": COARSE_POLICY,
+            "coarseCoordinatePolicy": "Reserved schema slots 186:194 remain zero and unavailable.",
             "coverage": {
                 "framesWithGeometry": int(arrays["structured_available"][..., :98].any(axis=(1, 2)).sum()),
                 "framesWithIndependentHand": int(arrays["structured_available"][..., 98:140].any(axis=(1, 2)).sum()),
@@ -352,7 +315,7 @@ def prepare_paired_inputs(video_path, shots_path, hands_path, geometry_path, ann
             },
             "clock": {"sampleRate": clock.sample_rate, "offsetSamples": clock.offset_samples, "rate": [1, 1]},
             "clips": [{"startPts": row["startPts"], "endPtsExclusive": row["endPtsExclusive"]} for row in sorted(clips, key=lambda value: value["startPts"])],
-            "correspondenceIntervals": [] if policy is None else policy["intervals"],
+            "correspondenceIntervals": [],
             "maximumGapSeconds": MAXIMUM_GAP_SECONDS,
         }
         _publish(output / "inputs.json", report)

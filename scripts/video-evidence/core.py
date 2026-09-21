@@ -1,4 +1,4 @@
-"""Validated, model-independent evidence for edited modern fingerstyle video."""
+"""Source integrity, rational clocks and coordinate schema primitives."""
 
 from __future__ import annotations
 
@@ -14,38 +14,6 @@ from uuid import uuid4
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 PRIVATE_OUTPUT_ROOT = REPOSITORY_ROOT / "runs" / "video-evidence"
 
-FRAME_STATES = frozenset({
-    "trackable",
-    "guitar_partial",
-    "guitar_absent",
-    "hands_occluded",
-    "calibration_unstable",
-    "transition",
-    "decode_failure",
-    "av_mismatch",
-    "unknown",
-})
-
-FINGERSTYLE_ACTIONS = frozenset({
-    "pluck",
-    "thumb_bass",
-    "brush",
-    "arpeggio_roll",
-    "rasgueado",
-    "pick_stroke",
-    "thumb_slap",
-    "wrist_thump",
-    "body_tap",
-    "string_tap",
-    "hammer_on",
-    "pull_off",
-    "slide",
-    "bend",
-    "vibrato",
-    "harmonic_touch",
-})
-
-
 class EvidenceError(ValueError):
     pass
 
@@ -54,6 +22,16 @@ def sha256(path):
     path = Path(path)
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def video_stream(container):
+    """Select one video track, excluding embedded cover artwork."""
+    from av.stream import Disposition
+
+    streams = [stream for stream in container.streams.video if not stream.disposition & Disposition.attached_pic]
+    if len(streams) != 1:
+        raise EvidenceError("Exactly one video stream is required, excluding attached pictures.")
+    return streams[0]
 
 
 def frames_in_shot_range(container, stream, shots):
@@ -112,17 +90,6 @@ def _finite(value, name, minimum=None, maximum=None):
     result = float(value)
     if minimum is not None and result < minimum or maximum is not None and result > maximum:
         raise EvidenceError(f"{name} is outside its permitted range.")
-    return result
-
-
-def _fraction(value, name, *, positive=False):
-    if not isinstance(value, list) or len(value) != 2:
-        raise EvidenceError(f"{name} must be [numerator, denominator].")
-    numerator = _integer(value[0], f"{name} numerator")
-    denominator = _integer(value[1], f"{name} denominator", 1)
-    result = Fraction(numerator, denominator)
-    if positive and result <= 0:
-        raise EvidenceError(f"{name} must be positive.")
     return result
 
 
@@ -214,158 +181,3 @@ class GuitarCoordinateFrame:
             "acrossFretboard": (dx * self.cross_x + dy * self.cross_y) / self.fretboard_width,
             "confidence": min(confidence, self.confidence),
         }
-
-
-def _hand_evidence(hand, geometry, name):
-    if hand is None:
-        return None
-    if not isinstance(hand, dict) or set(hand) != {"role", "anatomicalHandedness", "landmarks", "candidateActions"}:
-        raise EvidenceError(f"{name} hand evidence has an invalid schema.")
-    if hand["role"] not in ("fretting", "plucking", "unknown"):
-        raise EvidenceError(f"{name} hand role is invalid.")
-    if hand["anatomicalHandedness"] not in ("left", "right", "unknown"):
-        raise EvidenceError(f"{name} anatomical handedness is invalid.")
-    landmarks = hand["landmarks"]
-    if not isinstance(landmarks, list):
-        raise EvidenceError(f"{name} hand landmarks must be a list.")
-    actions = hand["candidateActions"]
-    if not isinstance(actions, list):
-        raise EvidenceError(f"{name} candidate actions must be a list.")
-    normalized_actions = []
-    for action in actions:
-        if not isinstance(action, dict) or set(action) != {"type", "confidence"} or action["type"] not in FINGERSTYLE_ACTIONS:
-            raise EvidenceError(f"{name} contains an unsupported fingerstyle action.")
-        normalized_actions.append({
-            "type": action["type"],
-            "confidence": _finite(action["confidence"], f"{name} action confidence", 0, 1),
-        })
-    return {
-        "role": hand["role"],
-        "anatomicalHandedness": hand["anatomicalHandedness"],
-        "landmarks": [geometry.transform(point) for point in landmarks] if geometry is not None else [],
-        "landmarksUnavailableWithoutGeometry": geometry is None and bool(landmarks),
-        "candidateActions": normalized_actions,
-    }
-
-
-def _coverage(frames, end_sample):
-    if not frames:
-        raise EvidenceError("At least one frame observation is required.")
-    if end_sample <= frames[-1]["audioSample"]:
-        raise EvidenceError("Coverage end must follow the final mapped frame.")
-    intervals = []
-    for index, frame in enumerate(frames):
-        stop = frames[index + 1]["audioSample"] if index + 1 < len(frames) else end_sample
-        if stop <= frame["audioSample"]:
-            raise EvidenceError("Mapped frame samples must increase strictly.")
-        key = (frame["state"], frame["cameraSegmentId"])
-        if intervals and (intervals[-1]["state"], intervals[-1]["cameraSegmentId"]) == key:
-            intervals[-1]["endAudioSample"] = stop
-        else:
-            intervals.append({
-                "startAudioSample": frame["audioSample"],
-                "endAudioSample": stop,
-                "state": frame["state"],
-                "cameraSegmentId": frame["cameraSegmentId"],
-            })
-    return intervals
-
-
-def build_evidence(video_path, audio_path, observations):
-    video_path, audio_path = Path(video_path), Path(audio_path)
-    if not video_path.is_file() or not audio_path.is_file():
-        raise EvidenceError("Evidence requires existing local video and trimmed-audio files.")
-    if not isinstance(observations, dict) or set(observations) != {
-        "timeBase", "clockMapping", "endPts", "frames", "review"
-    }:
-        raise EvidenceError("Observation document has an invalid top-level schema.")
-    time_base = _fraction(observations["timeBase"], "time base", positive=True)
-    clock = observations["clockMapping"]
-    if not isinstance(clock, dict) or set(clock) != {"sampleRate", "offsetSamples", "rate"}:
-        raise EvidenceError("Clock mapping has an invalid schema.")
-    mapping = ClockMapping(
-        sample_rate=_integer(clock["sampleRate"], "sample rate", 1),
-        offset_samples=_integer(clock["offsetSamples"], "offset samples"),
-        rate=_fraction(clock["rate"], "clock rate", positive=True),
-    )
-    raw_frames = observations["frames"]
-    if not isinstance(raw_frames, list) or not raw_frames:
-        raise EvidenceError("Frames must be a nonempty list.")
-    frames = []
-    prior_pts = None
-    segment = -1
-    for index, frame in enumerate(raw_frames):
-        expected = {"pts", "cutBefore", "state", "guitarGeometry", "frettingHand", "pluckingHand", "sync"}
-        if not isinstance(frame, dict) or set(frame) != expected:
-            raise EvidenceError(f"Frame {index} has an invalid schema.")
-        pts = _integer(frame["pts"], f"frame {index} PTS")
-        if prior_pts is not None and pts <= prior_pts:
-            raise EvidenceError("Frame PTS values must increase strictly.")
-        if type(frame["cutBefore"]) is not bool or index == 0 and frame["cutBefore"] is not True:
-            raise EvidenceError("The first frame must start a camera segment; cutBefore must be boolean.")
-        if frame["cutBefore"]:
-            segment += 1
-        state = frame["state"]
-        if state not in FRAME_STATES:
-            raise EvidenceError(f"Unsupported frame state: {state}")
-        geometry = None
-        if frame["guitarGeometry"] is not None:
-            geometry = GuitarCoordinateFrame.from_landmarks(frame["guitarGeometry"])
-        if state == "trackable" and geometry is None:
-            raise EvidenceError("Trackable frames require guitar geometry.")
-        sync = frame["sync"]
-        if not isinstance(sync, dict) or set(sync) != {"status", "lagSeconds", "support", "ambiguity"}:
-            raise EvidenceError("Frame synchronization evidence has an invalid schema.")
-        if sync["status"] not in ("supported", "contradicted", "unassessable"):
-            raise EvidenceError("Synchronization status is invalid.")
-        normalized_sync = {
-            "status": sync["status"],
-            "lagSeconds": None if sync["lagSeconds"] is None else _finite(sync["lagSeconds"], "synchronization lag"),
-            "support": _integer(sync["support"], "synchronization support", 0),
-            "ambiguity": _finite(sync["ambiguity"], "synchronization ambiguity", 0),
-        }
-        if sync["status"] == "unassessable" and sync["lagSeconds"] is not None:
-            raise EvidenceError("Unassessable synchronization cannot claim a lag.")
-        audio_sample = mapping.map_pts(pts, time_base)
-        frames.append({
-            "pts": pts,
-            "audioSample": audio_sample,
-            "audioSeconds": audio_sample / mapping.sample_rate,
-            "cutBefore": frame["cutBefore"],
-            "cameraSegmentId": segment,
-            "trackingGeneration": segment,
-            "state": state,
-            "guitarGeometryConfidence": None if geometry is None else geometry.confidence,
-            "frettingHand": _hand_evidence(frame["frettingHand"], geometry, "fretting"),
-            "pluckingHand": _hand_evidence(frame["pluckingHand"], geometry, "plucking"),
-            "sync": normalized_sync,
-        })
-        prior_pts = pts
-    end_pts = _integer(observations["endPts"], "end PTS")
-    if end_pts <= raw_frames[-1]["pts"]:
-        raise EvidenceError("endPts must follow the final frame.")
-    end_sample = mapping.map_pts(end_pts, time_base)
-    review = observations["review"]
-    if not isinstance(review, dict) or set(review) != {"timingReviewed", "coverageReviewed", "sameTakeConfirmed"}:
-        raise EvidenceError("Review status has an invalid schema.")
-    if any(type(review[name]) is not bool for name in review):
-        raise EvidenceError("Review statuses must be boolean.")
-    return {
-        "schemaVersion": 1,
-        "kind": "fingerstyle-video-evidence",
-        "visibility": "private",
-        "trainingPerformed": False,
-        "videoSha256": sha256(video_path),
-        "trimmedAudioSha256": sha256(audio_path),
-        "clock": {
-            "timeBase": [time_base.numerator, time_base.denominator],
-            "sampleRate": mapping.sample_rate,
-            "offsetSamples": mapping.offset_samples,
-            "rate": [mapping.rate.numerator, mapping.rate.denominator],
-            "mapping": "trimmedAudioSeconds = rate * (videoPTS * timeBase) + offsetSamples / sampleRate",
-        },
-        "review": dict(review),
-        "sameTakeInferencePolicy": "Soundtrack alignment and local motion agreement do not prove same-take fingering.",
-        "frames": frames,
-        "coverage": _coverage(frames, end_sample),
-    }

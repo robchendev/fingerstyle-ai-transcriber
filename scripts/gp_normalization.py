@@ -342,7 +342,8 @@ def _conversion_candidates(labels, annotations, score):
     result = []
     for gesture in labels["targets"]["gestures"]:
         technique = gesture["technique"]
-        if gesture.get("interpretationRuleId") == "owner-ghost-X-generic" and gesture.get("evidenceSource") == "owner-notation-conventions":
+        convention = labels["provenance"].get("notationConventionsId", "owner")
+        if gesture.get("interpretationRuleId") == f"{convention}-ghost-X-generic" and gesture.get("evidenceSource") == f"{convention}-notation-conventions":
             continue
         retained = []
         timing_uncertain = False

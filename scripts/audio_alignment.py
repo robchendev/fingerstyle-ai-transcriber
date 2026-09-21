@@ -341,45 +341,6 @@ def align_first_attack(reference, audio, *, first_reference_seconds, max_cells=6
     return result
 
 
-def align_attack_bounds(reference, audio, *, first_reference_seconds, last_reference_seconds, max_cells=60_000_000, warp_penalty=0.08):
-    """Match the attack span without stretching notation into post-attack decay."""
-    reference_chroma = _validate_features(reference, "reference")
-    audio_chroma = _validate_features(audio, "audio")
-    last_reference_seconds = _number(last_reference_seconds, "last_reference_seconds")
-    if not first_reference_seconds < last_reference_seconds <= reference.times[-1]:
-        raise AlignmentError("The last notated attack must follow the first and lie within the reference.")
-    last_reference = int(np.argmin(np.abs(reference.times - last_reference_seconds)))
-    peaks, _ = find_peaks(np.r_[0., audio.onset, 0.], height=.12, prominence=.06, distance=2)
-    peaks = peaks - 1
-    peaks = peaks[(peaks > 0) & (peaks < len(audio.times))]
-    compatible = audio.activity[peaks] >= .025
-    if np.any(reference_chroma[last_reference] > 0):
-        compatible &= audio_chroma[peaks] @ reference_chroma[last_reference] >= .35
-    peaks = peaks[compatible]
-    if not len(peaks):
-        raise AlignmentError("No plausible final attack; no audio-end fallback was used.")
-    last_audio = int(peaks[-1])
-
-    def prefix(features, stop):
-        return Features(features.times[:stop + 1], features.chroma[:stop + 1], features.onset[:stop + 1], features.activity[:stop + 1])
-
-    result = align_first_attack(prefix(reference, last_reference), prefix(audio, last_audio), first_reference_seconds=first_reference_seconds, max_cells=max_cells, warp_penalty=warp_penalty)
-    result["fixedFrameAnchors"].append((last_reference, last_audio))
-    first_reference, first_audio = int(result["reference_indices"][0]), int(result["audio_indices"][0])
-    result["diagnostics"].update(
-        algorithm="first_and_last_attack_then_dtw", mode="attack-span",
-        reference_frame_range=[first_reference, last_reference], audio_frame_range=[first_audio, last_audio],
-        reference_coverage_fraction=(last_reference - first_reference + 1) / len(reference.times),
-        audio_coverage_fraction=(last_audio - first_audio + 1) / len(audio.times),
-        last_attack_reference_seconds=float(reference.times[last_reference]),
-        last_attack_audio_seconds=float(audio.times[last_audio]),
-        last_attack_is_review_approved=False,
-        unmatched_audio_after_last_attack_seconds=float(audio.times[-1] - audio.times[last_audio]),
-    )
-    result["diagnostics"]["flags"].append("post_attack_sustain_unmapped")
-    return result
-
-
 def align_features(reference, audio, *, mode="global", max_cells=60_000_000, warp_penalty=0.08):
     """Return an unapproved monotonic DTW candidate, without proportional fallback.
 

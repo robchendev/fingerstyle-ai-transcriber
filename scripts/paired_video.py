@@ -21,8 +21,6 @@ VIDEO_FIELDS = frozenset({"structured", "structured_available", "technique_avail
 MAXIMUM_FRAME_DISTANCE = .045
 _ARRAY_NAMES = {"audio_seconds", "pts", "technique_available", "segment_id", "structured", "structured_available"}
 _INPUT_NAMES = {"video", "shots", "hands", "geometry", "annotations", "handArrays", "geometryArrays", "roles", "roleArrays", "trimmedAudio", "alignment"}
-_REVIEW_NAMES = {"correspondenceReview", "correspondenceReferenceGp"}
-_COARSE_NAMES = {"coarse", "coarseArrays"}
 _VELOCITY_OBSERVATIONS = ((0, 42), (98, 140), (98, 100), (186, 188))
 
 
@@ -246,11 +244,7 @@ class _Bundle:
         arrays_path = _relative(self.path.parent, report.get("arraysPath"), filename=True)
         bindings = {self.path: report_hash, arrays_path: _digest(report.get("arraysSha256"), "Array identity")}
         hashes, paths = report.get("inputSha256"), report.get("inputPaths")
-        allowed_inputs = (
-            _INPUT_NAMES, _INPUT_NAMES | _REVIEW_NAMES,
-            _INPUT_NAMES | _COARSE_NAMES, _INPUT_NAMES | _REVIEW_NAMES | _COARSE_NAMES,
-        )
-        if not isinstance(hashes, dict) or set(hashes) not in allowed_inputs or not isinstance(paths, dict) or set(paths) != set(hashes):
+        if not isinstance(hashes, dict) or set(hashes) != _INPUT_NAMES or not isinstance(paths, dict) or set(paths) != set(hashes):
             raise HarnessError("Paired-video source paths and input hashes must be complete.")
         for name, value in paths.items():
             if not isinstance(value, str) or not Path(value).is_absolute():
@@ -264,10 +258,6 @@ class _Bundle:
         before = {path: _stat(path) for path in bindings}
         if any(sha256(path) != expected for path, expected in bindings.items()):
             raise HarnessError("A paired-video asset hash does not match its report.")
-        if _COARSE_NAMES <= hashes.keys():
-            coarse = _read(Path(paths["coarse"]))
-            if coarse.get("kind") != "coarse-instrument-context" or type(coarse.get("schemaVersion")) is not int or coarse["schemaVersion"] != 1:
-                raise HarnessError("Paired-video coarse input requires coarse-instrument-context schemaVersion 1.")
         try:
             with np.load(arrays_path, allow_pickle=False) as archive:
                 if {"images", "available"} & set(archive.files):
@@ -293,8 +283,8 @@ class _Bundle:
         if (np.diff(arrays["pts"]) <= 0).any():
             raise HarnessError("Paired-video PTS must increase strictly.")
         _validate_features(arrays["structured"], arrays["structured_available"], arrays["segment_id"])
-        if not _COARSE_NAMES <= hashes.keys() and arrays["structured_available"][..., 186:].any():
-            raise HarnessError("Available coarse context requires both hash-bound coarse and coarseArrays inputs.")
+        if arrays["structured_available"][..., 186:].any():
+            raise HarnessError("Reserved coarse-context feature slots must remain masked.")
         segments = arrays["segment_id"]
         ids = np.unique(segments[segments >= 0])
         if not np.array_equal(ids, np.arange(len(ids))):
@@ -368,22 +358,11 @@ class _Bundle:
             if not np.array_equal(source_pts[native], arrays["pts"]):
                 raise HarnessError("Paired-video input must retain exact native observation cadence.")
         intervals = report.get("correspondenceIntervals")
-        if not isinstance(intervals, list):
-            raise HarnessError("Paired-video correspondence intervals must be explicit.")
-        if _REVIEW_NAMES <= report["inputSha256"].keys():
-            from .video_correspondence import load_correspondence_review
-
-            policy = load_correspondence_review(paths["correspondenceReview"], video_sha256=report["videoSha256"], source_gp_path=paths["correspondenceReferenceGp"])
-            if intervals != policy["intervals"]:
-                raise HarnessError("Paired-video correspondence intervals differ from the source review.")
-        elif intervals:
-            raise HarnessError("Paired-video correspondence exclusions require their source review.")
+        if intervals != []:
+            raise HarnessError("External score-video correspondence overrides are not supported.")
         expected_technique = np.ones(len(self.times), bool)
-        seconds = arrays["pts"] * float(self.time_base)
-        for interval in intervals:
-            expected_technique &= ~((seconds >= interval["startVideoSeconds"]) & (seconds <= interval["endVideoSeconds"]))
         if not np.array_equal(expected_technique, arrays["technique_available"]):
-            raise HarnessError("Paired-video technique mask differs from local correspondence exclusions.")
+            raise HarnessError("Paired-video technique mask must preserve the local hand observations.")
 
     def check_unchanged(self):
         _check_guards(self._guards, self._parents)

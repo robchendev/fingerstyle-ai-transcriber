@@ -73,8 +73,6 @@ def canonical_techniques(labels):
             "annotationCompleteAtResolvedNoteAttacks": True,
         })
     return result
-
-
 def projected_techniques(labels, candidate, clock):
     mapping = candidate["denseMapping"]
     reference = np.asarray([point["referenceSeconds"] for point in mapping], dtype=np.float64)
@@ -108,15 +106,3 @@ def techniques_in_window(events, start, stop, rate):
                 },
             })
     return result
-
-
-def technique_counts(labels):
-    events = canonical_techniques(labels)
-    return {
-        "events": len(events),
-        "techniques": {
-            technique: sum(technique in event["techniques"] for event in events)
-            for technique in TECHNIQUE_TYPES
-        },
-        "memberStrings": sum(len(strings) for event in events for strings in event["stringsByTechnique"].values()),
-    }

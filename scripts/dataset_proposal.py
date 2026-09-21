@@ -122,8 +122,6 @@ def inspect_pair(workspace, pair):
     if not coverage["windows"] and not blockers:
         blockers.append("no_windows_after_range_exclusions")
     provided = labels["conditioning"]["providedTiming"]
-    initial_tempo = provided["tempo"]
-    quarter_bpm = initial_tempo["bpm"] * initial_tempo["beatUnit"][0] / initial_tempo["beatUnit"][1] * 4
     signatures = {tuple(provided["timeSignature"])}
     signatures.update(tuple(item["timeSignature"]) for item in provided["sourceTimeSignatureChanges"])
     bindings = {
@@ -143,7 +141,6 @@ def inspect_pair(workspace, pair):
         "percussionCompletenessConfirmed": review.get("approval", {}).get("percussionAnnotationsComplete") is True,
         "coverage": coverage, "tuning": labels["conditioning"]["instrument"]["openStringMidi"],
         "capo": labels["conditioning"]["instrument"]["capoFret"], "meters": [list(value) for value in sorted(signatures)],
-        "initialQuarterBpm": quarter_bpm,
         "sourceBindings": bindings, "reviewWasPresent": review_path.exists(),
         "sourceGpSha256": state["inputs"]["sourceGpSha256"], "audioSha256": state["audio"]["sha256"],
         "candidateSha256": candidate_digest(candidate),
@@ -151,28 +148,9 @@ def inspect_pair(workspace, pair):
     }
 
 
-def _coverage_score(rows, totals):
-    score = 0.
-    for name in COVERAGE_TYPES:
-        events = sum(row["coverage"]["counts"][name] for row in rows)
-        sources = sum(row["coverage"]["counts"][name] > 0 for row in rows)
-        target = min(20, totals[name])
-        score += (min(events, target) / target if target else 0) * 4 + min(sources, 2) * 2
-    score += min(len({row["performerId"] for row in rows if row["performerId"]}), 2) * 2
-    score += min(len({tuple(row["tuning"]) for row in rows}), 5)
-    score += min(len({tuple(meter) for row in rows for meter in row["meters"]}), 3) * 2
-    score += min(len({row["capo"] for row in rows}), 4) * .5
-    score += min(len({len(row["coverage"]["voices"]) for row in rows}), 2)
-    score += min(len({int(pitch) for row in rows for pitch in row["coverage"].get("pitchCounts", {})}), 36) / 18
-    score += min(len({int(fret) for row in rows for fret in row["coverage"].get("fretCounts", {})}), 16) / 8
-    score += min(len({duration for row in rows for duration in row["coverage"].get("durationCounts", {})}), 8) / 4
-    score += min(len({int(row["initialQuarterBpm"] // 30) for row in rows if "initialQuarterBpm" in row}), 3) / 2
-    return score
-
-
-def select_validation(profiles, target_groups=10, explicit_ids=None):
-    if type(target_groups) is not int or target_groups < 1:
-        raise ValueError("The validation group target must be a positive integer.")
+def select_validation(profiles, explicit_ids):
+    if not isinstance(explicit_ids, (list, tuple)) or not explicit_ids or any(not isinstance(value, str) or not value.strip() for value in explicit_ids) or len(explicit_ids) != len(set(explicit_ids)):
+        raise ValueError("Explicit validation IDs must be unique and nonempty.")
     groups = defaultdict(list)
     for row in profiles:
         if row["status"] == "proposed":
@@ -188,43 +166,12 @@ def select_validation(profiles, target_groups=10, explicit_ids=None):
             pinned_train.add(group)
         if "validation" in constraints:
             pinned_validation.add(group)
-    if explicit_ids is not None:
-        if not explicit_ids or len(explicit_ids) != len(set(explicit_ids)):
-            raise ValueError("Explicit validation IDs must be unique and nonempty.")
-        indexed = {row["id"]: row for rows in groups.values() for row in rows}
-        if set(explicit_ids) - set(indexed):
-            raise ValueError("Explicit validation IDs include unknown or quarantined records.")
-        selected_groups = list(dict.fromkeys(indexed[identifier]["groupId"] for identifier in explicit_ids))
-        if set(selected_groups) & pinned_train or pinned_validation - set(selected_groups):
-            raise ValueError("Validation selection conflicts with existing reviewed split constraints.")
-    else:
-        selected_groups = sorted(pinned_validation)
-        selected = [row for group in selected_groups for row in groups[group]]
-        if len(selected_groups) > target_groups:
-            raise ValueError("Existing reviewed validation groups exceed the requested target.")
-        totals = Counter()
-        for rows in groups.values():
-            for row in rows:
-                totals.update(row["coverage"]["counts"])
-        while len(selected_groups) < target_groups:
-            options = []
-            current_score = _coverage_score(selected, totals)
-            for group, rows in groups.items():
-                if group in selected_groups or group in pinned_train:
-                    continue
-                trial = [*selected, *rows]
-                # Keep most rare technique examples on the training side.
-                if any(sum(row["coverage"]["counts"][name] for row in trial) > max(20, .3 * totals[name]) for name in COVERAGE_TYPES if totals[name]):
-                    continue
-                improvement = _coverage_score(trial, totals) - current_score
-                excluded_fraction = sum(1 - row["proposedAudioSeconds"] / row["audioDurationSeconds"] for row in rows) / len(rows)
-                rarity_cost = sum(row["coverage"]["counts"][name] / max(1, totals[name]) for row in rows for name in COVERAGE_TYPES)
-                options.append((improvement / len(rows), -excluded_fraction, -rarity_cost, group))
-            if not options:
-                raise ValueError("Cannot fill the validation target while preserving groups, reviewed splits and training technique coverage; choose explicit IDs or a different target.")
-            chosen = max(options)[-1]
-            selected_groups.append(chosen)
-            selected.extend(groups[chosen])
+    indexed = {row["id"]: row for rows in groups.values() for row in rows}
+    if set(explicit_ids) - set(indexed):
+        raise ValueError("Explicit validation IDs include unknown or quarantined records.")
+    selected_groups = list(dict.fromkeys(indexed[identifier]["groupId"] for identifier in explicit_ids))
+    if set(selected_groups) & pinned_train or pinned_validation - set(selected_groups):
+        raise ValueError("Validation selection conflicts with existing reviewed split constraints.")
     validation = [row for group in selected_groups for row in groups[group]]
     training = [row for group, rows in groups.items() if group not in selected_groups for row in rows]
     if not validation or not training:
@@ -271,7 +218,7 @@ def render_proposal(document):
         "| --- | ---: | ---: | ---: | ---: |",
         *[f"| {name} | {counts['train']['uniqueEventCounts'].get(name, 0)} | {counts['validation']['uniqueEventCounts'].get(name, 0)} | {counts['train']['recordingsWithTechnique'].get(name, '-')} | {counts['validation']['recordingsWithTechnique'].get(name, '-')} |" for name in ("notes", *COVERAGE_TYPES)],
         "", "## Validation selection", "",
-        "Each relationship group stays entirely in one split. Existing reviewed split assignments are retained; selection aims for class coverage and variation, not a calibrated generalization guarantee.", "",
+        "User-selected validation IDs include their complete relationship groups. Existing reviewed split assignments are retained.", "",
         "| Recording | ID | Minutes | Wrist | Thumb | Generic | Harmonics |",
         "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
     ]
@@ -287,7 +234,7 @@ def render_proposal(document):
         "", "## Decisions before release", "",
         *[f"- {decision}" for decision in document["requiredDecisions"]],
         "", "Localized timing flags are excluded with a half-second guard. Unbounded/rejected timing is quarantined rather than guessed. Unmapped score/audio tails are not extrapolated. Existing reviewed pilot ranges are retained without enlargement.", "",
-        "Low matching cost and the absence of a diagnostic flag are not manual timing approval. The proposed interpolation must be explicitly accepted for these experimental ranges before it can become training data. No requirement to repeat completed trims or audition four cues for every file is implied.", "",
+        "Review the proposed alignment and ranges before release.", "",
         "The accompanying JSON contains every included recording's exact sample windows, ranges, local exclusions, grouping and input hashes. It is not a trainer manifest. Keep both files private.", "",
     ])
     if document["coverageWarnings"]:
@@ -295,7 +242,7 @@ def render_proposal(document):
     return "\n".join(lines)
 
 
-def propose_dataset(workspace, name, *, validation_group_count=10, validation_ids=None, progress=None):
+def propose_dataset(workspace, name, *, validation_ids, progress=None):
     from .prepare_training_data import load_pairs, regular_path, safe_id, write_json, write_bytes
 
     workspace = Path(workspace).resolve()
@@ -313,7 +260,7 @@ def propose_dataset(workspace, name, *, validation_group_count=10, validation_id
         profiles.append(row)
         if progress is not None and (index == 0 or (index + 1) % 20 == 0 or index + 1 == len(pairs)):
             progress(f"Proposal: inspected {index + 1}/{len(pairs)} pairs.")
-    validation_groups = select_validation(profiles, validation_group_count, validation_ids)
+    validation_groups = select_validation(profiles, validation_ids)
     entries, quarantine = [], []
     for row in profiles:
         if row["status"] != "proposed":
@@ -347,8 +294,7 @@ def propose_dataset(workspace, name, *, validation_group_count=10, validation_id
     document = {
         "schemaVersion": 1, "kind": "training-dataset-proposal", "name": name,
         "trainingReady": False, "visibility": "private", "distributionAuthorized": False,
-        "validationGroups": validation_groups, "validationGroupTarget": validation_group_count,
-        "selectionPolicy": "Deterministic greedy coverage of four technique types, performer/tuning/meter/voice variation, existing reviewed split constraints and whole-group isolation. Automatic selection limits each validation technique count to max(20,30% of the available total) to retain training examples; explicit IDs can override selection, never source/group approval.",
+        "validationGroups": validation_groups,
         "guardSeconds": GUARD_SECONDS, "splitSummary": summaries, "entries": entries, "quarantined": quarantine,
         "coverageWarnings": warnings,
         "requiredDecisions": [
@@ -358,7 +304,7 @@ def propose_dataset(workspace, name, *, validation_group_count=10, validation_id
             "Accept the listed localized exclusions and quarantine; any changed source, range, split or rule requires a new bound proposal.",
         ],
         "sourceRegistrySha256": registry_hash, "implementationSha256": implementation,
-        "trainingExecution": "explicit-command", "finalTestSet": False,
+        "finalTestSet": False,
     }
     if sha256(registry_path) != registry_hash:
         raise ValueError("Pair registry changed during proposal generation.")
