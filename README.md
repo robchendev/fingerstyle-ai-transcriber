@@ -4,6 +4,18 @@ Turn fingerstyle guitar performances into editable Guitar Pro `.gp` drafts using
 
 Use trimmed local videos. Training also needs matching single-track, six-string scores in modern `.gp` format. For transcription, supply the tuning before applying a capo, capo fret, tempo, beat unit and time signature. Local recordings, scores and outputs are excluded from Git.
 
+## Demo
+
+Performance video, hand tracking and the audio/video features used by the model:
+
+![Performance video alongside hand tracking, video input values and audio features](docs/images/demo-analysis.png)
+
+Generated tablature for the same passage, starting at bar 25:
+
+![Model-generated notation and guitar tablature for bars 25 and 26](docs/images/demo-tablature.png)
+
+The bundled model in [`models/`](models/) struggles with complex melodies and was trained on a limited dataset. Training on a larger, high-quality dataset may improve results; see the [training guide](docs/TRAINING.md).
+
 ## Setup
 
 Use Python 3.12 and install FFmpeg/FFprobe on `PATH`. Run these commands from the repository root:
