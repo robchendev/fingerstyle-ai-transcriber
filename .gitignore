@@ -14,6 +14,8 @@ cache/
 *.flac
 *.m4a
 *.mp4
+!/docs/demo/analysis.mp4
+!/docs/demo/tablature.mp4
 *.mkv
 *.webm
 *.npz
