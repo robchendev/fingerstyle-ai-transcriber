@@ -3,9 +3,10 @@
 import argparse
 from collections import Counter
 from copy import deepcopy
-from dataclasses import asdict, fields
+from dataclasses import asdict, fields, replace
 from datetime import datetime
 import math
+import os
 from pathlib import Path
 import random
 import sys
@@ -19,7 +20,7 @@ from torch.utils.data import DataLoader
 
 from .dataset_io import ROOT, publish_json, read_json, sha256
 from .transcriber_audio import FeatureConfig, HarnessError, audio_features, conditioning_features, read_audio_window
-from .transcriber_data import EpochShuffleSampler, TrainingDataset, collate_windows
+from .transcriber_data import PAIRED_TECHNIQUE_TARGET_POLICY, EpochShuffleSampler, TrainingDataset, collate_windows
 
 
 def private_output(path, root=ROOT):
@@ -38,7 +39,7 @@ def default_config():
     return {
         "schemaVersion": 1, "features": asdict(FeatureConfig()), "model": asdict(ModelConfig(architecture_version=4)),
         "training": asdict(TrainingConfig()),
-        "data": {"manifest": "data\\releases\\dataset-v1\\manifest.json", "batch_size": 4, "num_workers": 0, "num_threads": 4, "cache": "cache\\transcriber"},
+        "data": {"manifest": "data\\releases\\dataset-v1\\manifest.json", "batch_size": 4, "num_workers": 0, "num_threads": max(1, min(32, (os.cpu_count() or 1) * 3 // 4)), "cache": "cache\\transcriber"},
     }
 
 
@@ -46,7 +47,8 @@ def load_config(path=None):
     from .transcriber_model import ModelConfig
     from .transcriber_runtime import TrainingConfig
     config = read_json(Path(path)) if path else default_config()
-    if not isinstance(config, dict) or type(config.get("schemaVersion")) is not int or config["schemaVersion"] != 1 or set(config) != {"schemaVersion", "features", "model", "training", "data"}:
+    required = {"schemaVersion", "features", "model", "training", "data"}
+    if not isinstance(config, dict) or type(config.get("schemaVersion")) is not int or config["schemaVersion"] != 1 or not required <= config.keys() or config.keys() - required - {"video"}:
         raise HarnessError("Expected version-1 harness configuration.")
     instances = []
     for key, cls in (("features", FeatureConfig), ("model", ModelConfig), ("training", TrainingConfig)):
@@ -64,6 +66,11 @@ def load_config(path=None):
         raise HarnessError("Manifest and cache paths must be explicit strings.")
     if instances[0].n_mels != instances[1].n_mels or instances[1].conditioning_dim != 12:
         raise HarnessError("Feature and model dimensions disagree.")
+    if "video" in config:
+        video = config["video"]
+        if not isinstance(video, dict) or set(video) != {"index", "model"} or not isinstance(video["index"], str) or not video["index"].strip() or not isinstance(video["model"], dict):
+            raise HarnessError("Video configuration requires an explicit paired index and model configuration.")
+        video_model_config(video["model"])
     return config, *instances
 
 
@@ -79,7 +86,28 @@ def make_dataset(config, feature_config, model_config, split, root, manifest_ove
     manifest = Path(manifest_override or config["data"]["manifest"])
     if not manifest.is_absolute():
         manifest = Path(root) / manifest
-    return TrainingDataset(manifest, split, feature_config, model_config, root=root, cache_dir=private_output(config["data"]["cache"], root))
+    kwargs = {}
+    if "video" in config:
+        index = Path(config["video"]["index"])
+        kwargs["video_index_path"] = index if index.is_absolute() else Path(root) / index
+    dataset = TrainingDataset(manifest, split, feature_config, model_config, root=root, cache_dir=private_output(config["data"]["cache"], root), **kwargs)
+    if "video" in config:
+        indices = dataset.video_paired_window_indices
+        if not indices:
+            raise HarnessError(f"No source-bound prepared paired windows are available in the {split} split.")
+        dataset.video_coverage = {
+            "releaseWindows": len(dataset.windows), "pairedWindows": len(indices), "releaseRecordings": len(dataset.records),
+            "selectionPolicy": "Indexed recordings and windows overlapping prepared clips only; supervision outside prepared intervals masked; local tracking gaps retain audio/GP supervision.",
+            **dataset.video_paired_coverage,
+        }
+        dataset.windows = [dataset.windows[index] for index in indices]
+        paired_records = {id(record) for record, _ in dataset.windows}
+        dataset.records = [record for record in dataset.records if id(record) in paired_records]
+        dataset.paired_only = True
+        dataset.video_coverage["pairedRecordings"] = len(dataset.records)
+        dataset.video_coverage["excludedWindows"] = dataset.video_coverage["releaseWindows"] - len(indices)
+        dataset.video_coverage["excludedRecordings"] = dataset.video_coverage["releaseRecordings"] - len(dataset.records)
+    return dataset
 
 
 def make_loader(dataset, config, training, *, shuffle):
@@ -97,8 +125,9 @@ def run_identity(dataset, config, features, model, training, device):
     settings = asdict(training)
     settings.pop("epochs", None)
     settings.pop("max_steps", None)
+    settings.pop("max_seconds", None)
     modules = ("transcriber.py", "transcriber_audio.py", "transcriber_data.py", "transcriber_model.py", "transcriber_runtime.py", "transcriber_events.py", "technique_supervision.py", "connection_supervision.py", "dataset_release.py", "training_windows.py", "score_alignment.py", "dataset_io.py", "canonical_events.py", "gp_events.py", "inspect_gp_files.py", "settings.py")
-    return {
+    result = {
         "schemaVersion": 1, "manifest_sha256": dataset.manifest_sha256,
         "features": asdict(features), "model": asdict(model), "training": settings,
         "techniqueSupervisionVersion": SUPERVISION_VERSION if model.architecture_version >= 4 else f"historical-architecture-v{model.architecture_version}",
@@ -107,39 +136,155 @@ def run_identity(dataset, config, features, model, training, device):
         "runtime": {"torch": str(torch.__version__), "numpy": np.__version__, "scipy": scipy.__version__, "soundfile": sf.__version__},
         "dataPolicy": "private-approved-training-release; no source legends or presentation settings as model inputs",
     }
+    if "video" in config:
+        from .transcriber_video import VideoConfig
+
+        result["video"] = {"config": asdict(VideoConfig(**config["video"]["model"])), "data": dataset.video_identity}
+        result["video"]["windowPolicy"] = "indexed-prepared-intervals-retain-tracking-gaps-v1"
+        result["initialization"] = {
+            "kind": "joint-audio-numeric-video-from-scratch",
+            "audioParametersFrozen": False, "optimizerStateImported": False,
+        }
+        for name in ("transcriber_video.py", "paired_video.py", "video_features.py"):
+            result["implementationSha256"][name] = sha256(Path(__file__).with_name(name))
+    return result
+
+
+def video_model_config(values):
+    from .transcriber_video import VideoConfig
+    from .video_features import SCHEMA_VERSION, STRUCTURED_DIM
+
+    if not isinstance(values, dict) or values.keys() - {field.name for field in fields(VideoConfig)}:
+        raise HarnessError("Unknown video model configuration fields. Only numeric landmark/motion/geometry inputs are supported, not RGB checkpoints.")
+    if values.get("architecture_version") != 4 or values.get("input_schema_version") != SCHEMA_VERSION:
+        raise HarnessError("Paired models require explicit joint video architecture_version 4 and input_schema_version 4; historical, frozen or unversioned paired configurations cannot be resumed or reinterpreted.")
+    if values.get("structured_dim") != STRUCTURED_DIM:
+        raise HarnessError(f"Paired models require structured_dim {STRUCTURED_DIM} with four guitar-hand-coarse views; historical configurations cannot be reinterpreted.")
+    return VideoConfig(**values)
+
+
+def _wrap_video_model(model, config):
+    if "video" not in config:
+        return model
+    from .transcriber_video import AudioVideoTranscriber
+
+    return AudioVideoTranscriber(model, video_model_config(config["video"]["model"]))
 
 
 def preflight(args):
     from .transcriber_model import FingerstyleTranscriber
+    from .transcriber_runtime import _progress_due, format_duration
+
+    log_progress("Preflight: loading configuration...")
     config, features, model_config, training = load_config(args.config)
     torch.set_num_threads(config["data"]["num_threads"])
     seed_everything(training.seed)
+    log_progress(f"Preflight: configuration loaded | CPU threads {config['data']['num_threads']} | no training.")
+    if getattr(args, "audio_checkpoint", None):
+        raise HarnessError("--audio-checkpoint is obsolete: paired preflight uses a fresh joint model, without loading trained weights.")
+    if args.forward:
+        log_progress("Preflight: initializing untrained acoustic model...")
     model = FingerstyleTranscriber(model_config).eval() if args.forward else None
     report = {"schemaVersion": 1, "kind": "transcriber-preflight", "trainingRun": False, "weights": "untrained-in-memory-only" if model else "not-created", "splits": {}}
+    initialized = False
     for split in ("train", "validation"):
+        log_progress(f"Preflight {split}: loading data and verifying input identities...")
         dataset = make_dataset(config, features, model_config, split, args.data_root, args.manifest)
+        log_progress(f"Preflight {split}: loaded {len(dataset)} windows.")
+        if model is not None and not initialized:
+            log_progress("Preflight: preparing the forward-pass model...")
+            model = _wrap_video_model(model, config).eval()
+            initialized = True
+            log_progress("Preflight: model ready.")
         counts = Counter()
+        target_counts = Counter()
+        paired_target_counts = Counter()
         first = None
+        started = last_log = time.perf_counter()
+        log_progress(f"Preflight {split}: scanning features, targets and masks...")
         for item in dataset:
             if first is None:
                 first = item
             counts["windows"] += 1
             counts["frames"] += len(item["features"])
             counts["collisions_masked"] += item["metadata"]["stringFrameCollisionsMasked"]
+            if "video" in item:
+                counts["video_frames"] += len(item["video"]["structured"])
+                counts["video_available_view_frames"] += int(item["video"]["structured_available"].any(-1).sum())
+                counts["audio_frames_with_video"] += int((item["video"]["frame_indices"] >= 0).sum())
+                observed = bool((item["video"]["frame_indices"] >= 0).any())
+                counts["windows_with_observed_video"] += int(observed)
+                counts["tracking_gap_only_windows"] += int(not observed)
+                counts["structured_available_values"] += int(item["video"]["structured_available"].sum())
+                counts["structured_available_view_frames"] += int(item["video"]["structured_available"].any(-1).sum())
+                from .technique_supervision import TECHNIQUE_TYPES
+                from .transcriber_model import PERCUSSION_TYPES
+
+                video = item["video"]
+                availability = video["structured_available"]
+                guitar_observed = availability[:, :, :42].any(-1) | availability[:, :, 84:98].any(-1)
+                hand_observed = availability[:, :, 98:140].any(-1) | availability[:, :, 184:186].any(-1)
+                counts["guitar_relative_observation_view_frames"] += int(guitar_observed.sum())
+                counts["independent_hand_observation_view_frames"] += int(hand_observed.sum())
+                counts["unassigned_hand_observation_view_frames"] += int(hand_observed[:, 2:].sum())
+                indices = video["frame_indices"]
+                safe_indices = indices.clamp_min(0)
+                view_available = video["structured_available"].any(-1)
+                plucking = (indices >= 0) & view_available[safe_indices, 1] & video["technique_available"][safe_indices]
+                for task, names in (("technique", TECHNIQUE_TYPES), ("percussion", PERCUSSION_TYPES)):
+                    if task not in item["targets"]:
+                        continue
+                    for axis, name in enumerate(names):
+                        positive = (item["targets"][task][:, axis] > .5) & item["masks"][task][:, axis]
+                        target_counts[name] += int(positive.sum())
+                        paired_target_counts[name] += int((positive & plucking).sum())
             for name, mask in item["masks"].items():
                 counts[f"supervised_{name}"] += int(mask.sum())
+            now = time.perf_counter()
+            if _progress_due(counts["windows"], len(dataset), now, last_log):
+                log_progress(f"Preflight {split}: windows {counts['windows']}/{len(dataset)} | frames {counts['frames']} | elapsed {format_duration(now - started)}")
+                last_log = now
+        log_progress(f"Preflight {split}: feature/target scan completed.")
         row = dict(counts)
+        if "video" in config:
+            row["videoCoverage"] = dataset.video_coverage
+            if dataset.video_coverage["audioFramesWithUsableVideo"] == 0:
+                report.setdefault("warnings", []).append(f"{split}: prepared paired coverage contains no usable numeric video on acoustic frames; local gaps remain supervised, but an entirely missing-visual training split cannot start joint training.")
+                log_progress(f"Preflight warning: {report['warnings'][-1]}")
+            row["positiveTargetFrames"] = dict(target_counts)
+            row["positiveTargetFramesWithUsablePluckingVideo"] = dict(paired_target_counts)
+            if "videoIdentity" in report and report["videoIdentity"] != dataset.video_identity:
+                raise HarnessError("Video inputs changed between preflight splits.")
+            report["videoIdentity"] = dataset.video_identity
+            report["targetPolicy"] = "Existing frozen canonical GP supervision only. Frame counts include repeated overlapping windows. Arpeggio is finger-roll notation; brush strokes are not silently relabeled as compound rasgueados. No heuristic detector labels enter targets."
         if model is not None:
+            log_progress(f"Preflight {split}: running no-gradient forward pass...")
             batch = collate_windows([first])
             with torch.no_grad():
-                outputs = model(batch["features"], batch["conditioning"], batch["lengths"])
+                if "video" in batch:
+                    outputs = model(batch["features"], batch["conditioning"], batch["lengths"], video=batch["video"])
+                else:
+                    outputs = model(batch["features"], batch["conditioning"], batch["lengths"])
             if not all(torch.isfinite(value).all() for value in outputs.values()):
                 raise HarnessError("Model forward produced nonfinite output.")
             row["forwardShapes"] = {name: list(value.shape) for name, value in outputs.items()}
+            log_progress(f"Preflight {split}: forward pass completed; outputs are finite.")
         report["splits"][split] = row
         report["manifestSha256"] = dataset.manifest_sha256
-    publish_json(private_output(args.output, args.data_root), report)
-    print({"preflight": "completed", "windows": {key: value["windows"] for key, value in report["splits"].items()}, "trainingRun": False})
+        log_progress(f"Preflight {split}: completed.")
+    if "video" in config:
+        report["implementationSha256"] = {
+            name: sha256(Path(__file__).with_name(name))
+            for name in ("transcriber.py", "transcriber_data.py", "paired_video.py", "video_features.py", "transcriber_video.py", "transcriber_model.py", "transcriber_runtime.py", "transcriber_events.py")
+        }
+        report["videoInputs"] = "Numeric guitar-relative observations, independently available local hand positions/motion/orientation and coarse instrument-context evidence with masks; no RGB neural-network inputs or heuristic technique labels. Coarse coverage is reported by the dataset in videoCoverage, not absolute fret/contact accuracy. Unassigned hands are not known plucking-technique evidence."
+        report["initialization"] = "joint-audio-numeric-video-from-scratch"
+        report["optimization"] = "One optimizer trains acoustic, numeric-video and fusion parameters together; preflight performs no optimizer updates."
+    output_path = private_output(args.output, args.data_root)
+    log_progress(f"Preflight: saving report to {output_path}...")
+    publish_json(output_path, report)
+    log_progress("Preflight: report saved.")
+    print({"preflight": "completed", "windows": {key: value["windows"] for key, value in report["splits"].items()}, "trainingRun": False}, flush=True)
     return report
 
 
@@ -151,15 +296,25 @@ def print_training_summary(result, summary_path):
     from .transcriber_runtime import format_duration
 
     records, windows = result["dataset_recordings"], result["dataset_windows"]
+    step_summary = f"  Optimizer steps: {result['training_steps_processed']} this invocation; {result['global_step']} total"
+    if "optimizer_updates" in result:
+        step_summary = (
+            f"  Consumed training batches: {result['training_steps_processed']} this invocation; {result['global_step']} total"
+            f" | optimizer updates this invocation: {result['optimizer_updates']}"
+            f" | skipped updates: {result['optimizer_skipped_batches']}"
+        )
+    validation, best = result.get("validation"), result.get("best_score")
+    validation_text = f"{validation['loss']:.6f}" if validation is not None else "not completed"
+    best_text = f"{best:.6f}" if best is not None else "not selected"
     lines = [
         "", "Training summary",
         f"  Total elapsed: {format_duration(result['elapsed_seconds'])} (setup {format_duration(result['setup_seconds'])}; training/validation {format_duration(result['training_elapsed_seconds'])})",
         f"  Dataset: {records['train']} training recordings / {windows['train']} windows; {records['validation']} validation recordings / {windows['validation']} windows",
         f"  Window visits this invocation: {result['training_windows_processed']} training; {result['validation_windows_processed']} validation (includes repeated passes)",
-        f"  Optimizer steps: {result['training_steps_processed']} this invocation; {result['global_step']} total",
+        step_summary,
         f"  Completed epochs: {result['epoch']}/{result['epochs_requested']} ({result['epochs_completed_this_run']} this invocation)",
         f"  Stopped by: {result['stopped_by']}",
-        f"  Validation loss: {result['validation']['loss']:.6f}; best {result['best_score']:.6f}",
+        f"  Last completed validation loss: {validation_text}; best {best_text}; validation pending: {result.get('validation_pending', False)}",
         f"  Latest checkpoint: {result['latest_checkpoint']}",
         f"  Best checkpoint: {result['best_checkpoint']}",
         f"  Saved summary: {summary_path}",
@@ -167,55 +322,138 @@ def print_training_summary(result, summary_path):
     if result.get("best_event_checkpoint"):
         lines.insert(-1, f"  Best decoded-event checkpoint: {result['best_event_checkpoint']} | score {result['best_event_score']:.6f}")
         lines.insert(4, f"  Additional decoded-event validation window visits: {result['event_validation_windows_processed']}")
+    if result.get("stopped_by") == "max_seconds":
+        lines.insert(-1, f"  Paused at wall-clock budget; native operations can overrun. Reported overrun: {result.get('budget_overrun_seconds', 0.):.3f}s")
+        if result.get("resume_action"):
+            lines.insert(-1, f"  {result['resume_action']}")
     print("\n".join(lines), flush=True)
 
 
 def train(args):
+    started = time.perf_counter()
+    from .transcriber_runtime import TrainingBudget, TrainingBudgetExpired, load_checkpoint
+
+    config, features, model_config, training = load_config(args.config)
+    max_hours = getattr(args, "max_hours", None)
+    if max_hours is not None:
+        training = replace(training, max_seconds=max_hours * 3600)
+        config = {**config, "training": asdict(training)}
+    budget = TrainingBudget(training.max_seconds, started_at=started)
+    if getattr(args, "audio_checkpoint", None):
+        raise HarnessError("--audio-checkpoint is obsolete: paired training initializes acoustic, numeric-video and fusion weights together from scratch.")
+    if "video" not in config and not args.resume:
+        raise HarnessError("Fresh training is joint-only and requires a numeric paired video index. Create the configuration with config --video-index INDEX; pure audio/GP training is not supported.")
+    if getattr(args, "initialize_from", None):
+        raise HarnessError("Joint paired training starts from scratch or resumes its own joint checkpoint; --initialize-from is not supported.")
+    checkpoint = load_checkpoint(args.resume) if args.resume else None
+    run_dir = private_output(args.run_dir, args.data_root)
+    if args.resume:
+        if Path(args.resume).absolute() != run_dir / "latest.pt":
+            raise HarnessError("Resume must use latest.pt from this exact run directory.")
+        if (run_dir / ".training.lock").exists():
+            raise HarnessError("This training run is locked; do not replace its summary while another trainer may be running.")
+    elif run_dir.exists() and (not run_dir.is_dir() or any(run_dir.iterdir())):
+        raise HarnessError("A fresh run directory must be absent or empty. A setup-only budget pause has no checkpoint: use a new empty run directory.")
+    try:
+        budget.check()
+        result = _train_with_budget(args, config, features, model_config, training, run_dir, budget)
+    except TrainingBudgetExpired:
+        cursor = checkpoint["cursor"] if checkpoint else {"epoch": 0, "next_batch_index": 0, "global_step": 0}
+        history = checkpoint["history"] if checkpoint else []
+        counts = checkpoint.get("resume_state", history[-1] if history else {}) if checkpoint else {}
+        result = {
+            "run_dir": str(run_dir), **cursor, **budget.report(),
+            "status": "paused", "stopped_by": "max_seconds", "training_started": False,
+            "training_elapsed_seconds": 0., "setup_seconds": time.perf_counter() - started,
+            "validation_pending": counts.get("validation_pending", not bool(history)),
+            "resume_phase": counts.get("phase", "setup"),
+            "best_score": checkpoint["best_score"] if checkpoint else None,
+            "validation": history[-1]["validation"] if history else None,
+            "latest_checkpoint": str(run_dir / "latest.pt") if checkpoint else None,
+            "best_checkpoint": str(run_dir / "best.pt") if history else None,
+            "best_event_checkpoint": None, "best_event_score": None,
+            "epochs_requested": training.epochs, "epochs_remaining": max(0, training.epochs - cursor["epoch"]),
+            "epochs_completed_this_run": 0, "training_steps_processed": 0,
+            "optimizer_updates": 0, "optimizer_skipped_batches": 0,
+            "total_optimizer_updates": counts.get("optimizer_updates", cursor["global_step"]),
+            "total_optimizer_skipped_batches": counts.get("optimizer_skipped_batches", 0),
+            "training_windows_processed": 0, "validation_windows_processed": 0, "event_validation_windows_processed": 0,
+            "dataset_recordings": {"train": None, "validation": None}, "dataset_windows": {"train": None, "validation": None},
+            "resume_action": "Resume the unchanged latest.pt with a fresh per-invocation budget." if checkpoint else "No model or optimizer was created. Restart with a larger budget in a new empty run directory; this setup-only summary is not a checkpoint.",
+        }
+        if checkpoint is None:
+            if run_dir.exists() and any(run_dir.iterdir()):
+                raise HarnessError("Fresh run directory became nonempty before budget-pause publication.")
+            run_dir.mkdir(parents=True, exist_ok=True)
+    result.update(budget.report())
+    summary_path = run_dir / "summary.json"
+    publish_json(summary_path, result)
+    print_training_summary(result, summary_path)
+    return result
+
+
+def _train_with_budget(args, config, features, model_config, training, run_dir, budget):
     from .transcriber_model import FingerstyleTranscriber
     from .transcriber_runtime import resolve_device, run_training
     from .transcriber_events import checkpoint_event_score, evaluate_events
-    started = time.perf_counter()
-    config, features, model_config, training = load_config(args.config)
     torch.set_num_threads(config["data"]["num_threads"])
     device = resolve_device(training.device)
     seed_everything(training.seed)
     step_cap = training.max_steps if training.max_steps is not None else "none"
     log_progress(f"Setup: device {device} | CPU threads {config['data']['num_threads']} | batch size {config['data']['batch_size']} | epochs {training.epochs} | step cap {step_cap}")
     log_progress("Loading training data...")
+    budget.check()
     train_data = make_dataset(config, features, model_config, "train", args.data_root, args.manifest)
+    budget.check()
     log_progress(f"Loaded {len(train_data)} training windows from {len(train_data.records)} recordings.")
+    if "video" in config and train_data.video_coverage["audioFramesWithUsableVideo"] == 0:
+        raise HarnessError("Joint training has no usable numeric video on any selected prepared training frame. Local tracking-gap windows are retained, but prepare or correct the missing visual inputs before starting a joint run.")
     log_progress("Loading validation data...")
     validation_data = make_dataset(config, features, model_config, "validation", args.data_root, args.manifest)
+    budget.check()
     log_progress(f"Loaded {len(validation_data)} validation windows from {len(validation_data.records)} recordings.")
+    if "video" in config and validation_data.video_coverage["audioFramesWithUsableVideo"] == 0:
+        log_progress("Warning: validation contains prepared paired footage but no usable numeric video; validation will exercise the learned audio-only path.")
     if train_data.manifest_sha256 != validation_data.manifest_sha256:
         raise HarnessError("Training and validation reference different releases.")
-    model = FingerstyleTranscriber(model_config)
+    if "video" in config and train_data.video_identity != validation_data.video_identity:
+        raise HarnessError("Training and validation reference different paired-video inputs.")
     identity = run_identity(train_data, config, features, model_config, training, device)
-    if args.initialize_from:
-        identity["initialization"] = initialize_model(
-            model, model_config, args.initialize_from, train_data.manifest_sha256,
-        )
-    run_dir = private_output(args.run_dir, args.data_root)
+    budget.check()
     train_loader = make_loader(train_data, config, training, shuffle=True)
     validation_loader = make_loader(validation_data, config, training, shuffle=False)
-    setup_seconds = time.perf_counter() - started
+    budget.check()
+    model = FingerstyleTranscriber(model_config)
+    if "video" in config:
+        model = _wrap_video_model(model, config)
+        log_progress("Joint acoustic/numeric-video/fusion optimization; all parameters trainable. " + ("Restoring exact joint run state." if args.resume else "All weights randomly initialized; no checkpoint imported."))
+        for split, dataset in (("train", train_data), ("validation", validation_data)):
+            coverage = dataset.video_coverage
+            log_progress(f"Paired {split}: {len(dataset)} windows; excluded {coverage['excludedWindows']} release windows and {coverage['excludedRecordings']} recordings outside the paired selection.")
+            log_progress(f"Visual {split}: {coverage['audioFramesWithUsableVideo']} usable-video acoustic frames / {coverage['preparedAudioFrames']} prepared acoustic frames; {coverage['trackingGapOnlyWindows']} tracking-gap-only windows retained.")
+    setup_seconds = time.perf_counter() - budget.started_at
+
+    def event_progress(message):
+        budget.check()
+        log_progress(message)
 
     def event_evaluator(current_model):
-        report = evaluate_events(current_model, validation_data, device, tolerances=(.1,), progress=log_progress)
+        report = evaluate_events(current_model, validation_data, device, tolerances=(.1,), progress=event_progress)
         return checkpoint_event_score(report)
 
     result = run_training(
         model, train_loader, validation_loader,
         training, run_dir, identity, resume=args.resume, progress=log_progress, event_evaluator=event_evaluator,
+        started_at=budget.started_at, deadline=budget.deadline,
     )
     result.update(
-        training_elapsed_seconds=result["elapsed_seconds"], elapsed_seconds=time.perf_counter() - started,
+        training_elapsed_seconds=result.get("training_elapsed_seconds", result["elapsed_seconds"]),
         setup_seconds=setup_seconds,
         dataset_recordings={"train": len(train_data.records), "validation": len(validation_data.records)},
     )
-    summary_path = run_dir / "summary.json"
-    publish_json(summary_path, result)
-    print_training_summary(result, summary_path)
+    if "video" in config:
+        result["videoCoverage"] = {"train": train_data.video_coverage, "validation": validation_data.video_coverage}
+        result["trainingMode"] = "joint-audio-numeric-video-from-scratch"
     return result
 
 
@@ -272,11 +510,29 @@ def checkpoint_model(path, device_name):
     checkpoint = load_checkpoint(path)
     if checkpoint["global_step"] <= 0:
         raise HarnessError("Inference/evaluation requires a checkpoint with actual training steps, not random initialization.")
+    counts = checkpoint.get("resume_state", checkpoint["history"][-1] if checkpoint["history"] else {})
+    if "video" in checkpoint["identity"] and counts.get("optimizer_updates") == 0:
+        raise HarnessError("Joint inference/evaluation requires actual optimizer updates, not only skipped batches.")
     identity = checkpoint["identity"]
     model = FingerstyleTranscriber(ModelConfig(**identity["model"]))
+    if "video" in identity:
+        model = _wrap_video_model(model, {"video": {"model": identity["video"]["config"]}})
     model.load_state_dict(checkpoint["model_state"], strict=True)
     device = resolve_device(device_name)
     return model.to(device).eval(), checkpoint, device
+
+
+def _evaluation_video_config(args, identity, config):
+    index = getattr(args, "video_index", None)
+    audio_only = getattr(args, "audio_only", False)
+    if index and audio_only:
+        raise HarnessError("Choose paired evaluation or --audio-only, not both.")
+    if index and "video" not in identity:
+        raise HarnessError("An audio-only checkpoint cannot consume video inputs.")
+    if "video" in identity and not index and not audio_only:
+        raise HarnessError("Paired checkpoint evaluation needs --video-index or explicit --audio-only.")
+    if index:
+        config["video"] = {"index": index, "model": identity["video"]["config"]}
 
 
 def evaluate(args):
@@ -285,15 +541,25 @@ def evaluate(args):
     model, checkpoint, device = checkpoint_model(args.checkpoint, args.device)
     identity = checkpoint["identity"]
     config = default_config()
+    _evaluation_video_config(args, identity, config)
     config["data"].update(batch_size=identity["batch_size"], num_workers=0)
     torch.set_num_threads(config["data"]["num_threads"])
     feature_config, model_config = FeatureConfig(**identity["features"]), ModelConfig(**identity["model"])
     training = TrainingConfig(**checkpoint["training_config"])
     dataset = make_dataset(config, feature_config, model_config, args.split, args.data_root, args.manifest)
+    if "video" in identity:
+        dataset.paired_technique_target_policy = PAIRED_TECHNIQUE_TARGET_POLICY
     if dataset.manifest_sha256 != identity["manifest_sha256"]:
         raise HarnessError("Evaluation release differs from this run; do not silently substitute a different split.")
     metrics = evaluate_model(model, make_loader(dataset, config, training, shuffle=False), device, sparsity_weight=training.sparsity_weight)
     report = {"schemaVersion": 1, "kind": "transcriber-evaluation", "split": args.split, "checkpointSha256": sha256(Path(args.checkpoint)), "manifestSha256": dataset.manifest_sha256, "metrics": metrics, "developmentOnly": True, "visibility": "private"}
+    if "video" in identity:
+        report["pairedVideo"] = {
+            "inputIdentity": dataset.video_identity if "video" in config else None,
+            "audioOnlyAblation": "video" not in config,
+            "targetPolicy": PAIRED_TECHNIQUE_TARGET_POLICY,
+            "evaluationCoverage": dataset.video_coverage if "video" in config else "full-requested-release-split",
+        }
     publish_json(private_output(args.output, args.data_root), report)
     print(metrics)
     return report
@@ -308,8 +574,11 @@ def evaluate_decoded_events(args):
     model, checkpoint, device = checkpoint_model(args.checkpoint, args.device)
     identity = checkpoint["identity"]
     config = default_config()
+    _evaluation_video_config(args, identity, config)
     torch.set_num_threads(config["data"]["num_threads"])
     dataset = make_dataset(config, FeatureConfig(**identity["features"]), ModelConfig(**identity["model"]), args.split, args.data_root, args.manifest)
+    if "video" in identity:
+        dataset.paired_technique_target_policy = PAIRED_TECHNIQUE_TARGET_POLICY
     report = evaluate_events(
         model, dataset, device, tolerances=args.tolerances, onset_threshold=args.onset_threshold,
         percussion_threshold=args.percussion_threshold, technique_threshold=args.technique_threshold,
@@ -327,6 +596,13 @@ def evaluate_decoded_events(args):
         implementationSha256=implementation,
         runtime={"torch": str(torch.__version__), "numpy": np.__version__, "scipy": scipy.__version__, "soundfile": sf.__version__},
     )
+    if "video" in identity:
+        report["pairedVideo"] = {
+            "inputIdentity": dataset.video_identity if "video" in config else None,
+            "audioOnlyAblation": "video" not in config,
+            "targetPolicy": PAIRED_TECHNIQUE_TARGET_POLICY,
+            "evaluationCoverage": dataset.video_coverage if "video" in config else "full-requested-release-split",
+        }
     output_path = private_output(args.output, args.data_root)
     publish_json(output_path, report)
     print("Decoded-event evaluation (masked coverage)")
@@ -387,6 +663,13 @@ def infer(args):
     duration = info.frames / info.samplerate
     if not 0 < duration <= 900 or not 1 <= info.channels <= 8:
         raise HarnessError("Inference audio must be nonempty, at most 15 minutes, and have one to eight channels.")
+    video_bundle = None
+    if getattr(args, "video_bundle", None):
+        if "video" not in checkpoint["identity"]:
+            raise HarnessError("--video-bundle requires a paired-video checkpoint.")
+        from .paired_video import load_inference_video
+
+        video_bundle = load_inference_video(args.video_bundle, audio_hash)
     total_frames = math.ceil(duration / config.hop_seconds)
     frame_times = np.arange(total_frames) * config.hop_seconds
     timeline = OutputTimeline(frame_times)
@@ -402,7 +685,11 @@ def infer(args):
             features, local_times = audio_features(samples, rate, config)
             times = local_times + start_sample / rate
             conditioning = conditioning_features(metadata["openStringMidi"], metadata["capoFret"], tempos, meters, times)
-            outputs = model(features[None].to(device), conditioning[None].to(device), torch.tensor([len(features)], dtype=torch.long))
+            if video_bundle is not None:
+                video = {name: value.unsqueeze(0).to(device) for name, value in video_bundle.window(times).items()}
+                outputs = model(features[None].to(device), conditioning[None].to(device), torch.tensor([len(features)], dtype=torch.long), video=video)
+            else:
+                outputs = model(features[None].to(device), conditioning[None].to(device), torch.tensor([len(features)], dtype=torch.long))
             count = min(len(features), total_frames - start_frame)
             timeline.add({name: value[0, :count] for name, value in outputs.items()}, times[:count], stop_sample / rate)
             if start_frame + count == total_frames:
@@ -411,6 +698,8 @@ def infer(args):
         raise HarnessError("Input audio is silent; no transcription hypotheses were published.")
     if sha256(audio_path) != audio_hash:
         raise HarnessError("Audio changed during inference.")
+    if video_bundle is not None:
+        video_bundle.check_unchanged()
     events = decode_events(
         timeline.finish(), torch.tensor(frame_times), tuning=metadata["openStringMidi"], capo=metadata["capoFret"],
         onset_threshold=args.onset_threshold, percussion_threshold=args.percussion_threshold,
@@ -427,6 +716,8 @@ def infer(args):
         "gpWriterImplemented": True, "gpWrittenByThisCommand": False, "modelTrainingPerformedByThisCommand": False,
         **events,
     }
+    if "video" in checkpoint["identity"]:
+        report["pairedVideo"] = {"provided": video_bundle is not None, "inputIdentity": video_bundle.identity if video_bundle is not None else None, "audioOnlyFallback": video_bundle is None, "architectureVersion": model.video_config.architecture_version, "inputSchemaVersion": model.video_config.input_schema_version, "featureDimension": model.video_config.structured_dim, "audioOnlyPolicy": "jointly-learned-audio-path"}
     publish_json(private_output(args.output, args.data_root), report)
     print({"notes": len(report["notes"]), "percussionHypotheses": len(report["percussion"]), "gpWritten": False})
     return report
@@ -438,13 +729,25 @@ def export_gp(args):
 
     predictions_path = Path(args.predictions).resolve()
     predictions = read_json(predictions_path)
+    playing_beat_identity = sha256(Path(args.beat_evidence).resolve()) if args.playing_evidence and args.beat_evidence else None
     beat_evidence = read_json(Path(args.beat_evidence).resolve()) if args.beat_evidence else None
+    if playing_beat_identity is not None and sha256(Path(args.beat_evidence).resolve()) != playing_beat_identity:
+        raise HarnessError("Beat evidence changed while loading playing-evidence score timing.")
     full_path = private_output(args.full_output, args.data_root)
     single_path = private_output(args.single_output, args.data_root)
     if full_path.suffix.lower() != ".gp" or single_path.suffix.lower() != ".gp" or full_path == single_path:
         raise HarnessError("GP outputs require two different .gp paths under the private runs directory.")
     before = sha256(predictions_path)
     hand_evidence_identity = None
+    playing_options = {}
+    if args.playing_evidence:
+        from .playing_evidence import load_playing_evidence
+
+        if args.hand_position_evidence or "handPositionEvidence" in predictions:
+            raise HarnessError("Playing evidence conflicts with hand-position evidence; do not silently replace it.")
+        if not args.beat_evidence:
+            raise HarnessError("Playing evidence requires --beat-evidence for the exact exported score timing.")
+        playing_options["playing_evidence"] = load_playing_evidence(Path(args.playing_evidence).resolve(), predictions)
     if args.hand_position_evidence:
         if not args.beat_evidence:
             raise HarnessError("Hand-position evidence requires the exact beat-evidence file used for score timing.")
@@ -486,6 +789,7 @@ def export_gp(args):
     profile = DraftProfile(
         note_threshold=args.draft_note_threshold,
         percussion_threshold=args.draft_percussion_threshold,
+        thumb_slap_threshold=args.thumb_slap_threshold,
         harmonic_threshold=args.draft_harmonic_threshold,
         include_harmonics=args.include_harmonics,
         brush_threshold=args.brush_threshold,
@@ -501,6 +805,8 @@ def export_gp(args):
         grace_threshold=args.grace_threshold,
         chord_tolerance_seconds=args.chord_tolerance,
         same_string_gap_seconds=args.same_string_gap,
+        strict_note_confidence=args.strict_note_confidence,
+        rhythm_policy=args.rhythm_policy,
     )
     arranger = arranger_identity = None
     if args.fingering_arranger:
@@ -525,9 +831,13 @@ def export_gp(args):
         beat_evidence=beat_evidence, include_unsupported_tail=args.include_beat_unsupported_tail,
         arranger=arranger, completer=completer, completion_threshold=args.symbolic_completion_threshold,
         completion_technique_threshold=args.symbolic_completion_technique_threshold,
+        progress=log_progress,
+        **playing_options,
     )
     if sha256(predictions_path) != before:
         raise HarnessError("Prediction hypotheses changed during GP export.")
+    if args.playing_evidence:
+        report["playingEvidence"]["input"]["beatEvidenceSha256"] = playing_beat_identity
     report.update(
         visibility="private",
         predictionsSha256=before,
@@ -539,6 +849,7 @@ def export_gp(args):
     )
     report_path = private_output(args.report, args.data_root)
     publish_json(report_path, report)
+    log_progress(f"GP export: report saved: {report_path}")
     print({
         "fullVoices": str(full_path),
         "singleVoice": str(single_path),
@@ -564,11 +875,44 @@ def analyze_beats(args):
     return report
 
 
-def main(argv=None):
+DRAFT_CLI_NAMES = {"note_threshold": "draft-note-threshold", "percussion_threshold": "draft-percussion-threshold",
+                   "harmonic_threshold": "draft-harmonic-threshold", "chord_tolerance_seconds": "chord-tolerance",
+                   "same_string_gap_seconds": "same-string-gap"}
+
+
+def draft_cli_values(args):
+    from .draft_cleanup import DraftProfile
+
+    values = {field.name: getattr(args, DRAFT_CLI_NAMES.get(field.name, field.name.replace("_", "-")).replace("-", "_"))
+              for field in fields(DraftProfile)}
+    DraftProfile(**values)
+    return {DRAFT_CLI_NAMES.get(name, name.replace("_", "-")): value for name, value in values.items()}
+
+
+def add_draft_arguments(parser):
+    from .draft_cleanup import DraftProfile
+
+    for name, value in asdict(DraftProfile()).items():
+        flag = "--" + DRAFT_CLI_NAMES.get(name, name.replace("_", "-"))
+        if isinstance(value, bool):
+            parser.add_argument(flag, action="store_true", help={
+                "strict_note_confidence": "Apply the note threshold to every note, including technique-completed chord members.",
+                "include_harmonics": "Include consistency-gated harmonic guesses; disabled by default.",
+            }[name])
+        elif name == "rhythm_policy":
+            parser.add_argument(flag, choices=("adaptive", "fingerstyle"), default=value,
+                                help="fingerstyle uses ordinary binary16ths or coarser and reserves32nds for supported downstroke figures; adaptive also allows tuplets.")
+        else:
+            parser.add_argument(flag, type=float, default=value)
+
+
+def argument_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    configure = commands.add_parser("config", help="Write a generic local configuration.")
+    configure = commands.add_parser("config", help="Write a local configuration; fresh training requires --video-index.")
     configure.add_argument("--output", default="runs/config.json")
+    configure.add_argument("--video-index", help="Source-bound numeric paired index for fresh joint acoustic/video/fusion training (default acoustic architecture v4); no audio checkpoint.")
+    configure.add_argument("--manifest", help="Exact release for --video-index when an existing schema-2 index lacks manifestPath; its hash must match.")
     for name in ("preflight", "train", "evaluate", "evaluate-events"):
         command = commands.add_parser(name)
         command.add_argument("--data-root", default=str(ROOT))
@@ -580,14 +924,16 @@ def main(argv=None):
             command.add_argument("--forward", action="store_true", help="One untrained eval-mode forward per split; no optimizer or checkpoint.")
         elif name == "train":
             command.add_argument("--run-dir", required=True)
-            start = command.add_mutually_exclusive_group()
-            start.add_argument("--resume")
-            start.add_argument("--initialize-from", help="Initialize a new model (including v2/v3 to corrected v4); optimizer/RNG/history are never resumed.")
+            command.add_argument("--resume", help="Exact resume from this run's latest.pt; never converts a historical acoustic run into a joint run.")
+            command.add_argument("--max-hours", type=float, help="Optional explicit override of training.max_seconds. Default configs have no time limit. Includes setup, validation and checkpoint I/O; cooperatively pauses at safe boundaries. Native operations can overrun.")
         else:
             command.add_argument("--checkpoint", required=True)
             command.add_argument("--split", choices=("train", "validation"), default="validation")
             command.add_argument("--device", default="auto")
             command.add_argument("--output", default="runs/event-evaluation.json" if name == "evaluate-events" else "runs/evaluation.json")
+            video_evaluation = command.add_mutually_exclusive_group()
+            video_evaluation.add_argument("--video-index", help="Paired evaluation using the existing release splits.")
+            video_evaluation.add_argument("--audio-only", action="store_true", help="Evaluate the joint checkpoint's learned audio-only path without video.")
             if name == "evaluate-events":
                 command.add_argument("--tolerances", nargs="+", type=float, default=[.05, .1, .2])
                 command.add_argument("--onset-threshold", type=float, default=.5)
@@ -603,6 +949,7 @@ def main(argv=None):
     inference.add_argument("--metadata", required=True)
     inference.add_argument("--output", default="runs/predictions.json")
     inference.add_argument("--device", default="auto")
+    inference.add_argument("--video-bundle", help="Optional source/audio-bound numeric landmarks, motion and guitar-geometry bundle for a joint checkpoint; omitted uses its jointly learned audio-only path.")
     inference.add_argument("--onset-threshold", type=float, default=.5)
     inference.add_argument("--percussion-threshold", type=float, default=.5)
     inference.add_argument("--technique-threshold", type=float, default=.5)
@@ -621,35 +968,50 @@ def main(argv=None):
     export.add_argument("--beat-evidence", help="Private analyze-beats output for beat-anchored constrained rhythm inference.")
     export.add_argument("--fingering-arranger", help="Optional trained symbolic arranger checkpoint; training is a separate human-owner command.")
     export.add_argument("--hand-position-evidence", help="Optional audio/beat-hash-bound visual or explicitly labeled reference-oracle hand-position sidecar.")
+    export.add_argument("--playing-evidence", help="Optional private guitar-playing-evidence report; requires --beat-evidence. Soft fret ranges only; gesture hypotheses are reported, never encoded automatically.")
     export.add_argument("--symbolic-completer", help="Optional GP-trained missing-onset/chord checkpoint; training is a separate human-owner command.")
     export.add_argument("--symbolic-completion-threshold", type=float, default=.8)
     export.add_argument("--symbolic-completion-technique-threshold", type=float, default=.8)
     export.add_argument("--full-output", default="runs/transcription.full-voices.gp")
     export.add_argument("--single-output", default="runs/transcription.single-voice.gp")
     export.add_argument("--report", default="runs/gp-output.json")
-    export.add_argument("--draft-note-threshold", type=float, default=.9)
-    export.add_argument("--draft-percussion-threshold", type=float, default=.6)
-    export.add_argument("--draft-harmonic-threshold", type=float, default=.8)
-    export.add_argument("--include-harmonics", action="store_true", help="Export consistency-gated harmonic guesses; disabled by default because the positive-only harmonic head is uncalibrated.")
-    export.add_argument("--brush-threshold", type=float, default=.9)
-    export.add_argument("--arpeggio-threshold", type=float, default=.925)
-    export.add_argument("--pick-stroke-threshold", type=float, default=.8)
-    export.add_argument("--rasgueado-threshold", type=float, default=.99)
-    export.add_argument("--brush-membership-threshold", type=float, default=.6)
-    export.add_argument("--arpeggio-membership-threshold", type=float, default=.5)
-    export.add_argument("--pick-stroke-membership-threshold", type=float, default=.7)
-    export.add_argument("--rasgueado-membership-threshold", type=float, default=.8)
-    export.add_argument("--connection-threshold", type=float, default=.8)
-    export.add_argument("--note-technique-threshold", type=float, default=.8)
-    export.add_argument("--grace-threshold", type=float, default=.8, help="Minimum presence and attribute confidence for anchored grace notation.")
-    export.add_argument("--chord-tolerance", type=float, default=.04)
-    export.add_argument("--same-string-gap", type=float, default=0., help="Opt-in temporal suppression in seconds; zero preserves distinct reattacks.")
+    add_draft_arguments(export)
     export.add_argument("--include-beat-unsupported-tail", action="store_true", help="Keep attacks after the final detected beat using extrapolated timing; raw JSON always retains them.")
-    args = parser.parse_args(argv)
+    from .transcription_pipeline import add_commands
+
+    add_commands(commands)
+    return parser
+
+
+def main(argv=None):
+    args = argument_parser().parse_args(argv)
     try:
         if args.command == "config":
-            publish_json(private_output(args.output), default_config())
-            print("Generic configuration written under the private runs directory.")
+            log_progress("Configuration: creating defaults...")
+            config = default_config()
+            if args.video_index:
+                from .paired_video import index_manifest
+                from .transcriber_video import VideoConfig
+
+                log_progress(f"Configuration: validating paired index {args.video_index}...")
+                manifest = index_manifest(args.video_index, manifest_path=args.manifest, default_manifest=config["data"]["manifest"])
+                config["data"]["manifest"] = str(manifest.relative_to(ROOT))
+                config["video"] = {"index": args.video_index, "model": asdict(VideoConfig())}
+                log_progress("Configuration: paired index validated.")
+            elif args.manifest:
+                raise HarnessError("config --manifest requires --video-index; fresh public training is joint-only.")
+            output_path = private_output(args.output)
+            log_progress(f"Configuration: writing {output_path}...")
+            publish_json(output_path, config)
+            log_progress("Configuration: completed.")
+        elif args.command in ("transcribe", "transcribe-review", "transcribe-status"):
+            import json
+            from .transcription_pipeline import review_transcription, run_transcription, transcription_status
+
+            result = {"transcribe": run_transcription, "transcribe-review": review_transcription, "transcribe-status": transcription_status}[args.command](args)
+            print(json.dumps(result, indent=2))
+            if result["status"] == "blocked":
+                return 1
         else:
             {"preflight": preflight, "train": train, "evaluate": evaluate, "evaluate-events": evaluate_decoded_events, "infer": infer, "analyze-beats": analyze_beats, "export-gp": export_gp}[args.command](args)
     except (HarnessError, OSError, ValueError, RuntimeError) as error:

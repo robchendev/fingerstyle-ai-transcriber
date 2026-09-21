@@ -1,4 +1,4 @@
-"""Prepare private local GP/trimmed-audio pairs without an LLM or training."""
+"""Prepare local GP/audio/video data without an LLM; only batch-train starts training."""
 
 import argparse
 from collections.abc import Sequence
@@ -793,6 +793,34 @@ def parser():
     release.add_argument("--reviewer", help="Human owner authorizing this complete release scope and split.")
     release.add_argument("--authorize-release", action="store_true", help="Explicitly authorize the chosen validation groups and ALL selected pairs/ranges (all pairs unless --ids is supplied).")
     commands.add_parser("status", help="Report stale, blocked and reviewed pairs without running training.")
+    for name in ("batch", "batch-status", "batch-review", "batch-release", "batch-train"):
+        batch = commands.add_parser(name, help="Explicit owner-started preparation and training pipeline." if name == "batch-train" else "Repeatable GP/audio/video preparation; never starts training.")
+        batch.add_argument("--manifest", required=True, type=Path)
+        batch.add_argument("--output-directory", required=True, type=Path)
+        if name == "batch-release":
+            batch.add_argument("--reviewer", required=True)
+        if name == "batch-train":
+            batch.add_argument("--epochs", type=int, default=3, help="Joint audio/video training epochs; both branches learn together.")
+            batch.add_argument("--max-steps", type=int)
+            batch.add_argument("--max-hours", type=float, help="Optional training-only wall-clock limit, including setup/evaluation and checkpointing. Omit for no time limit. Preparation is separate.")
+            batch.add_argument("--cpu-threads", type=int, help="PyTorch compute threads; defaults to 75 percent of logical CPUs, capped at32.")
+            batch.add_argument("--video-dropout", type=float, default=.2, help="Probability of masking video on a paired training example for audio-only inference.")
+            batch.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+        if name == "batch-review":
+            batch.add_argument("--id", required=True)
+            batch.add_argument("--reviewer")
+            action = batch.add_mutually_exclusive_group(required=True)
+            action.add_argument("--accept-score", action="store_true", help="Explicitly accept reviewed score/audio pairing, notation, grouping and supplied ranges.")
+            action.add_argument("--accept-shots", action="store_true", help="Accept the inspected video shot boundaries.")
+            action.add_argument("--alignment-offset", type=float, help="Explicit reviewed video start time for trimmed audio zero.")
+            action.add_argument("--annotate-geometry", action="store_true", help="Open local guitar landmark annotation; no LLM or JSON editing.")
+            batch.add_argument("--geometry-shot", type=int, help="Review one one-based shot number rather than the entire video.")
+            batch.add_argument("--range", dest="ranges", action="append", default=[], metavar="START:END")
+            batch.add_argument("--anchor", action="append", default=[])
+            batch.add_argument("--exclude-range", action="append", default=[])
+            batch.add_argument("--acknowledge-uncertainty", action="store_true")
+            batch.add_argument("--confirm-percussion-completeness", action="store_true")
+            batch.add_argument("--add-cut", type=float, action="append", default=[])
     return result
 
 
@@ -800,6 +828,37 @@ def main(argv=None):
     command_parser = parser()
     args = command_parser.parse_args(argv)
     try:
+        if args.command.startswith("batch"):
+            from .paired_preparation import batch_status, finalize_batch, review_batch, run_batch, train_batch
+
+            if args.command == "batch":
+                output = run_batch(args.manifest, args.output_directory)
+            elif args.command == "batch-status":
+                output = batch_status(args.manifest, args.output_directory)
+            elif args.command == "batch-release":
+                output = finalize_batch(args.manifest, args.output_directory, args.reviewer)
+            elif args.command == "batch-train":
+                output = train_batch(args.manifest, args.output_directory, epochs=args.epochs, max_steps=args.max_steps, max_hours=args.max_hours,
+                                     cpu_threads=args.cpu_threads, video_dropout=args.video_dropout, device=args.device)
+            else:
+                flags = None
+                if args.accept_shots:
+                    flags = ["--accept-shots"]
+                    for value in args.add_cut:
+                        flags.extend(["--add-cut", str(value)])
+                elif args.alignment_offset is not None:
+                    flags = ["--alignment-offset", str(args.alignment_offset)]
+                if args.add_cut and not args.accept_shots:
+                    raise ValueError("--add-cut requires --accept-shots.")
+                output = review_batch(
+                    args.manifest, args.output_directory, args.id, reviewer=args.reviewer,
+                    accept_score=args.accept_score, ranges=args.ranges, anchors=args.anchor,
+                    exclude_ranges=args.exclude_range, acknowledge_uncertainty=args.acknowledge_uncertainty,
+                    percussion_complete=args.confirm_percussion_completeness,
+                    video_flags=flags, annotate_geometry=args.annotate_geometry, geometry_shot=args.geometry_shot,
+                )
+            print(json.dumps(output, ensure_ascii=False, allow_nan=False, indent=2))
+            return 0
         workspace = workspace_path(args.workspace)
         if args.command == "init":
             output = {"pairsPath": str(initialize(workspace))}

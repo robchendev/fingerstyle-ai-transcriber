@@ -3,6 +3,7 @@ from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+from types import SimpleNamespace
 import unittest
 from unittest.mock import ANY, MagicMock, patch
 
@@ -45,10 +46,18 @@ class HarnessCommandTests(unittest.TestCase):
         return {"openStringMidi": [40, 45, 50, 55, 59, 64], "capoFret": 0, "tempo": {"bpm": 100, "beatUnit": [1, 4]}, "timeSignature": [4, 4]}
 
     def test_train_and_resume_require_no_acknowledgement_flag(self):
+        from scripts.transcriber_video import VideoConfig
+
         with TemporaryDirectory(dir=ROOT) as directory:
             root = Path(directory).resolve()
             config = transcriber.load_config()
-            dataset = MagicMock(manifest_sha256="synthetic-manifest", records=[{}, {}])
+            config[0]["video"] = {"index": "synthetic-index.json", "model": asdict(VideoConfig())}
+            identity = {"model": config[0]["model"], "video": {"config": config[0]["video"]["model"]}}
+            dataset = MagicMock(
+                manifest_sha256="synthetic-manifest", records=[{}, {}],
+                video_identity={"synthetic": True},
+                video_coverage={"excludedWindows": 1, "excludedRecordings": 1, "audioFramesWithUsableVideo": 8, "preparedAudioFrames": 10, "trackingGapOnlyWindows": 0},
+            )
             dataset.__len__.return_value = 4
             model, train_loader, validation_loader = object(), object(), object()
             for resume in (None, str(root / "runs" / "example" / "latest.pt")):
@@ -60,12 +69,13 @@ class HarnessCommandTests(unittest.TestCase):
                     "latest_checkpoint": str(root / "runs" / "example" / "latest.pt"),
                     "best_checkpoint": str(root / "runs" / "example" / "best.pt"),
                 }
-                with self.subTest(resume=resume), patch.object(transcriber, "load_config", return_value=config), patch.object(transcriber, "seed_everything"), patch.object(transcriber.torch, "set_num_threads"), patch.object(transcriber, "make_dataset", return_value=dataset), patch.object(transcriber, "make_loader", side_effect=[train_loader, validation_loader]), patch.object(transcriber, "run_identity", return_value={"synthetic": True}), patch("scripts.transcriber_model.FingerstyleTranscriber", return_value=model), patch("scripts.transcriber_runtime.run_training", return_value=summary) as run_training, patch.object(transcriber.time, "perf_counter", side_effect=[100., 103., 105.]), patch("sys.stdout", new=StringIO()) as output:
+                with self.subTest(resume=resume), patch.object(transcriber, "load_config", return_value=config), patch.object(transcriber, "seed_everything"), patch.object(transcriber.torch, "set_num_threads"), patch.object(transcriber, "make_dataset", return_value=dataset), patch.object(transcriber, "make_loader", side_effect=[train_loader, validation_loader]), patch.object(transcriber, "run_identity", return_value=identity), patch.object(transcriber, "_wrap_video_model", return_value=model), patch("scripts.transcriber_model.FingerstyleTranscriber", return_value=model), patch("scripts.transcriber_runtime.load_checkpoint", return_value={"identity": identity}) as load_checkpoint, patch("scripts.transcriber_runtime.run_training", return_value=summary) as run_training, patch.object(transcriber.time, "perf_counter", side_effect=[100., 103., 105.]), patch("sys.stdout", new=StringIO()) as output:
                     args = ["train", "--data-root", str(root), "--run-dir", "runs\\example"]
                     if resume:
                         args.extend(["--resume", resume])
                     self.assertEqual(transcriber.main(args), 0)
-                    run_training.assert_called_once_with(model, train_loader, validation_loader, config[3], root / "runs" / "example", {"synthetic": True}, resume=resume, progress=transcriber.log_progress, event_evaluator=ANY)
+                    self.assertEqual(load_checkpoint.call_count, int(resume is not None))
+                    run_training.assert_called_once_with(model, train_loader, validation_loader, config[3], root / "runs" / "example", identity, resume=resume, progress=transcriber.log_progress, event_evaluator=ANY, started_at=100., deadline=None)
                     self.assertTrue(callable(run_training.call_args.kwargs["event_evaluator"]))
                     text = output.getvalue()
                     self.assertIn("Loading training data", text)
@@ -78,11 +88,75 @@ class HarnessCommandTests(unittest.TestCase):
                     self.assertEqual(saved["setup_seconds"], 3.)
                     self.assertEqual(saved["dataset_recordings"], {"train": 2, "validation": 2})
 
+    def test_resume_rejects_historical_paired_checkpoint_before_dataset_loading(self):
+        from scripts.transcriber_video import VideoConfig
+
+        config = transcriber.load_config()
+        config[0]["video"] = {"index": "synthetic-index.json", "model": asdict(VideoConfig())}
+        args = SimpleNamespace(config=None, resume="historical.pt")
+        with patch.object(transcriber, "load_config", return_value=config), patch("scripts.transcriber_runtime.load_checkpoint", side_effect=ValueError("schema-2 paired checkpoints are unsupported")), patch.object(transcriber, "make_dataset") as dataset, patch.object(transcriber, "seed_everything") as seed:
+            with self.assertRaisesRegex(ValueError, "schema-2 paired checkpoints"):
+                transcriber.train(args)
+        dataset.assert_not_called()
+        seed.assert_not_called()
+
+    def test_fresh_public_training_rejects_default_and_explicit_audio_only_configs_before_loading_data(self):
+        with TemporaryDirectory(dir=ROOT) as directory:
+            root = Path(directory)
+            path = root / "audio-config.json"
+            publish_json(path, transcriber.default_config())
+            for config_args in ([], ["--config", str(path)]):
+                with self.subTest(config_args=config_args), patch.object(transcriber, "make_dataset") as dataset, patch("scripts.transcriber_model.FingerstyleTranscriber") as model, patch("scripts.transcriber_runtime.run_training") as run, patch("sys.stderr", new=StringIO()) as error:
+                    result = transcriber.main(["train", "--data-root", str(root), "--run-dir", "runs\\not-started", *config_args])
+                self.assertEqual(result, 1)
+                self.assertIn("Fresh training is joint-only", error.getvalue())
+                dataset.assert_not_called()
+                model.assert_not_called()
+                run.assert_not_called()
+                self.assertFalse((root / "runs" / "not-started").exists())
+
     def test_progress_logs_flush_immediately(self):
         with patch("builtins.print") as output:
             transcriber.log_progress("Epoch progress")
         output.assert_called_once_with(ANY, flush=True)
         self.assertIn("Epoch progress", output.call_args.args[0])
+
+    def test_preflight_reports_incremental_progress_and_never_success_on_scan_failure(self):
+        config = transcriber.load_config()
+        item = {"features": torch.zeros(2, config[1].n_mels), "metadata": {"stringFrameCollisionsMasked": 0}, "masks": {}}
+        owner = self
+        for fail in (False, True):
+            with self.subTest(fail=fail), TemporaryDirectory(dir=ROOT / "runs") as directory:
+                report = Path(directory) / "preflight.json"
+                output = StringIO()
+
+                class Dataset(list):
+                    manifest_sha256 = "synthetic"
+
+                    def __iter__(self):
+                        owner.assertIn("scanning features, targets and masks", output.getvalue())
+                        for index, row in enumerate(super().__iter__()):
+                            if index == 1:
+                                owner.assertIn("windows 1/23", output.getvalue())
+                                if fail:
+                                    raise HarnessError("synthetic scan failure")
+                            yield row
+
+                with patch.object(transcriber, "load_config", return_value=config), patch.object(transcriber, "make_dataset", return_value=Dataset([item] * 23)), patch("sys.stdout", new=output), patch("sys.stderr", new=StringIO()) as error, patch("torch.optim.AdamW", side_effect=AssertionError("Preflight cannot train")):
+                    code = transcriber.main(["preflight", "--output", str(report)])
+                if fail:
+                    self.assertEqual(code, 1)
+                    self.assertIn("synthetic scan failure", error.getvalue())
+                    self.assertNotIn("scan completed", output.getvalue())
+                    self.assertNotIn("report saved", output.getvalue())
+                    self.assertFalse(report.exists())
+                else:
+                    self.assertEqual(code, 0)
+                    for split in ("train", "validation"):
+                        for count in (1, 10, 20, 23):
+                            self.assertIn(f"Preflight {split}: windows {count}/23", output.getvalue())
+                        self.assertEqual(read_json(report)["splits"][split]["windows"], 23)
+                    self.assertIn("Preflight: report saved", output.getvalue())
 
     def test_v2_initialization_copies_v1_weights_but_not_new_heads_or_optimizer(self):
         from scripts.transcriber_model import FingerstyleTranscriber, ModelConfig
@@ -218,6 +292,16 @@ class HarnessCommandTests(unittest.TestCase):
         self.assertEqual(profile.note_technique_threshold, .8)
         self.assertEqual(profile.chord_tolerance_seconds, .04)
         self.assertEqual(profile.same_string_gap_seconds, 0.)
+        self.assertFalse(profile.strict_note_confidence)
+
+    def test_export_accepts_strict_confidence_for_completed_chord_notes(self):
+        args = transcriber.argument_parser().parse_args([
+            "export-gp", "--predictions", "runs\\predictions.json", "--template", "template.gpt",
+            "--draft-note-threshold", ".98", "--strict-note-confidence", "--brush-threshold", ".995",
+        ])
+        self.assertEqual(args.draft_note_threshold, .98)
+        self.assertEqual(args.brush_threshold, .995)
+        self.assertTrue(args.strict_note_confidence)
 
     def test_analyze_beats_cli_publishes_private_evidence(self):
         report = {"beatCount": 10, "downbeatCount": 3}

@@ -280,20 +280,73 @@ def _candidate_ticks(mapper, seconds):
     return [(tick, result[tick][0]) for tick in sorted(result)]
 
 
-def _optimize_onsets(document, mapper):
+def _beat_unit_at(document, mapper, position):
+    changes = [(Fraction(str(mapper.bar_phase_quarters)), Fraction(*document["metadata"]["tempo"]["beatUnit"]) * 4)]
+    changes.extend((mapper.quarter_at(event["timeSeconds"]), Fraction(*event["beatUnit"]) * 4)
+                   for event in document["metadata"].get("tempoChanges", []))
+    return max((row for row in changes if row[0] <= position), key=lambda row: row[0], default=changes[0])
+
+
+def _stroke_32_windows(document, mapper):
+    positions = sorted({mapper.quarter_at(event["onsetSeconds"]) for event in document.get("techniques", [])
+                        if event["technique"] == "brush" and event.get("direction") == "Down"})
+    anchors = [mapper.quarter_at(note["onsetSeconds"]) for note in document["notes"] if not _completed_attack(note)]
+    anchors.extend(mapper.quarter_at(event["onsetSeconds"]) for event in document.get("acousticAttackEvidence", []))
+    windows = {}
+    for landing_observation in positions:
+        origin, unit = _beat_unit_at(document, mapper, landing_observation)
+        landing = origin + round((landing_observation - origin) / unit) * unit
+        if landing < Fraction(1, 4) or abs(landing - landing_observation) > Fraction(1, 12):
+            continue
+        slots = (landing - Fraction(1, 4), landing - Fraction(1, 8), landing)
+        chosen = [min(positions, key=lambda position: abs(position - slot)) for slot in slots]
+        if (len(set(chosen)) != 3 or any(abs(position - slot) > Fraction(1, 12) for position, slot in zip(chosen, slots))
+                or not any(abs(anchor - landing) <= Fraction(1, 8) for anchor in anchors)):
+            continue
+        windows[landing] = {"startQuarter": [slots[0].numerator, slots[0].denominator],
+                            "endQuarter": [landing.numerator, landing.denominator]}
+    return [windows[landing] for landing in sorted(windows)]
+
+
+def _fine_stroke_position(document, position):
+    return any(Fraction(*row["startQuarter"]) <= position <= Fraction(*row["endQuarter"])
+               for row in document.get("stroke32Windows", []))
+
+
+def _timing_candidates(document, mapper, seconds):
+    candidates = _candidate_ticks(mapper, seconds)
+    if document.get("rhythmPolicy") == "fingerstyle":
+        raw = mapper.quarter_at(seconds)
+        candidates = [(tick, cost) for tick, cost in candidates if tick % 6 == 0 or (
+            tick % 3 == 0 and _fine_stroke_position(document, Fraction(tick, TICKS_PER_QUARTER))
+            and abs(Fraction(tick, TICKS_PER_QUARTER) - raw) <= Fraction(1, 8))]
+    return candidates
+
+
+def _solve_onsets(document, mapper):
     try:
         from ortools.sat.python import cp_model
     except (ImportError, ModuleNotFoundError) as error:
         raise HarnessError("OR-Tools is required for constrained rhythm inference.") from error
     kinds = tuple(kind for kind in ("notes", "percussion", "techniques") if kind in document)
     times = sorted({float(event["onsetSeconds"]) for kind in kinds for event in document[kind]})
+    triplet_support = defaultdict(set)
+    for seconds in times:
+        raw = float(mapper.quarter_at(seconds)) * TICKS_PER_QUARTER
+        nearest = round(raw / 4) * 4
+        if nearest % TICKS_PER_QUARTER in (4, 8, 16, 20) and abs(raw - nearest) <= 1:
+            triplet_support[nearest // TICKS_PER_QUARTER].add(nearest % TICKS_PER_QUARTER)
     model = cp_model.CpModel()
     variables = []
     costs = []
     regimes = {}
+    binary_resolutions = {}
     triplet_selections = defaultdict(lambda: defaultdict(list))
     for index, seconds in enumerate(times):
-        candidates = _candidate_ticks(mapper, seconds)
+        candidates = _timing_candidates(document, mapper, seconds)
+        candidates = [(tick, cost) for tick, cost in candidates
+                      if tick % TICKS_PER_QUARTER not in (4, 8, 16, 20)
+                      or len(triplet_support[tick // TICKS_PER_QUARTER]) >= 2]
         tick = model.new_int_var_from_domain(cp_model.Domain.from_values([value[0] for value in candidates]), f"tick_{index}")
         choices = [model.new_bool_var(f"choice_{index}_{candidate_index}") for candidate_index in range(len(candidates))]
         model.add(sum(choices) == 1)
@@ -304,12 +357,21 @@ def _optimize_onsets(document, mapper):
             position = candidate_tick % TICKS_PER_QUARTER
             if beat not in regimes:
                 regimes[beat] = model.new_bool_var(f"triplet_beat_{beat}")
+                binary_resolutions[beat] = (
+                    model.new_bool_var(f"sixteenth_beat_{beat}"),
+                    model.new_bool_var(f"thirtysecond_beat_{beat}"),
+                )
             regime = regimes[beat]
             if position in (4, 8, 16, 20):
                 model.add(regime == 1).only_enforce_if(choice)
                 triplet_selections[beat][candidate_tick].append(choice)
             elif position not in (0,):
                 model.add(regime == 0).only_enforce_if(choice)
+                sixteenth, thirtysecond = binary_resolutions[beat]
+                if position % 12:
+                    model.add(sixteenth == 1).only_enforce_if(choice)
+                if position % 6:
+                    model.add(thirtysecond == 1).only_enforce_if(choice)
         variables.append(tick)
         costs.append(cost)
     for beat, regime in regimes.items():
@@ -329,8 +391,15 @@ def _optimize_onsets(document, mapper):
     for string in range(1, 7):
         reattacks = sorted({float(note["onsetSeconds"]) for note in document["notes"] if note["string"] == string})
         for left, right in zip(reattacks, reattacks[1:]):
+            left_pitches = {note["soundingPitchMidi"] for note in document["notes"] if note["string"] == string and note["onsetSeconds"] == left}
+            right_pitches = {note["soundingPitchMidi"] for note in document["notes"] if note["string"] == string and note["onsetSeconds"] == right}
+            if (document.get("rhythmPolicy") == "fingerstyle" and left_pitches == right_pitches
+                    and mapper.quarter_at(right) - mapper.quarter_at(left) < Fraction(1, 4)
+                    and not any(_fine_stroke_position(document, mapper.quarter_at(time)) for time in (left, right))):
+                continue
             model.add(by_time[right] > by_time[left])
-    model.minimize(sum(costs) + 8 * sum(regimes.values()))
+    subdivision_cost = sum(24 * sixteenth + 48 * thirtysecond for sixteenth, thirtysecond in binary_resolutions.values())
+    model.minimize(sum(costs) + 80 * sum(regimes.values()) + subdivision_cost)
     solver = cp_model.CpSolver()
     solver.parameters.max_deterministic_time = 30
     solver.parameters.num_search_workers = 1
@@ -362,38 +431,167 @@ def _optimize_onsets(document, mapper):
         "tripletBeatCount": sum(solver.value(value) for value in regimes.values()),
         "ticksPerQuarter": TICKS_PER_QUARTER,
         "candidateStepsTicks": list(GRID_STEPS),
-        "reattackPolicy": "Distinct same-string acoustic attacks cannot collapse onto one score position.",
+        "reattackPolicy": ("In fingerstyle mode, close same-pitch candidates outside protected stroke windows may share a sixteenth-grid attack; other reattacks remain distinct."
+                          if document.get("rhythmPolicy") == "fingerstyle" else "Distinct same-string acoustic attacks cannot collapse onto one score position."),
+        "subdivisionPolicy": "Charge fine binary resolution once per beat, not once per chord member; retain timing-supported fast attacks and distinct reattacks.",
+        "rhythmPolicy": document.get("rhythmPolicy", "adaptive"),
+        "stroke32Windows": document.get("stroke32Windows", []),
     }
+
+
+def _completed_attack(note):
+    return "technique_membership_completed_attack" in note.get("uncertainty", [])
+
+
+def _optimize_onsets(document, mapper):
+    primary_notes = [note for note in document["notes"] if not _completed_attack(note)]
+    if not primary_notes and not document["percussion"]:
+        return _solve_onsets(document, mapper)
+    primary = {**document, "notes": primary_notes, "techniques": []}
+    timed, report = _solve_onsets(primary, mapper)
+    primary_times = {
+        float(source["onsetSeconds"]): Fraction(*target["scoreOnsetQuarter"])
+        for kind in ("notes", "percussion") for source, target in zip(primary[kind], timed[kind])
+    }
+    triplet_beats = {position // 1 for position in primary_times.values() if position.denominator % 3 == 0}
+    result = deepcopy(document)
+    supplemental_groups = defaultdict(list)
+    for note in result["notes"]:
+        if _completed_attack(note):
+            parent = note.get("completionParent", {})
+            supplemental_groups[(parent.get("technique"), parent.get("onsetSeconds", note["onsetSeconds"]))].append(note)
+    aligned_groups, collapsed = [], []
+    supplemental_positions = {}
+    deferred = {}
+    onset_evidence = document.get("acousticAttackEvidence", [])
+    brush_positions = sorted({mapper.quarter_at(event["onsetSeconds"]) for event in document.get("techniques", [])
+                              if event["technique"] == "brush" and event.get("direction") == "Down"})
+    acoustic_positions = {mapper.quarter_at(note["onsetSeconds"]) for note in (*primary_notes, *onset_evidence)}
+    protected_strokes = set()
+    for left, middle, right in zip(brush_positions, brush_positions[1:], brush_positions[2:]):
+        acoustic_count = sum(any(abs(position - anchor) <= Fraction(1, 24) for anchor in acoustic_positions)
+                             for position in (left, middle, right))
+        origin, beat_unit = _beat_unit_at(document, mapper, right)
+        lands_on_beat = abs(right - origin - round((right - origin) / beat_unit) * beat_unit) <= Fraction(1, 24)
+        landing_supported = any(abs(right - anchor) <= Fraction(1, 24) for anchor in acoustic_positions)
+        if (abs((middle - left) - Fraction(1, 8)) <= Fraction(1, 24)
+                and abs((right - middle) - Fraction(1, 8)) <= Fraction(1, 24)
+                and (acoustic_count >= 2 or lands_on_beat and landing_supported)):
+            protected_strokes.update((left, middle, right))
+    for (technique, seconds), notes in supplemental_groups.items():
+        # Membership completes a nearby acoustic chord, not a delayed reattack.
+        brush_supported = any(abs(position - mapper.quarter_at(seconds)) <= Fraction(1, 24) for position in protected_strokes)
+        nearby = [
+            primary for primary in primary_notes
+            if technique in ("brush", "rasgueado", "pick_stroke") and not brush_supported
+            and abs(float(mapper.quarter_at(primary["onsetSeconds"]) - mapper.quarter_at(seconds))) <= .125
+        ]
+        anchor = min(nearby, key=lambda n: (abs(n["onsetSeconds"] - seconds), -n["confidence"])) if nearby else None
+        position = primary_times[float(anchor["onsetSeconds"])] if anchor is not None else None
+        if position is None and not brush_supported and onset_evidence:
+            weak = [event for event in onset_evidence
+                    if abs(mapper.quarter_at(event["onsetSeconds"]) - mapper.quarter_at(seconds)) <= Fraction(1, 8)]
+            if weak:
+                anchor = min(weak, key=lambda event: (abs(event["onsetSeconds"] - seconds), -event["confidence"]))
+                choices = [(tick, cost) for tick, cost in _timing_candidates(document, mapper, anchor["onsetSeconds"])
+                           if tick % (4 if tick // TICKS_PER_QUARTER in triplet_beats else 3) == 0]
+                tick, _ = min(choices, key=lambda value: (value[1], value[0]))
+                position = Fraction(tick, TICKS_PER_QUARTER)
+            else:
+                for note in notes:
+                    deferred[id(note)] = "technique_completion_without_independent_attack_support"
+        if position is not None:
+            for note in notes:
+                supplemental_positions[id(note)] = position
+            aligned_groups.append({"technique": technique, "sourceSeconds": seconds,
+                                   "anchorSeconds": anchor["onsetSeconds"], "scoreOnsetQuarter": [position.numerator, position.denominator]})
+    for kind in ("notes", "percussion", "techniques"):
+        for event in result.get(kind, []):
+            seconds = float(event["onsetSeconds"])
+            group_position = next((row["scoreOnsetQuarter"] for row in aligned_groups
+                                   if kind == "techniques" and row["technique"] == event["technique"]
+                                   and row["sourceSeconds"] == seconds), None)
+            if id(event) in supplemental_positions:
+                position = supplemental_positions[id(event)]
+            elif group_position is not None:
+                position = Fraction(*group_position)
+            elif seconds in primary_times:
+                position = primary_times[seconds]
+            else:
+                candidates = [(tick, cost) for tick, cost in _timing_candidates(document, mapper, seconds)
+                              if tick % (4 if tick // TICKS_PER_QUARTER in triplet_beats else 3) == 0]
+                tick, _ = min(candidates, key=lambda value: (value[1], value[0]))
+                position = Fraction(tick, TICKS_PER_QUARTER)
+            event["scoreOnsetQuarter"] = [position.numerator, position.denominator]
+    attacks = {(tuple(n["scoreOnsetQuarter"]), n["soundingPitchMidi"]) for n in result["notes"] if not _completed_attack(n)}
+    kept = []
+    for note in result["notes"]:
+        key = tuple(note["scoreOnsetQuarter"]), note["soundingPitchMidi"]
+        if id(note) in deferred:
+            continue
+        if id(note) in supplemental_positions and key in attacks:
+            collapsed.append({"reason": "compound_candidate_duplicates_acoustic_attack", "event": deepcopy(note)})
+        else:
+            kept.append(note)
+    deferred_notes = [{"reason": deferred[id(note)], "event": deepcopy(note)}
+                      for note in result["notes"] if id(note) in deferred]
+    result["notes"] = kept
+    report.update(
+        techniqueTimingPolicy="Acoustic attacks anchor nearby chord-completion candidates; retain their new pitches, merge duplicated pitches, and protect acoustically supported 32nd stroke sequences. Compound indications do not create separate delayed strums.",
+        alignedCompoundCandidates=aligned_groups, mergedCompoundDuplicates=collapsed,
+        deferredUnsupportedCandidates=deferred_notes,
+    )
+    return result, report
 
 
 def _optimize_durations(document):
     result = deepcopy(document)
+    triplet_beats = {
+        position.numerator // position.denominator
+        for kind in ("notes", "percussion")
+        for event in result.get(kind, [])
+        for position in (Fraction(*event["scoreOnsetQuarter"]),)
+        if position.denominator % 3 == 0
+    }
     notes_by_string = {string: [] for string in range(1, 7)}
     for note in result["notes"]:
         notes_by_string[note["string"]].append(note)
     changes = []
+    candidates_by_note = {}
     for values in notes_by_string.values():
         values.sort(key=lambda note: Fraction(*note["scoreOnsetQuarter"]))
+        distinct_onsets = sorted({Fraction(*note["scoreOnsetQuarter"]) for note in values})
         for index, note in enumerate(values):
             onset = Fraction(*note["scoreOnsetQuarter"])
             predicted = Fraction(str(note["notatedDurationQuarter"])).limit_denominator(1_000_000)
-            next_onset = Fraction(*values[index + 1]["scoreOnsetQuarter"]) if index + 1 < len(values) else None
+            next_index = bisect_right(distinct_onsets, onset)
+            next_onset = distinct_onsets[next_index] if next_index < len(distinct_onsets) else None
             candidates = list(DURATION_VALUES)
+            if onset // 1 in triplet_beats:
+                candidates.extend((Fraction(1, 6), Fraction(1, 3), Fraction(2, 3), Fraction(4, 3), Fraction(8, 3)))
             if next_onset is not None and next_onset > onset:
                 candidates.append(next_onset - onset)
                 candidates = [duration for duration in candidates if onset + duration <= next_onset]
-            candidates = sorted(set(duration for duration in candidates if duration > 0))
+            candidates = sorted(set(
+                duration for duration in candidates if duration > 0
+                and ((onset + duration) * (6 if (onset + duration) // 1 in triplet_beats else 8)).denominator == 1
+                and (result.get("rhythmPolicy") != "fingerstyle" or ((onset + duration) * 4).denominator == 1
+                     or _fine_stroke_position(result, onset + duration))
+            ))
             if not candidates:
-                candidates = [Fraction(1, 4)]
+                boundary = Fraction(onset // 1 + 1)
+                candidates = [min(boundary, next_onset) - onset if next_onset is not None and next_onset > onset else boundary - onset]
 
             def cost(duration):
                 difference = abs(math.log1p(float(duration)) - math.log1p(float(predicted)))
                 endpoint = onset + duration
                 metric = 0 if endpoint.denominator == 1 else 1 if (endpoint * 2).denominator == 1 else 2
                 long_tie = max(0, math.ceil(float(duration) / 4) - 1) * 3
-                return difference * 100 + metric + long_tie
+                tiny_gap = next_onset is not None and 0 < next_onset - endpoint <= Fraction(1, 4)
+                return difference * 100 + metric + long_tie + 12 * tiny_gap
 
             selected = min(candidates, key=lambda duration: (cost(duration), duration))
+            candidates_by_note[id(note)] = {duration: cost(duration) for duration in candidates}
             note["scoreDurationQuarter"] = [selected.numerator, selected.denominator]
             if selected != predicted:
                 changes.append({
@@ -402,26 +600,57 @@ def _optimize_durations(document):
                     "predictedQuarter": [predicted.numerator, predicted.denominator],
                     "selectedQuarter": note["scoreDurationQuarter"],
                 })
+    chord_groups = defaultdict(list)
+    for note in result["notes"]:
+        chord_groups[(tuple(note["scoreOnsetQuarter"]), note["voiceIndex"])].append(note)
+    chord_changes = []
+    for group in chord_groups.values():
+        if len(group) < 2 or any(note.get("grace") or note.get("connection", "none") != "none" for note in group):
+            continue
+        selected = [Fraction(*note["scoreDurationQuarter"]) for note in group]
+        if min(selected) == max(selected) or max(selected) - min(selected) > Fraction(1, 4) or max(selected) > 2 * min(selected):
+            continue
+        common = set.intersection(*(set(candidates_by_note[id(note)]) for note in group))
+        common = [duration for duration in common if min(selected) <= duration <= max(selected)]
+        if not common:
+            continue
+        duration = min(common, key=lambda value: (
+            sum(candidates_by_note[id(note)][value] for note in group),
+            -sum(value == previous for previous in selected), -value,
+        ))
+        for note in group:
+            before = note["scoreDurationQuarter"]
+            if Fraction(*before) != duration:
+                note["scoreDurationQuarter"] = [duration.numerator, duration.denominator]
+                chord_changes.append({"onsetQuarter": note["scoreOnsetQuarter"], "pitch": note["soundingPitchMidi"],
+                                      "voice": note["voiceIndex"], "fromQuarter": before, "toQuarter": note["scoreDurationQuarter"]})
     return result, {
-        "policy": "Predicted notated duration is a soft log-distance prior over conventional values, bounded by the next same-string attack.",
+        "policy": "Predicted duration is a soft prior over conventional values, bounded by the next same-string attack; endpoints remain on the selected binary/triplet beat grid.",
         "changedCount": len(changes),
         "changes": changes,
+        "chordDurationNormalization": chord_changes,
+        "chordDurationPolicy": "Same-attack/same-voice chord members with similar predicted durations share a feasible conventional end. Penalize tiny predicted gaps before same-string reattacks, while preserving substantial silence, long bass sustains and ornaments.",
     }
 
 
-def infer_notated_timing(document, evidence, *, include_unsupported_tail=False):
+def infer_notated_timing(document, evidence, *, include_unsupported_tail=False, rhythm_policy="adaptive"):
     if not isinstance(document, dict) or not isinstance(document.get("metadata"), dict):
         raise HarnessError("Rhythm inference requires hypothesis metadata.")
     mapper = PerformanceMap(
         evidence,
         document["metadata"],
         document["audioDurationSeconds"],
-        event_seconds=[event["onsetSeconds"] for kind in ("notes", "percussion") for event in document[kind]],
+        event_seconds=[note["onsetSeconds"] for note in document["notes"] if not _completed_attack(note)]
+                      + [event["onsetSeconds"] for event in document["percussion"]],
     )
     if type(include_unsupported_tail) is not bool:
         raise TypeError("include_unsupported_tail must be boolean.")
+    if rhythm_policy not in ("adaptive", "fingerstyle"):
+        raise HarnessError("Unknown rhythm policy.")
     beat_supported_end = float(mapper.anchor_seconds[-1])
     bounded = deepcopy(document)
+    bounded["rhythmPolicy"] = rhythm_policy
+    bounded["stroke32Windows"] = _stroke_32_windows(bounded, mapper) if rhythm_policy == "fingerstyle" else []
     unsupported = {}
     for kind in tuple(kind for kind in ("notes", "percussion", "techniques") if kind in document):
         unsupported[kind] = sum(event["onsetSeconds"] > beat_supported_end for event in document[kind])

@@ -13,11 +13,13 @@ import cv2
 import numpy as np
 
 from core import EvidenceError, GuitarCoordinateFrame, sha256
-from geometry import GEOMETRY_POINTS, STATE_CODES, _cleanup, _publish, _safe_directory, validate_geometry_annotations
+from geometry import GEOMETRY_POINTS, STATE_CODES, _cleanup, _publish, _safe_directory, annotations_ready, validate_geometry_annotations
 from hand_review import HAND_CONNECTIONS
+from hand_tracking import same_hand_landmarks
 
 
 ROLE_CODES = {"unknown": 0, "fretting": 1, "plucking": 2}
+ASSIGNMENT_SOURCES = {"unavailable": 0, "guitar_geometry": 1, "reviewed_screen_order": 2}
 REASON_CODES = {
     "assigned": 0, "hand_absent": 1, "geometry_unavailable": 2,
     "landmarks_unavailable": 3, "outside_role_regions": 4,
@@ -31,6 +33,7 @@ TIPS = (4, 8, 12, 16, 20)
 
 @dataclass(frozen=True)
 class RoleConfig:
+    plucking_screen_side: str = "geometry"
     minimum_geometry_confidence: float = .5
     minimum_role_score: float = .6
     ambiguity_margin: float = .2
@@ -41,6 +44,10 @@ class RoleConfig:
 
     def __post_init__(self):
         for name, value in asdict(self).items():
+            if name == "plucking_screen_side":
+                if value not in ("geometry", "left", "right"):
+                    raise EvidenceError("Plucking screen side must be geometry, left or right.")
+                continue
             if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
                 raise EvidenceError(f"{name} must be a finite nonnegative number.")
         if not 0 < self.minimum_geometry_confidence <= 1 or not 0 < self.minimum_role_score <= 1 or not 0 < self.ambiguity_margin <= 1:
@@ -87,8 +94,8 @@ def load_role_inputs(video_path, shots_path, hands_path, geometry_path, annotati
             raise EvidenceError(f"{name} report references different shot boundaries.")
         if documents[name].get("timeBase") != shots.get("timeBase"):
             raise EvidenceError(f"{name} and shot report time bases differ.")
-    if geometry.get("annotationsSha256") != hashes["annotations"] or annotations.get("reviewComplete") is not True:
-        raise EvidenceError("Geometry must reference these completed reviewed annotations.")
+    if geometry.get("annotationsSha256") != hashes["annotations"] or not annotations_ready(annotations):
+        raise EvidenceError("Geometry must reference these completed reviewed or automatically prepared annotations.")
     if not isinstance(shots.get("shots"), list) or not shots["shots"] or any(
         not isinstance(row, dict) or not {"shotId", "startPts", "endPtsExclusive"} <= row.keys()
         for row in shots["shots"]
@@ -181,11 +188,39 @@ def frame_features(landmarks, coordinates, confidence, state, image_size, config
         "scores": np.zeros((2, 2), np.float32),
         "geometryConfidence": 0., "bodyConfidence": 0.,
         "available": np.zeros(2, bool),
+        "imageCenters": np.full((2, 2), np.nan, np.float32),
+        "imageAspect": np.asarray(image_size, dtype=np.float64) / max(image_size),
+        "pairRoles": np.zeros(2, np.int8),
         "reason": np.full(2, REASON_CODES["geometry_unavailable"], np.int8),
     }
     present = np.isfinite(landmarks[..., :2]).all(-1).any(-1)
     features["reason"][~present] = REASON_CODES["hand_absent"]
-    if state not in (STATE_CODES["trackable"], STATE_CODES["guitar_partial"]):
+    performance_states = (STATE_CODES["trackable"], STATE_CODES["guitar_partial"])
+    screen_order = config.plucking_screen_side != "geometry"
+    if state not in (*performance_states, STATE_CODES["calibration_unstable"], STATE_CODES["unknown"]):
+        return features
+    if screen_order:
+        for hand in range(2):
+            points = landmarks[hand, :, :2]
+            valid = np.isfinite(points).all(-1) & ((points >= 0) & (points <= 1)).all(-1)
+            if valid.sum() < 3:
+                if present[hand]:
+                    features["reason"][hand] = REASON_CODES["landmarks_unavailable"]
+                continue
+            features["imageCenters"][hand] = np.mean(points[valid], axis=0)
+            features["available"][hand] = True
+        if features["available"].all():
+            if same_hand_landmarks(landmarks[0], landmarks[1], image_size):
+                # Duplicate observations must not move both existing identities
+                # onto one physical hand and corrupt the following single frame.
+                features["available"][:] = False
+                features["reason"][:] = REASON_CODES["competing_hands"]
+                return features
+            centers = features["imageCenters"][:, 0]
+            if centers[0] != centers[1]:
+                order = np.argsort(centers)
+                features["pairRoles"][order] = (2, 1) if config.plucking_screen_side == "left" else (1, 2)
+    if state not in performance_states:
         return features
     if not np.isfinite(coordinates[:4]).all() or float(min(confidence[:4])) < config.minimum_geometry_confidence:
         return features
@@ -219,8 +254,8 @@ def frame_features(landmarks, coordinates, confidence, state, image_size, config
             continue
         available = np.isfinite(landmarks[hand, :, :2]).all(-1)
         available &= ((landmarks[hand, :, :2] >= 0) & (landmarks[hand, :, :2] <= 1)).all(-1)
-        features["reason"][hand] = REASON_CODES["landmarks_unavailable"]
         if not available[0] or sum(available[list(PALM)]) < 3 or sum(available[list(TIPS)]) < 2:
+            features["reason"][hand] = REASON_CODES["landmarks_unavailable"]
             continue
         for index in np.flatnonzero(available):
             transformed = frame.transform(_point(landmarks[hand, index, :2] * image_size))
@@ -231,7 +266,8 @@ def frame_features(landmarks, coordinates, confidence, state, image_size, config
             np.median(values[list(TIPS)][available[list(TIPS)]], axis=0),
         ))
         features["anchors"][hand] = anchors
-        features["available"][hand] = True
+        if not screen_order:
+            features["available"][hand] = True
         features["scores"][hand, 0] = _region_score(anchors, (-.08, 1.15, -1.2, 1.2))
         if len(body):
             features["scores"][hand, 1] = _region_score(anchors, body_region)
@@ -253,7 +289,11 @@ class RoleTracker:
             self.shot = shot
         self.tracks = {key: value for key, value in self.tracks.items() if seconds - value["time"] <= self.config.maximum_gap_seconds}
         hands = list(np.flatnonzero(features["available"]))
-        anchors = {hand: np.median(features["anchors"][hand], axis=0) for hand in hands}
+        screen_order = self.config.plucking_screen_side != "geometry"
+        anchors = {
+            hand: features["imageCenters"][hand] * features["imageAspect"] if screen_order else np.median(features["anchors"][hand], axis=0)
+            for hand in hands
+        }
         possibilities = []
         for assignment in itertools.product([-1, *self.tracks], repeat=len(hands)):
             existing = [value for value in assignment if value != -1]
@@ -265,7 +305,11 @@ class RoleTracker:
                     cost += .5
                     continue
                 track = self.tracks[key]
-                delta = (anchors[hand] - track["anchor"]) * [1., .15]
+                pair_role = features["pairRoles"][hand]
+                if pair_role and track["role"] and pair_role != track["role"]:
+                    cost = math.inf
+                    break
+                delta = (anchors[hand] - track["anchor"]) * ([1., 1.] if screen_order else [1., .15])
                 distance = float(np.linalg.norm(delta))
                 if distance > .25 + 1.5 * (seconds - track["time"]):
                     cost = math.inf
@@ -279,12 +323,17 @@ class RoleTracker:
         reason = features["reason"].copy()
         candidates = {}
         for hand in hands:
+            if features["pairRoles"][hand]:
+                candidates[hand] = int(features["pairRoles"][hand])
+                continue
+            if not np.isfinite(features["anchors"][hand]).all():
+                continue
             scores = features["scores"][hand]
             best = int(np.argmax(scores))
             if scores[best] < self.config.minimum_role_score:
                 reason[hand] = REASON_CODES[
                     "body_geometry_unavailable"
-                    if not features["bodyConfidence"] and anchors[hand][0] < 0
+                    if not features["bodyConfidence"] and features["anchors"][hand, 1, 0] < 0
                     else "outside_role_regions"
                 ]
             elif scores[best] - scores[1 - best] < self.config.ambiguity_margin:
@@ -310,13 +359,19 @@ class RoleTracker:
             track_ids[hand] = key
             track.update(anchor=anchors[hand], time=seconds)
             candidate = candidates.get(hand, 0)
+            if features["pairRoles"][hand]:
+                track["screen_role"] = candidate
+            elif candidate and track.get("screen_role", candidate) != candidate:
+                reason[hand] = REASON_CODES["ambiguous_role"]
+                track["pending"] = 0
+                continue
             if not candidate:
                 track["pending"] = 0
                 continue
             if candidate != track["role"]:
                 if track["pending"] != candidate:
                     track.update(pending=candidate, since=seconds)
-                if seconds - track["since"] + 1e-9 < self.config.confirmation_seconds:
+                if not features["pairRoles"][hand] and seconds - track["since"] + 1e-9 < self.config.confirmation_seconds:
                     reason[hand] = REASON_CODES["temporal_confirmation"]
                     continue
                 if track["role"]:
@@ -327,7 +382,7 @@ class RoleTracker:
             roles[hand] = candidate
             scores = features["scores"][hand]
             geometry_confidence = features["geometryConfidence"] if candidate == 1 else features["bodyConfidence"]
-            certainty[hand] = geometry_confidence * float(scores[candidate - 1]) * float(scores.max() - scores.min())
+            certainty[hand] = 1. if features["pairRoles"][hand] else geometry_confidence * float(scores[candidate - 1]) * float(scores.max() - scores.min())
             reason[hand] = REASON_CODES["assigned"]
         return roles, certainty, track_ids, reason
 
@@ -337,6 +392,7 @@ def assign_role_arrays(hand, geo, shots, config=RoleConfig()):
     output = {
         "pts": hand["pts"].copy(), "shot_id": hand["shot_id"].copy(),
         "role": np.zeros((count, 2), np.int8), "role_confidence": np.zeros((count, 2), np.float32),
+        "assignment_source": np.zeros((count, 2), np.int8),
         "track_id": np.full((count, 2), -1, np.int32), "reason": np.zeros((count, 2), np.int8),
         "guitar_landmarks": np.full((count, 2, 21, 2), np.nan, np.float32),
         "anchors": np.full((count, 2, 3, 2), np.nan, np.float32),
@@ -358,6 +414,7 @@ def assign_role_arrays(hand, geo, shots, config=RoleConfig()):
         output["body_confidence"][i] = features["bodyConfidence"]
         role, confidence, tracks, reason = tracker.update(features, float(int(pts) * time_base), int(hand["shot_id"][i]))
         output["role"][i], output["role_confidence"][i], output["track_id"][i], output["reason"][i] = role, confidence, tracks, reason
+        output["assignment_source"][i] = np.where(role > 0, np.where(features["pairRoles"] > 0, 2, 1), 0)
     output["role_available"] = output["role"] != 0
     return output, tracker.swap_count
 
@@ -387,6 +444,7 @@ def _summary(arrays, hand, geo):
         "oneHandFramesWithRole": int((one_hand & any_role).sum()),
         "detectedHandFramesWithoutRole": int((detected & ~any_role).sum()),
         "unknownDetectedHandObservations": int((np.isfinite(hand["image_landmarks"][..., :2]).all(-1).any(-1) & (role == 0)).sum()),
+        "screenOrderHandAssignments": int((arrays["assignment_source"] == 2).sum()),
         "withinShotRoleSwapCount": swaps,
         "trackIdentityCount": int(len(np.unique(arrays["track_id"][arrays["track_id"] >= 0]))),
     }
@@ -417,15 +475,19 @@ def assign_hand_roles(video_path, shots_path, hands_path, geometry_path, annotat
         report = {
             "schemaVersion": 1, "kind": "guitar-relative-hand-roles", "visibility": "private",
             "inputSha256": inputs["hashes"], "timeBase": shots["timeBase"],
+            "geometryPreparationMethod": inputs["documents"]["annotations"].get("preparationMethod", "reviewed-annotations"),
+            "geometryReviewComplete": inputs["documents"]["annotations"].get("reviewComplete") is True,
             "frameCount": len(arrays["pts"]),
             "roleEncoding": ROLE_CODES, "reasonEncoding": REASON_CODES, "anchorOrder": list(ANCHOR_NAMES),
             "coordinateAxes": ["alongNeck", "acrossFretboard"],
             "coordinatePolicy": "Aspect-correct source pixels; neck/body at zero, nutward positive; no world-landmark or anatomical-role inference.",
-            "roleScorePolicy": "Uncalibrated geometric proximity and separation, not contact or technique probability. Plucking requires reviewed body-anchor evidence.",
+            "roleScorePolicy": "Geometric assignments use uncalibrated proximity/separation; reviewed screen-order pairs score 1 conditional on that explicit orientation, not measured accuracy or contact probability. Geometry scores remain separate.",
+            "screenOrderPolicy": "When two distinct hands are detected, order by mean X of all finite in-frame XY landmarks. Apply the explicit plucking-screen-side rule immediately, independently of guitar calibration. Single hands, duplicate detections and non-performance/transition frames are not forced into a pair.",
+            "assignmentSourceEncoding": ASSIGNMENT_SOURCES,
             "anatomicalHandednessUsedForRole": False, "sameTakeConfirmed": False,
             "trackingResetCount": len(rows), "withinShotRoleSwapCount": swaps,
             "config": asdict(config), **_summary(arrays, inputs["hand"], inputs["geometry"]),
-            "implementationSha256": {name: sha256(Path(__file__).with_name(name)) for name in ("hand_roles.py", "core.py", "geometry.py")},
+            "implementationSha256": {name: sha256(Path(__file__).with_name(name)) for name in ("hand_roles.py", "hand_tracking.py", "core.py", "geometry.py")},
             "runtime": {"numpy": np.__version__, "opencv": cv2.__version__, "av": av.__version__},
             "shotCount": len(rows), "shots": rows, "arrays": path.name, "arraysSha256": sha256(path),
             "legacyInputArrayHashes": "Upstream reports do not necessarily carry array hashes; exact observed array digests are bound here after schema/PTS validation.",
@@ -440,8 +502,7 @@ def assign_hand_roles(video_path, shots_path, hands_path, geometry_path, annotat
             _cleanup(output)
 
 
-def review_hand_roles(video_path, shots_path, hands_path, geometry_path, annotations_path, roles_path, output_directory):
-    inputs = load_role_inputs(video_path, shots_path, hands_path, geometry_path, annotations_path)
+def load_role_observations(inputs, roles_path):
     roles_path = Path(roles_path)
     report = json.loads(roles_path.read_text(encoding="utf-8"))
     array_path = roles_path.with_name("roles.npz")
@@ -461,6 +522,14 @@ def review_hand_roles(video_path, shots_path, hands_path, geometry_path, annotat
         "geometry_confidence": (np.dtype("float32"), (count,)), "body_confidence": (np.dtype("float32"), (count,)),
         "anatomical_handedness": (np.dtype("int8"), (count, 2)), "detection_source": (np.dtype("int8"), (count,)),
     })
+    if "assignmentSourceEncoding" in report:
+        if report["assignmentSourceEncoding"] != ASSIGNMENT_SOURCES:
+            raise EvidenceError("Unknown role assignment source encoding.")
+        arrays.update(_read_arrays(array_path, {"assignment_source": (np.dtype("int8"), (count, 2))}))
+        if not np.isin(arrays["assignment_source"], list(ASSIGNMENT_SOURCES.values())).all() or not np.array_equal(arrays["assignment_source"] > 0, arrays["role_available"]):
+            raise EvidenceError("Role assignment sources disagree with availability.")
+    else:
+        arrays["assignment_source"] = arrays["role_available"].astype(np.int8)
     if not np.array_equal(arrays["pts"], inputs["hand"]["pts"]) or not np.array_equal(arrays["shot_id"], inputs["hand"]["shot_id"]):
         raise EvidenceError("Role review PTS/shot arrays disagree.")
     if not np.isin(arrays["role"], list(ROLE_CODES.values())).all() or not np.isin(arrays["reason"], list(REASON_CODES.values())).all():
@@ -476,6 +545,14 @@ def review_hand_roles(video_path, shots_path, hands_path, geometry_path, annotat
     for code in (1, 2):
         if np.any((arrays["role"] == code).sum(-1) > 1):
             raise EvidenceError("A role is assigned to two hands in the same frame.")
+    return report, arrays
+
+
+def review_hand_roles(video_path, shots_path, hands_path, geometry_path, annotations_path, roles_path, output_directory):
+    inputs = load_role_inputs(video_path, shots_path, hands_path, geometry_path, annotations_path)
+    roles_path = Path(roles_path)
+    report, arrays = load_role_observations(inputs, roles_path)
+    array_path = roles_path.with_name("roles.npz")
     selected = {}
     detected = np.isfinite(inputs["hand"]["image_landmarks"][..., :2]).all(-1).any(-1)
     for shot in inputs["documents"]["shots"]["shots"]:
@@ -541,6 +618,8 @@ def review_hand_roles(video_path, shots_path, hands_path, geometry_path, annotat
                     reason = next(name for name, code in REASON_CODES.items() if code == int(arrays["reason"][index, hand]))
                     scores = arrays["role_scores"][index, hand]
                     label = f"{name} c={arrays['role_confidence'][index, hand]:.2f} track={arrays['track_id'][index, hand]} F/P={scores[0]:.2f}/{scores[1]:.2f}"
+                    if arrays["assignment_source"][index, hand] == ASSIGNMENT_SOURCES["reviewed_screen_order"]:
+                        label = f"{name} source=reviewed-screen-order track={arrays['track_id'][index, hand]} F/P={scores[0]:.2f}/{scores[1]:.2f}"
                     y = 78 + hand * 48
                     cv2.putText(image, label, (18, y), cv2.FONT_HERSHEY_SIMPLEX, .65, (0, 0, 0), 4, cv2.LINE_AA)
                     cv2.putText(image, label, (18, y), cv2.FONT_HERSHEY_SIMPLEX, .65, color, 2, cv2.LINE_AA)
@@ -575,8 +654,11 @@ def review_hand_roles(video_path, shots_path, hands_path, geometry_path, annotat
             "reviewRequired": True, "roleAccuracyMeasured": False, "trainingPerformed": False,
         }
         _publish(output / "review.json", review)
-        panels = "\n".join(f'<figure><figcaption>Shot {item["shotId"] + 1}: {html.escape(item["sample"])}</figcaption><img loading="lazy" width="960" src="{html.escape(item["path"].replace(chr(92), "/"))}"></figure>' for item in selected.values())
-        (output / "index.html").write_text(f'<!doctype html><meta charset="utf-8"><title>Private hand-role review</title><h1>Geometry-based roles - owner review</h1><p>Green: fretting. Orange: plucking. Grey: unknown. Scores are not calibrated probabilities or contact evidence.</p>{panels}', encoding="utf-8")
+        panels = "\n".join(f'<figure id="shot-{item["shotId"] + 1}-{item["sample"]}"><figcaption>Shot {item["shotId"] + 1}: {html.escape(item["sample"])}</figcaption><img loading="lazy" width="960" src="{html.escape(item["path"].replace(chr(92), "/"))}"></figure>' for item in selected.values())
+        navigation = " ".join(f'<a href="#shot-{i + 1}-start">{i + 1}</a>' for i in range(report["shotCount"]))
+        side = report["config"].get("plucking_screen_side", "geometry")
+        method = "Guitar-relative geometric roles." if side == "geometry" else f"Reviewed two-hand layout: plucking screen-{html.escape(side)}; fretting opposite. Single-hand frames use guitar geometry."
+        (output / "index.html").write_text(f'<!doctype html><meta charset="utf-8"><title>Private hand-role review</title><h1>Hand roles - owner review</h1><p>Green: fretting. Orange: plucking. Grey: unknown. {method} Role identity does not establish available fret/contact coordinates. Scores are not calibrated probabilities or contact evidence.</p><nav>Shots: {navigation}</nav>{panels}', encoding="utf-8")
         complete = True
         return output / "review.json", review
     finally:

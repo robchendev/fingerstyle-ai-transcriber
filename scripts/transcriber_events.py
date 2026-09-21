@@ -9,7 +9,7 @@ import torch
 from .score_alignment import ScoreClock
 from .training_windows import projected_targets
 from .transcriber_audio import HarnessError
-from .transcriber_data import training_conditioning
+from .transcriber_data import PAIRED_TECHNIQUE_TARGET_POLICY, training_conditioning
 from .connection_supervision import RELATION_TYPES, SUPERVISION_VERSION, V4_NOTE_TECHNIQUE_TYPES
 
 
@@ -298,6 +298,11 @@ def evaluate_events(model, dataset, device, *, tolerances=(.05, .1, .2), onset_t
     config = dataset.feature_config
     records = []
     totals = {}
+    video_identity = getattr(dataset, "video_identity", None)
+    positive_only_rasgueado = (
+        getattr(dataset, "paired_technique_target_policy", None) == PAIRED_TECHNIQUE_TARGET_POLICY
+        or isinstance(video_identity, dict) and video_identity.get("targetPolicy") == PAIRED_TECHNIQUE_TARGET_POLICY
+    )
     version4 = getattr(getattr(model, "config", None), "architecture_version", None) == 4
     modes = [(module, module.training) for module in model.modules()]
     try:
@@ -310,6 +315,13 @@ def evaluate_events(model, dataset, device, *, tolerances=(.05, .1, .2), onset_t
                 [window["startSample"] / rate + .5, window["stopSampleExclusive"] / rate - .5 - config.hop_seconds]
                 for window in windows if (window["stopSampleExclusive"] - window["startSample"]) / rate > 1 + config.hop_seconds
             ])
+            intervals = dataset.video_training_intervals(record) if callable(getattr(dataset, "video_training_intervals", None)) else None
+            if intervals is not None:
+                scoring = merge_intervals([
+                    [max(left, start), min(right, stop)]
+                    for left, right in scoring for start, stop in intervals
+                    if max(left, start) < min(right, stop)
+                ])
             if not scoring:
                 raise HarnessError("No interior event-scoring coverage remains.")
             percussion_coverage = []
@@ -334,7 +346,15 @@ def evaluate_events(model, dataset, device, *, tolerances=(.05, .1, .2), onset_t
                     features, local_times = dataset._features(record, window)
                     local_times = local_times + window["startSample"] / rate
                     conditioning = training_conditioning(record, local_times)
-                    outputs = model(features[None].to(device), conditioning[None].to(device), torch.tensor([len(features)], dtype=torch.long))
+                    optional = {}
+                    if callable(getattr(dataset, "video_window", None)):
+                        video = dataset.video_window(record, local_times)
+                        if video is not None:
+                            optional["video"] = {name: value.unsqueeze(0).to(device) for name, value in video.items()}
+                    outputs = model(
+                        features[None].to(device), conditioning[None].to(device),
+                        torch.tensor([len(features)], dtype=torch.long), **optional,
+                    )
                     timeline.add({name: value[0] for name, value in outputs.items()}, local_times, window["stopSampleExclusive"] / rate)
                 instrument = data.labels["conditioning"]["instrument"]
                 decoded = decode_events(
@@ -396,6 +416,14 @@ def evaluate_events(model, dataset, device, *, tolerances=(.05, .1, .2), onset_t
                     technique_complete = record.get("techniqueAnnotationsComplete") is True
 
                     def known_technique_negative(event):
+                        if positive_only_rasgueado and event["technique"] == "rasgueado":
+                            # Native positive attributes remain scorable; absence
+                            # is not evidence against a physical a-m-i gesture.
+                            return inside(event["onsetSeconds"], scoring) and any(
+                                known["technique"] == "rasgueado"
+                                and abs(known["onsetSeconds"] - event["onsetSeconds"]) <= tolerance
+                                for known in technique_truth
+                            )
                         return inside(event["onsetSeconds"], scoring) and any(
                             abs(onset - event["onsetSeconds"]) <= tolerance
                             for onset in resolved_attack_times
@@ -433,7 +461,9 @@ def evaluate_events(model, dataset, device, *, tolerances=(.05, .1, .2), onset_t
                         actual = [event for event in guessed if event["technique"] == technique]
                         comparisons[f"technique_{technique}"] = event_counts(
                             expected, actual, tolerance, ("technique",), known_technique_negative,
-                            has_negative_coverage=technique_complete,
+                            has_negative_coverage=technique_complete and not (
+                                positive_only_rasgueado and technique == "rasgueado"
+                            ),
                         )
                 if version4:
                     if "connections" not in record:
@@ -467,6 +497,7 @@ def evaluate_events(model, dataset, device, *, tolerances=(.05, .1, .2), onset_t
         "schemaVersion": 1, "kind": "decoded-event-evaluation", "visibility": "private", "trainingPerformed": False,
         "recordings": records,
         "windowVisits": len(dataset.windows),
+        **({"pairedTechniqueTargetPolicy": PAIRED_TECHNIQUE_TARGET_POLICY} if positive_only_rasgueado else {}),
         **({"techniqueSupervisionVersion": SUPERVISION_VERSION} if version4 else {}),
         "metricsByToleranceSeconds": {key: {name: summarize_counts(value) for name, value in groups.items()} for key, groups in totals.items()},
         "settings": {"onsetThreshold": onset_threshold, "percussionThreshold": percussion_threshold, "techniqueThreshold": technique_threshold,

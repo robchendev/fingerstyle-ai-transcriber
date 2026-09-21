@@ -56,6 +56,20 @@ def sha256(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def frames_in_shot_range(container, stream, shots):
+    first = shots["shots"][0]["startPts"]
+    end = shots["shots"][-1]["endPtsExclusive"]
+    container.seek(first, stream=stream, backward=True, any_frame=False)
+    for frame in container.decode(stream):
+        if frame.pts is None:
+            raise EvidenceError("Decoded frame has no presentation timestamp.")
+        if frame.pts < first:
+            continue
+        if frame.pts >= end:
+            break
+        yield frame
+
+
 def private_output(path):
     root = PRIVATE_OUTPUT_ROOT.resolve()
     value = Path(path)

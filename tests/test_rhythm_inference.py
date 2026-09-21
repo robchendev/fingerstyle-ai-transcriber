@@ -41,6 +41,29 @@ def note(time, duration=1):
 
 
 class RhythmInferenceTests(unittest.TestCase):
+    def test_fingerstyle_policy_keeps_ordinary_onsets_and_ends_on_sixteenths(self):
+        document = {"metadata": metadata(), "audioDurationSeconds": 3, "percussion": [], "techniques": [],
+                    "notes": [note(time, .37) for time in (0., .31, .57, .81, 1.31)]}
+        result, report = infer_notated_timing(document, evidence([i / 2 for i in range(7)], [0., 2.]), rhythm_policy="fingerstyle")
+        self.assertFalse(result["stroke32Windows"])
+        self.assertEqual(report["onsetOptimization"]["tripletBeatCount"], 0)
+        for event in result["notes"]:
+            start = Fraction(*event["scoreOnsetQuarter"])
+            stop = start + Fraction(*event["scoreDurationQuarter"])
+            self.assertEqual((start * 4).denominator, 1)
+            self.assertEqual((stop * 4).denominator, 1)
+
+    def test_fingerstyle_policy_reserves_32nds_for_supported_three_downstrokes(self):
+        document = {
+            "metadata": metadata(), "audioDurationSeconds": 3, "percussion": [],
+            "notes": [note(time, .125) for time in (1.875, 1.9375, 2.)],
+            "techniques": [{"technique": "brush", "direction": "Down", "onsetSeconds": time} for time in (1.875, 1.9375, 2.)],
+        }
+        result, _ = infer_notated_timing(document, evidence([i / 2 for i in range(7)], [0., 2.]), rhythm_policy="fingerstyle")
+        self.assertEqual(result["stroke32Windows"], [{"startQuarter": [15, 4], "endQuarter": [4, 1]}])
+        self.assertEqual([Fraction(*n["scoreOnsetQuarter"]) for n in result["notes"]],
+                         [Fraction(15, 4), Fraction(31, 8), Fraction(4)])
+
     def test_clean_beat_sequence_corrects_phase_and_rubato(self):
         beats = [0.1, 0.6, 1.12, 1.61, 2.1, 2.62, 3.1, 3.6, 4.1]
         mapper = PerformanceMap(evidence(beats, [0.1, 2.1, 4.1]), metadata(), 4.2, event_seconds=[0.1])
@@ -155,6 +178,139 @@ class RhythmInferenceTests(unittest.TestCase):
         }
         _, report = infer_notated_timing(document, evidence([0, .5, 1, 1.5, 2], [0, 2]))
         self.assertEqual(report["onsetOptimization"]["tripletBeatCount"], 0)
+
+    def test_triplet_durations_do_not_end_between_the_selected_rhythm_grids(self):
+        document = {
+            "metadata": metadata(), "audioDurationSeconds": 2,
+            "notes": [note(1 / 6, .5), {**note(1 / 3, .5), "string": 5}],
+            "percussion": [],
+        }
+        result, _ = infer_notated_timing(document, evidence([0, .5, 1, 1.5, 2], [0, 2]))
+        for value in result["notes"]:
+            onset = Fraction(*value["scoreOnsetQuarter"])
+            end = onset + Fraction(*value["scoreDurationQuarter"])
+            self.assertEqual((end * (6 if end < 1 else 8)).denominator, 1)
+
+    def test_compound_hypotheses_cannot_move_or_split_independent_eighths(self):
+        document = {"metadata": metadata(), "audioDurationSeconds": 2,
+                    "notes": [note(t, .5) for t in (0., .25, .5, .75, 1.)], "percussion": [], "techniques": []}
+        beats = evidence([0., .5, 1., 1.5, 2.], [0., 2.])
+        baseline, _ = infer_notated_timing(document, beats)
+        extra = deepcopy(document)
+        for time in (.21, .46, .71, .96):
+            extra["notes"].append({**note(time, .5), "uncertainty": ["technique_membership_completed_attack"],
+                                   "completionParent": {"technique": "rasgueado", "onsetSeconds": time}})
+            extra["techniques"].append({"technique": "rasgueado", "onsetSeconds": time})
+        result, report = infer_notated_timing(extra, beats)
+        self.assertEqual([n["scoreOnsetQuarter"] for n in result["notes"]], [n["scoreOnsetQuarter"] for n in baseline["notes"]])
+        self.assertEqual(len(report["onsetOptimization"]["mergedCompoundDuplicates"]), 4)
+        self.assertEqual([n["scoreDurationQuarter"] for n in result["notes"]], [[1, 2]] * 5)
+
+    def test_compound_chord_tones_survive_alignment_to_an_independent_attack(self):
+        document = {"metadata": metadata(), "audioDurationSeconds": 2, "percussion": [], "techniques": [],
+                    "notes": [note(.5, .5)]}
+        for string, pitch in ((6, 40), (5, 45)):
+            document["notes"].append({**note(.46, .5), "string": string, "soundingPitchMidi": pitch,
+                                     "uncertainty": ["technique_membership_completed_attack"],
+                                     "completionParent": {"technique": "rasgueado", "onsetSeconds": .46}})
+        result, _ = infer_notated_timing(document, evidence([0., .5, 1., 1.5, 2.], [0., 2.]))
+        self.assertEqual(len(result["notes"]), 2)
+        self.assertEqual({n["soundingPitchMidi"] for n in result["notes"]}, {40, 45})
+        self.assertEqual({tuple(n["scoreOnsetQuarter"]) for n in result["notes"]}, {(1, 1)})
+
+    def test_eighth_note_jitter_does_not_activate_32nds_for_one_beat(self):
+        document = {"metadata": metadata(), "audioDurationSeconds": 2,
+                    "notes": [note(t, .5) for t in (0., .25, .5, .75, 1., 1.25, 1.45, 1.75)],
+                    "percussion": [], "techniques": []}
+        result, _ = infer_notated_timing(document, evidence([0., .5, 1., 1.5, 2.], [0., 2.]))
+        self.assertEqual([Fraction(*n["scoreOnsetQuarter"]) for n in result["notes"]],
+                         [Fraction(i, 2) for i in range(8)])
+
+    def test_separately_detected_downstroke_protects_a_compound_completed_32nd(self):
+        document = {
+            "metadata": metadata(), "audioDurationSeconds": 3, "percussion": [],
+            "notes": [note(1.875, .125), note(2., .5), {
+                **note(1.9375, .125), "uncertainty": ["technique_membership_completed_attack"],
+                "completionParent": {"technique": "rasgueado", "onsetSeconds": 1.9375},
+            }],
+            "techniques": [{"onsetSeconds": t, "technique": "brush", "direction": "Down"} for t in (1.875, 1.9375, 2.)],
+        }
+        result, report = infer_notated_timing(document, evidence([i / 2 for i in range(7)], [0., 2.]))
+        self.assertEqual(sorted(Fraction(*n["scoreOnsetQuarter"]) for n in result["notes"]),
+                         [Fraction(15, 4), Fraction(31, 8), Fraction(4)])
+        self.assertFalse(report["onsetOptimization"]["mergedCompoundDuplicates"])
+
+    def test_delayed_brush_completion_fills_a_chord_without_a_second_attack(self):
+        document = {
+            "metadata": metadata(), "audioDurationSeconds": 2, "percussion": [],
+            "notes": [note(.5, 1.), {**note(.55, 1.), "string": 5, "soundingPitchMidi": 45,
+                                   "uncertainty": ["technique_membership_completed_attack"],
+                                   "completionParent": {"technique": "brush", "onsetSeconds": .55}}],
+            "techniques": [{"onsetSeconds": .55, "technique": "brush", "direction": "Down"}],
+        }
+        before = deepcopy(document)
+        result, report = infer_notated_timing(document, evidence([0., .5, 1., 1.5, 2.], [0., 2.]))
+        self.assertEqual(document, before)
+        self.assertEqual(len(result["notes"]), 2)
+        self.assertEqual({tuple(n["scoreOnsetQuarter"]) for n in result["notes"]}, {(1, 1)})
+        self.assertEqual(result["techniques"][0]["scoreOnsetQuarter"], [1, 1])
+        self.assertEqual(len(report["onsetOptimization"]["alignedCompoundCandidates"]), 1)
+
+    def test_similar_chord_durations_share_an_end_without_shortening_the_bass(self):
+        document = {
+            "metadata": metadata(), "audioDurationSeconds": 3, "percussion": [], "techniques": [],
+            "notes": [
+                {**note(0., 2.3), "voiceIndex": 1},
+                *[{**note(0., duration), "string": string, "soundingPitchMidi": pitch}
+                  for string, pitch, duration in ((3, 55, 1.1), (2, 59, .9), (1, 64, .8))],
+            ],
+        }
+        result, report = infer_notated_timing(document, evidence([i / 2 for i in range(7)], [0., 2.]))
+        self.assertEqual(result["notes"][0]["scoreDurationQuarter"], [2, 1])
+        self.assertEqual([n["scoreDurationQuarter"] for n in result["notes"][1:]], [[1, 1]] * 3)
+        self.assertTrue(report["durationOptimization"]["chordDurationNormalization"])
+
+    def test_unsupported_completion_is_reported_but_weak_acoustic_attack_can_support_a_chord(self):
+        from scripts.draft_cleanup import clean_hypotheses
+
+        for has_weak_attack in (False, True):
+            with self.subTest(has_weak_attack=has_weak_attack):
+                document = {
+                    "metadata": metadata(), "audioDurationSeconds": 2, "percussion": [],
+                    "notes": [note(0., .5), {**note(.75, .5), "string": 5, "soundingPitchMidi": 45,
+                                           "uncertainty": ["technique_membership_completed_attack"],
+                                           "completionParent": {"technique": "brush", "onsetSeconds": .75}}],
+                    "techniques": [{"onsetSeconds": .75, "technique": "brush", "direction": "Down", "strings": [5], "confidence": .99,
+                                    "stringMembershipConfidence": {str(i): float(i == 5) for i in range(1, 7)}}],
+                }
+                if has_weak_attack:
+                    document["notes"].append({**note(.75, .5), "confidence": .7})
+                cleaned, _ = clean_hypotheses(document)
+                result, report = infer_notated_timing(cleaned, evidence([0., .5, 1., 1.5, 2.], [0., 2.]))
+                self.assertEqual(len(result["notes"]), 2 if has_weak_attack else 1)
+                self.assertEqual(len(report["onsetOptimization"]["deferredUnsupportedCandidates"]), 0 if has_weak_attack else 1)
+
+    def test_three_downstroke_components_survive_when_only_the_landing_has_a_strong_note(self):
+        document = {
+            "metadata": metadata(), "audioDurationSeconds": 3, "percussion": [],
+            "notes": [note(2., .5), *[
+                {**note(t, .125), "uncertainty": ["technique_membership_completed_attack"],
+                 "completionParent": {"technique": "brush", "onsetSeconds": t}} for t in (1.875, 1.9375)
+            ]],
+            "techniques": [{"onsetSeconds": t, "technique": "brush", "direction": "Down"} for t in (1.875, 1.9375, 2.)],
+            "acousticAttackEvidence": [{"onsetSeconds": 2., "confidence": .99}],
+        }
+        result, report = infer_notated_timing(document, evidence([i / 2 for i in range(7)], [0., 2.]))
+        self.assertEqual(sorted(Fraction(*n["scoreOnsetQuarter"]) for n in result["notes"]),
+                         [Fraction(15, 4), Fraction(31, 8), Fraction(4)])
+        self.assertFalse(report["onsetOptimization"]["deferredUnsupportedCandidates"])
+
+    def test_duration_normalization_bridges_only_a_small_predicted_gap(self):
+        for following, expected in ((.5, [1, 1]), (1., [3, 4])):
+            document = {"metadata": metadata(), "audioDurationSeconds": 3, "percussion": [], "techniques": [],
+                        "notes": [note(0., .8), note(following, 1.)]}
+            result, _ = infer_notated_timing(document, evidence([i / 2 for i in range(7)], [0., 2.]))
+            self.assertEqual(result["notes"][0]["scoreDurationQuarter"], expected)
 
 
 if __name__ == "__main__":

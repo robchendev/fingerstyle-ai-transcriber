@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import json
-import math
 from pathlib import Path
 import subprocess
-from uuid import uuid4
 
 import numpy as np
 from scipy.signal import correlate
 
-from core import EvidenceError, private_output, sha256
+from catalog import check_audio_asset, source_for_pair, source_video_id
+from core import EvidenceError, publish_json, sha256
 from intake import ffmpeg_executables
 
 
@@ -57,6 +56,43 @@ def _normalized_valid_correlation(source, clip):
     return numerator / denominator
 
 
+def load_source_provenance(mapping_path, receipt_path, pair_id, video_path, audio_path):
+    mapping = json.loads(Path(mapping_path).read_text(encoding="utf-8"))
+    if not isinstance(mapping, dict) or type(mapping.get("schemaVersion")) is not int or mapping["schemaVersion"] != 2 or mapping.get("kind") != "active-pair-video-sources":
+        raise EvidenceError("Retained trims require a version2 source mapping; migrate the archived catalog into a new file.")
+    url = source_for_pair(mapping, pair_id)
+    row = next(row for row in mapping["pairs"] if row["pairId"] == pair_id)
+    asset = check_audio_asset(row.get("audioAsset"), audio_path)
+    receipt = json.loads(Path(receipt_path).read_text(encoding="utf-8"))
+    if (not isinstance(receipt, dict) or receipt.get("kind") != "authorized-source-video" or type(receipt.get("schemaVersion")) is not int or receipt["schemaVersion"] != 1
+            or receipt.get("videoSha256") != sha256(video_path)
+            or receipt.get("videoFile") != Path(video_path).name):
+        raise EvidenceError("Source-video receipt does not bind the supplied video.")
+    if not isinstance(receipt.get("metadata"), dict) or receipt["metadata"].get("id") != asset["sourceVideoId"] or source_video_id(url) != asset["sourceVideoId"]:
+        raise EvidenceError("Source-video receipt ID differs from the retained audio's original video.")
+    return {
+        "pairId": pair_id, "mappingSha256": sha256(mapping_path),
+        "videoReceiptSha256": sha256(receipt_path), "audioAsset": asset,
+    }
+
+
+def align_retained_source(video_path, audio_path, output_path, *, mapping_path, receipt_path, pair_id):
+    provenance = load_source_provenance(mapping_path, receipt_path, pair_id, video_path, audio_path)
+    asset = provenance["audioAsset"]
+    first = asset["sourceSampleBounds"]["startSample"]
+    report = {
+        "schemaVersion": 1, "kind": "video-to-trimmed-audio-alignment", "visibility": "private",
+        "videoSha256": sha256(video_path), "trimmedAudioSha256": asset["sha256"],
+        "method": "retained-source-samples", "sourceProvenance": provenance,
+        "sampleRate": asset["sampleRate"], "trimmedAudioDurationSeconds": asset["sampleCount"] / asset["sampleRate"],
+        "videoStartSecondsForTrimmedAudioZero": first / asset["sampleRate"],
+        "mapping": "trimmedAudioSample = sourceTimeSeconds * sampleRate - retainedStartSample",
+        "correlation": None, "status": "supported", "reviewRequired": False,
+        "rate": [1, 1], "trainingPerformed": False,
+    }
+    return publish_json(output_path, report), report
+
+
 def align_soundtrack(video_path, trimmed_audio_path, output_path, *, sample_rate=8000, envelope_rate=200):
     video_path, trimmed_audio_path = Path(video_path), Path(trimmed_audio_path)
     if not video_path.is_file() or not trimmed_audio_path.is_file():
@@ -95,12 +131,4 @@ def align_soundtrack(video_path, trimmed_audio_path, output_path, *, sample_rate
         "rate": [1, 1],
         "trainingPerformed": False,
     }
-    output_path = private_output(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    pending = output_path.with_name(f".{output_path.name}.{uuid4().hex}.part")
-    try:
-        pending.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8", newline="\n")
-        pending.replace(output_path)
-    finally:
-        pending.unlink(missing_ok=True)
-    return output_path, report
+    return publish_json(output_path, report), report

@@ -4,6 +4,7 @@ from bisect import bisect_right
 from collections import defaultdict
 from copy import deepcopy
 from fractions import Fraction
+from functools import lru_cache
 import hashlib
 import json
 import math
@@ -13,7 +14,7 @@ import xml.etree.ElementTree as ET
 
 from .gp_events import HARMONIC_OFFSETS, NOTE_VALUES, TEMPO_BEAT_UNITS, decode_score
 from .draft_cleanup import DraftProfile, clean_hypotheses
-from .rhythm_inference import TICKS_PER_QUARTER
+from .rhythm_inference import TICKS_PER_QUARTER, _fine_stroke_position
 from .gp_normalization import (
     GPIF_ENTRY,
     NormalizationError,
@@ -328,7 +329,10 @@ def _validate_predictions(document):
             "direction": value["direction"],
             "strings": sorted(set(value["strings"]), reverse=True),
             "confidence": _finite(value["confidence"], "Technique confidence", minimum=0),
+            "strokeFinger": value.get("strokeFinger"),
         })
+        if techniques[-1]["strokeFinger"] not in (None, "a", "m", "i"):
+            raise HarnessError("A normalized downstroke finger must be a, m or i.")
     if not notes and not percussion:
         raise HarnessError("GP output requires at least one decoded note or percussion event.")
     if any(structured_flags) and not all(structured_flags):
@@ -338,7 +342,8 @@ def _validate_predictions(document):
         rhythm_counts = {"constrained-24-tick": len({note["onsetRaw"] for note in notes} | {event["onsetRaw"] for event in percussion} | {event["onsetRaw"] for event in techniques})}
         for note in notes:
             note["onset"] = note["onsetRaw"]
-            note["rhythmGrid"] = Fraction(1, TICKS_PER_QUARTER)
+            note["rhythmGrid"] = Fraction(1, TICKS_PER_QUARTER) if document.get("rhythmPolicy") != "fingerstyle" else (
+                GRID if _fine_stroke_position(document, note["onset"]) else Fraction(1, 4))
             note["duration"] = note["durationRaw"]
             note["durationQuantized"] = note["duration"]
             note["end"] = note["onset"] + note["duration"]
@@ -395,7 +400,8 @@ def _resolve_notes(notes, tuning, capo, audio_end):
     for note in resolved:
         if note["end"] > audio_end:
             available = max(Fraction(0), audio_end - note["onset"])
-            bounded = max(note["rhythmGrid"], available // note["rhythmGrid"] * note["rhythmGrid"])
+            minimum = max(note["rhythmGrid"], Fraction(1, 6) if note["onset"].denominator % 3 == 0 else GRID)
+            bounded = max(minimum, available // note["rhythmGrid"] * note["rhythmGrid"])
             shortened.append({
                 "id": note["id"], "reason": "clamped_to_audio_end",
                 "fromDurationQuarter": _rational(note["duration"]),
@@ -458,6 +464,32 @@ def _resolve_percussion(percussion):
         else:
             dropped.append({"id": event["id"], "reason": "duplicate_quantized_percussion", "kept": current["id"]})
     return sorted(selected.values(), key=lambda item: (item["onset"], PERCUSSION_TYPES.index(item["technique"]))), dropped
+
+
+def _attach_techniques(notes, techniques):
+    attacks = sorted({note["onset"] for note in notes})
+    selected, changes = {}, []
+    for event in techniques:
+        if not attacks:
+            changes.append({"id": event["id"], "reason": "no_pitched_attack"})
+            continue
+        nearest = min(attacks, key=lambda onset: (abs(onset - event["onset"]), onset))
+        if abs(nearest - event["onset"]) > Fraction(1, 8):
+            changes.append({"id": event["id"], "reason": "no_nearby_pitched_attack", "onsetQuarter": _rational(event["onset"])})
+            continue
+        if nearest != event["onset"]:
+            changes.append({"id": event["id"], "reason": "attach_to_existing_attack",
+                            "fromQuarter": _rational(event["onset"]), "toQuarter": _rational(nearest)})
+        event = {**event, "onset": nearest}
+        key = nearest, event["technique"]
+        current = selected.get(key)
+        if current is None or event["confidence"] > current["confidence"]:
+            if current is not None:
+                changes.append({"id": current["id"], "reason": "duplicate_attack_articulation", "kept": event["id"]})
+            selected[key] = event
+        else:
+            changes.append({"id": event["id"], "reason": "duplicate_attack_articulation", "kept": current["id"]})
+    return sorted(selected.values(), key=lambda event: (event["onset"], event["technique"])), changes
 
 
 def _bind_connection_origins(document):
@@ -663,13 +695,68 @@ def _split_duration(duration):
                 remaining -= value
         return result, remaining
 
-    result, remaining = decompose([item for item in RHYTHM_PALETTE if item[1][2] is None])
+    binary = [item for item in RHYTHM_PALETTE if item[1][2] is None]
+    # A triplet interval must not first consume binary values and leave an
+    # arbitrary tiny tuplet remainder (e.g. 1/3 quarter is one triplet eighth).
+    palette = binary if duration.denominator & (duration.denominator - 1) == 0 else [
+        item for item in RHYTHM_PALETTE if item[1][2] is not None
+    ]
+    result, remaining = decompose(palette)
     if not remaining:
         return result
-    result, remaining = decompose(RHYTHM_PALETTE)
-    if remaining:
-        result.append((remaining, ("Quarter", 0, (remaining.denominator, remaining.numerator))))
-    return result
+    raise HarnessError(f"Duration {duration} cannot be spelled using supported binary or triplet values.")
+
+
+def _spell_interval(start, stop, measure, *, rest=False):
+    meter = measure["meter"]
+    numerator, denominator = meter
+    if numerator not in (2, 3, 4) and not (numerator > 3 and numerator % 3 == 0):
+        return _split_duration(stop - start)
+    group = Fraction(12, denominator) if numerator > 3 and numerator % 3 == 0 else Fraction(4, denominator)
+    origin = measure["start"]
+    if measure.get("pickup"):
+        origin = measure["end"] - _meter_duration(meter)
+
+    @lru_cache(None)
+    def spell(cursor):
+        if cursor == stop:
+            return ()
+        offset = cursor - origin
+        boundary = origin + (offset // group + 1) * group
+        local_stop = min(stop, boundary)
+        triplet = cursor.denominator % 3 == 0 or local_stop.denominator % 3 == 0
+        best = None
+        for duration, notation in RHYTHM_PALETTE:
+            if measure.get("rhythmPolicy") == "fingerstyle" and (notation[1] > 1 or notation[1] and NOTE_VALUES[notation[0]] < Fraction(1, 2)):
+                continue
+            end = cursor + duration
+            if end > stop:
+                continue
+            if triplet:
+                if notation[2] is None or (duration * 6).denominator != 1 or end > boundary:
+                    continue
+            elif notation[2] is not None or (duration * 8).denominator != 1:
+                continue
+            if offset % group and end > boundary:
+                continue
+            if rest and end > boundary and (cursor != measure["start"] or end != measure["end"]):
+                continue
+            compound_group = numerator > 3 and numerator % 3 == 0 and not offset % group and not duration % group
+            if not notation[2] and not compound_group and duration >= group and NOTE_VALUES[notation[0]] > group and offset % NOTE_VALUES[notation[0]]:
+                continue
+            tail = spell(end)
+            if tail is None:
+                continue
+            candidate = ((duration, notation), *tail)
+            rank = (len(candidate), sum(row[1][1] > 1 for row in candidate), sum(row[1][2] is not None for row in candidate))
+            if best is None or rank < best[0]:
+                best = rank, candidate
+        return None if best is None else best[1]
+
+    result = spell(start)
+    if result is None:
+        raise HarnessError(f"Cannot spell metrical interval {start}..{stop} in {numerator}/{denominator}.")
+    return list(result)
 
 
 def _prototype_pitch_offsets(root):
@@ -1001,24 +1088,31 @@ class _ScoreWriter:
             properties = ET.SubElement(beat, "Properties")
         for event in events:
             technique, direction = event["technique"], event["direction"]
+            if technique == "rasgueado":
+                raise HarnessError("Native GP Rasgueado playback is forbidden; use independently timed brush downstrokes.")
+            if event.get("strokeFinger"):
+                existing = beat.findtext("FreeText", "")
+                _set_text(beat, "FreeText", " ".join((*existing.split(), event["strokeFinger"])))
             if technique == "arpeggio":
                 _set_text(beat, "Arpeggio", direction)
                 continue
             name, child, value = {
                 "brush": ("Brush", "Direction", direction),
                 "pick_stroke": ("PickStroke", "Direction", direction),
-                "rasgueado": ("Rasgueado", "Rasgueado", "ami_2"),
             }[technique]
-            prop = ET.SubElement(properties, "Property", name=name)
-            ET.SubElement(prop, child).text = value
+            prop = properties.find(f"./Property[@name='{name}']")
+            if prop is None:
+                prop = ET.SubElement(properties, "Property", name=name)
+            _set_text(prop, child, value)
             if technique == "brush":
                 xproperties = beat.find("XProperties")
                 if xproperties is None:
                     xproperties = ET.SubElement(beat, "XProperties")
-                duration = ET.SubElement(xproperties, "XProperty", id=BRUSH_DURATION_XPROPERTY)
-                ET.SubElement(duration, "Int").text = str(INSTANT_BRUSH_DURATION_TICKS)
-                start = ET.SubElement(xproperties, "XProperty", id=BRUSH_START_XPROPERTY)
-                ET.SubElement(start, "Float").text = "0"
+                for identifier, child, value in ((BRUSH_DURATION_XPROPERTY, "Int", str(INSTANT_BRUSH_DURATION_TICKS)), (BRUSH_START_XPROPERTY, "Float", "0")):
+                    prop = xproperties.find(f"./XProperty[@id='{identifier}']")
+                    if prop is None:
+                        prop = ET.SubElement(xproperties, "XProperty", id=identifier)
+                    _set_text(prop, child, value)
 
     def voice_beats(self, measure, voice):
         notes = [note for note in self.notes if note["voice"] == voice and note["onset"] < measure["end"] and note["end"] > measure["start"]]
@@ -1040,6 +1134,11 @@ class _ScoreWriter:
                     if not active:
                         later = min((value for value in boundaries if value > event["onset"]), default=measure["end"])
                         maximum = SINGLE_VOICE_BRIDGE_QUARTER if self.simplified else PERCUSSION_DURATION
+                        beat = event["onset"] // 1
+                        if not self.simplified and any(
+                            point // 1 == beat and point.denominator % 3 == 0 for point in boundaries
+                        ):
+                            maximum = Fraction(1, 6)
                         if later - event["onset"] > maximum:
                             boundaries.add(event["onset"] + maximum)
         points = sorted(boundaries)
@@ -1049,7 +1148,7 @@ class _ScoreWriter:
             carriers, text = self.percussion_content(left, voice)
             techniques = self.technique_content(left, voice)
             cursor = left
-            for duration, notation in _split_duration(right - left):
+            for duration, notation in _spell_interval(left, right, measure, rest=not active and not carriers and not text):
                 stop = cursor + duration
                 local_carriers = carriers if cursor == left else []
                 local_text = text if cursor == left else ""
@@ -1244,7 +1343,14 @@ def _atomic_bytes(path, content):
             temporary.unlink()
 
 
-def write_gp_outputs(template_path, predictions, full_path, single_path, *, profile=DraftProfile(), beat_evidence=None, include_unsupported_tail=False, arranger=None, completer=None, completion_threshold=.8, completion_technique_threshold=.8):
+def write_gp_outputs(template_path, predictions, full_path, single_path, *, profile=DraftProfile(), beat_evidence=None, include_unsupported_tail=False, arranger=None, completer=None, completion_threshold=.8, completion_technique_threshold=.8, playing_evidence=None, progress=None):
+    def emit(message):
+        if progress is not None:
+            progress(f"GP export: {message}")
+
+    emit("reading template and validating export inputs...")
+    if profile.rhythm_policy == "fingerstyle" and beat_evidence is None:
+        raise HarnessError("The fingerstyle rhythm policy requires beat evidence to locate supported 32nd-note stroke figures.")
     template_path = Path(template_path).resolve()
     if not template_path.is_file():
         raise HarnessError(f"GP output template does not exist: {template_path}")
@@ -1252,56 +1358,101 @@ def write_gp_outputs(template_path, predictions, full_path, single_path, *, prof
     template_hash = hashlib.sha256(template_raw).hexdigest()
     if Path(full_path).absolute() == Path(single_path).absolute():
         raise HarnessError("Full-voice and single-voice GP outputs require different paths.")
+    playing_report = None
+    if playing_evidence is not None:
+        from .playing_evidence import apply_playing_evidence, validate_playing_evidence
+
+        if beat_evidence is None:
+            raise HarnessError("Playing evidence requires beat evidence for the exact exported score timing.")
+        if "handPositionEvidence" in predictions:
+            raise HarnessError("Playing evidence conflicts with existing hand-position evidence.")
+        validate_playing_evidence(playing_evidence, predictions)
+    emit("template and inputs ready; filtering note, percussion and technique candidates...")
     cleaned, cleanup = clean_hypotheses(predictions, profile)
+    emit(f"confidence filtering completed ({len(cleaned['notes'])} note candidates).")
     rhythm_inference = None
+    stroke_normalization = None
     if beat_evidence is not None:
         if beat_evidence.get("audioSha256") != predictions.get("audioSha256"):
             raise HarnessError("Beat evidence and transcription hypotheses reference different audio.")
         from .rhythm_inference import infer_notated_timing
 
-        cleaned, rhythm_inference = infer_notated_timing(cleaned, beat_evidence, include_unsupported_tail=include_unsupported_tail)
+        emit("quantizing rhythm and selecting durations...")
+        cleaned, rhythm_inference = infer_notated_timing(cleaned, beat_evidence, include_unsupported_tail=include_unsupported_tail, rhythm_policy=profile.rhythm_policy)
+        emit("rhythm quantization completed; normalizing downstroke groups...")
+        from .stroke_normalization import normalize_downstroke_bursts
+
+        cleaned, stroke_normalization = normalize_downstroke_bursts(cleaned)
+        emit("downstroke normalization completed.")
+    if playing_evidence is not None:
+        cleaned, playing_report = apply_playing_evidence(cleaned, playing_evidence, audio_predictions=predictions)
     cleaned = _bind_connection_origins(cleaned)
     arranger_applied = False
     if arranger is not None:
         from .fingering_arranger import apply_arranger
 
+        emit("applying the selected fingering arranger...")
         cleaned = apply_arranger(arranger, cleaned)
+        emit("fingering arranger completed.")
         arranger_applied = True
     from .fingering_optimizer import optimize_fingerings
 
+    emit("optimizing playable fingering candidates...")
     cleaned, fingering_optimization = optimize_fingerings(cleaned)
+    emit("fingering optimization completed.")
     completion = None
     fingering_before_completion = None
     if completer is not None:
         from .symbolic_completer import complete_document
 
         fingering_before_completion = fingering_optimization
+        emit("applying the selected symbolic completer...")
         cleaned, completion = complete_document(
-            completer, cleaned, threshold=completion_threshold,
+            completer, cleaned, threshold=max(completion_threshold, profile.note_threshold) if profile.strict_note_confidence else completion_threshold,
             technique_threshold=completion_technique_threshold,
         )
-        if completion["addedCount"]:
+        if completion["addedCount"] or completion["replacedCount"] or completion["removedCount"]:
             for index, note in enumerate(cleaned["notes"]):
                 if "_connectionToken" not in note:
                     note["_connectionToken"] = f"completed-note-{index}"
+            if playing_evidence is not None:
+                cleaned.pop("handPositionEvidence", None)
+                cleaned, playing_report = apply_playing_evidence(cleaned, playing_evidence, audio_predictions=predictions)
             if arranger is not None:
                 cleaned = apply_arranger(arranger, cleaned)
             cleaned, fingering_optimization = optimize_fingerings(cleaned)
+        emit("symbolic completion and fingering reconciliation completed.")
+    suppressed_rasgueado = [event for event in cleaned.get("techniques", []) if event["technique"] == "rasgueado"]
+    cleaned["techniques"] = [event for event in cleaned.get("techniques", []) if event["technique"] != "rasgueado"]
+    tuning, capo, tempo, audio_end, raw_notes, raw_percussion, raw_techniques, rhythm_counts, structured = _validate_predictions(cleaned)
+    notes, reconciled, unresolved, shortened, dropped_notes = _resolve_notes(raw_notes, tuning, capo, audio_end)
+    percussion, dropped_percussion = _resolve_percussion(raw_percussion)
+    raw_techniques, technique_attachment = _attach_techniques(notes, raw_techniques)
     voice_optimization = None
     if rhythm_inference is not None:
         from .voice_optimizer import optimize_voices
 
-        cleaned, voice_optimization = optimize_voices(cleaned)
-    tuning, capo, tempo, audio_end, raw_notes, raw_percussion, raw_techniques, rhythm_counts, structured = _validate_predictions(cleaned)
-    notes, reconciled, unresolved, shortened, dropped_notes = _resolve_notes(raw_notes, tuning, capo, audio_end)
-    percussion, dropped_percussion = _resolve_percussion(raw_percussion)
+        voice_input = {"notes": [{
+            "scoreOnsetQuarter": _rational(note["onset"]), "scoreDurationQuarter": _rational(note["duration"]),
+            "soundingPitchMidi": note["soundingPitchMidi"], "voiceIndex": note["voice"],
+        } for note in notes]}
+        emit("assigning voices and reducing tied fragments...")
+        voiced, voice_optimization = optimize_voices(voice_input)
+        for note, value in zip(notes, voiced["notes"]):
+            note["voice"] = value["voiceIndex"]
+        emit("voice assignment completed.")
     content_end = max(audio_end, max([note["onset"] + note["rhythmGrid"] for note in notes] + [event["onset"] + PERCUSSION_DURATION for event in percussion] + [event["onset"] + GRID for event in raw_techniques], default=GRID))
     measures = _measures(cleaned, tempo, content_end)
+    for measure in measures:
+        measure["rhythmPolicy"] = profile.rhythm_policy
     notated_tempo_changes = cleaned.get("notatedTempoChanges")
     initial_tempo = cleaned.get("notatedInitialTempo")
+    emit("building full-voice GP notation...")
     full, full_report = _build_variant(template_raw, notes, percussion, raw_techniques, measures, tuning, capo, tempo, simplified=False, notated_tempo_changes=notated_tempo_changes, initial_tempo=initial_tempo)
+    emit("full-voice notation completed; building the single-voice version...")
     simple_notes = _simplified_notes(notes, percussion)
     single, single_report = _build_variant(template_raw, simple_notes, percussion, raw_techniques, measures, tuning, capo, tempo, simplified=True, notated_tempo_changes=notated_tempo_changes, initial_tempo=initial_tempo)
+    emit("single-voice notation completed.")
     if hashlib.sha256(template_path.read_bytes()).hexdigest() != template_hash:
         raise HarnessError("GP template changed while outputs were generated.")
     report = {
@@ -1320,8 +1471,12 @@ def write_gp_outputs(template_path, predictions, full_path, single_path, *, prof
         "fingeringBeforeCompletion": fingering_before_completion,
         "fingeringArrangerApplied": arranger_applied,
         "symbolicCompletion": completion,
-        "strokePolicy": "Preserve predicted attacks; never fabricate a paired stroke from bar position alone.",
+        "strokePolicy": "Never emit native GP Rasgueado. Normalize supported overly dense downstroke groups to a-m-i ending on a beat; preserve other note candidates and never synthesize missing strokes from a compound score alone.",
+        "strokeNormalization": stroke_normalization,
+        "suppressedPostprocessingRasgueado": suppressed_rasgueado,
+        "rhythmSpellingPolicy": "Minimize written fragments under simple/compound beat grouping. Off-beat carries and rests expose beat boundaries; binary/triplet portions use their own values. Preserve logical attacks and sustain. Unspecified additive groupings retain duration-only spelling.",
         "voiceOptimization": voice_optimization,
+        "techniqueAttachment": technique_attachment,
         "rhythmicGridPolicy": {
             "mode": "beat-anchored-constrained" if structured else "nominal-tempo-fallback",
             "candidateQuarterGrids": [_rational(value[0]) for value in RHYTHM_GRIDS] if not structured else None,
@@ -1348,14 +1503,23 @@ def write_gp_outputs(template_path, predictions, full_path, single_path, *, prof
         "linearPerformanceOrder": True,
         "trainingPerformed": False,
     }
+    if playing_report is not None:
+        playing_report.update(
+            appliedPositionRangeCount=fingering_optimization["handPositionEvidenceCount"],
+            positionConflictCount=fingering_optimization["handPositionEvidenceConflictCount"],
+            positionOptimization=fingering_optimization["handPositionEvidence"],
+        )
+        report["playingEvidence"] = playing_report
     try:
         json.dumps(report, allow_nan=False)
     except (TypeError, ValueError) as error:
         raise HarnessError(f"GP output report is not safely serializable: {error}") from error
+    emit("writing both GP files...")
     _atomic_bytes(full_path, full)
     try:
         _atomic_bytes(single_path, single)
     except Exception:
         Path(full_path).unlink(missing_ok=True)
         raise
+    emit("both GP files saved.")
     return report

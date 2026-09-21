@@ -43,6 +43,19 @@ class VoiceOptimizerTests(unittest.TestCase):
         with self.assertRaises(HarnessError):
             optimize_voices({"notes": [note([0, 1], [0, 1], 60, 0)]})
 
+    def test_chord_sizes_do_not_overcount_a_shared_boundary_and_sustains_are_unchanged(self):
+        document = {"notes": [
+            note([0, 1], [2, 1], 40, 0),
+            *[note([i, 2], [1, 2], pitch, 0) for i in range(4) for pitch in (60, 64, 67)],
+        ]}
+        original = deepcopy(document)
+        result, report = optimize_voices(document)
+        self.assertEqual(document, original)
+        for before, after in zip(document["notes"], result["notes"]):
+            self.assertEqual({k: v for k, v in before.items() if k != "voiceIndex"},
+                             {k: v for k, v in after.items() if k != "voiceIndex"})
+        self.assertEqual(report["estimatedSegmentsAfter"], len(document["notes"]))
+
 
 if __name__ == "__main__":
     unittest.main()

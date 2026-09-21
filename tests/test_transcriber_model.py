@@ -159,6 +159,69 @@ class ModelTests(unittest.TestCase):
         for name in original:
             self.assertTrue(torch.equal(original[name], restored[name]), name)
 
+    def test_encode_decode_preserves_original_checkpoint_keys_and_forward_values(self):
+        from torch.nn import functional as F
+        from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+
+        for version in (1, 2, 3, 4):
+            with self.subTest(version=version):
+                model = FingerstyleTranscriber(ModelConfig(
+                    architecture_version=version, n_mels=9, hidden_size=8,
+                    recurrent_layers=2, dropout=0,
+                )).eval()
+                expected_keys = {
+                    f"{module}.{parameter}" for module in ("conv1", "conv2", "projection.0")
+                    for parameter in ("weight", "bias")
+                }
+                expected_keys.update(
+                    f"recurrent.{parameter}_l{layer}{direction}"
+                    for parameter in ("weight_ih", "weight_hh", "bias_ih", "bias_hh")
+                    for layer in range(2) for direction in ("", "_reverse")
+                )
+                expected_keys.update(
+                    f"heads.{name}.{parameter}" for name in model.head_shapes for parameter in ("weight", "bias")
+                )
+                self.assertEqual(set(model.state_dict()), expected_keys)
+                features, conditioning = torch.randn(2, 5, 9), torch.randn(2, 5, 12)
+                lengths = torch.tensor([3, 5])
+                valid = torch.arange(5)[None, :] < lengths[:, None]
+                hidden = features.masked_fill(~valid[:, :, None], 0)[:, None, :, :]
+                hidden = F.gelu(model.conv1(hidden)).masked_fill(~valid[:, None, :, None], 0)
+                hidden = F.gelu(model.conv2(hidden)).masked_fill(~valid[:, None, :, None], 0)
+                hidden = model.projection(hidden.permute(0, 2, 1, 3).flatten(2))
+                hidden = torch.cat((hidden, conditioning.masked_fill(~valid[:, :, None], 0)), dim=-1)
+                packed, _ = model.recurrent(pack_padded_sequence(
+                    hidden, lengths, batch_first=True, enforce_sorted=False,
+                ))
+                hidden, _ = pad_packed_sequence(packed, batch_first=True, total_length=5)
+                reference = {}
+                for name, head in model.heads.items():
+                    values = head(hidden).reshape(2, 5, *model.head_shapes[name])
+                    if name == "duration_log":
+                        values = F.softplus(values)
+                    mask = valid.reshape(2, 5, *([1] * len(model.head_shapes[name])))
+                    reference[name] = values.masked_fill(~mask, 0)
+                encoded, mask = model.encode(features, conditioning, lengths)
+                self.assertTrue(torch.equal(encoded, hidden))
+                self.assertTrue(torch.equal(mask, valid))
+                for outputs in (
+                    model(features, conditioning, lengths), model.decode_hidden(encoded, mask),
+                ):
+                    for name in reference:
+                        self.assertTrue(torch.equal(outputs[name], reference[name]), name)
+
+    def test_decode_hidden_rejects_invalid_shared_feature_inputs(self):
+        model = FingerstyleTranscriber(ModelConfig(n_mels=8, hidden_size=4, recurrent_layers=1))
+        hidden, valid = torch.zeros(2, 3, 8), torch.ones(2, 3, dtype=torch.bool)
+        for value, mask, error in (
+            ([], valid, TypeError), (hidden[:, 0], valid, ValueError),
+            (hidden[:, :0], valid[:, :0], ValueError), (hidden[:, :, :7], valid, ValueError),
+            (hidden.double(), valid, TypeError), (hidden, valid.float(), TypeError),
+            (hidden, valid[:, :2], ValueError), (hidden + float("nan"), valid, ValueError),
+        ):
+            with self.subTest(error=error), self.assertRaises(error):
+                model.decode_hidden(value, mask)
+
     def test_v2_adds_technique_heads_without_changing_v1_state_contract(self):
         config = ModelConfig(architecture_version=2, hidden_size=8, recurrent_layers=1, dropout=0)
         model = FingerstyleTranscriber(config)

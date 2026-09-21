@@ -1,4 +1,7 @@
 from types import SimpleNamespace
+from copy import deepcopy
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
@@ -13,6 +16,95 @@ MODEL = SimpleNamespace(max_fret=36, max_voices=4)
 
 
 class TargetEncodingTests(unittest.TestCase):
+    def test_joint_selection_keeps_prepared_tracking_gaps_and_masks_unprepared_targets(self):
+        from scripts import transcriber
+        from scripts.dataset_io import ROOT, publish_json, sha256
+        from scripts.paired_video import build_index
+        from scripts.transcriber_audio import FeatureConfig, HarnessError
+        from scripts.transcriber_model import ModelConfig
+        from scripts.transcriber_data import TrainingDataset
+        from tests.test_dataset_release import synthetic_release
+        from tests.test_paired_video import bundle_fixture
+
+        with TemporaryDirectory(prefix=".joint-data-", dir=ROOT) as directory:
+            root = Path(directory)
+            manifest = synthetic_release(root / "release", percussion_complete=True)
+            audio = root / "release" / "audio" / "piece-0.flac"
+            bundle, report, arrays = bundle_fixture(root, audio)
+            observed_arrays = deepcopy(arrays)
+            arrays["structured"].fill(0)
+            arrays["structured_available"].fill(False)
+            arrays["segment_id"].fill(-1)
+            np.savez_compressed(bundle.with_name("inputs.npz"), **arrays)
+            report["arraysSha256"] = sha256(bundle.with_name("inputs.npz"))
+            publish_json(bundle, report)
+            index, _ = build_index(manifest, [bundle], root / "index.json", root=root)
+            config = transcriber.default_config()
+            config["data"]["manifest"] = str(manifest)
+            config["video"] = {"index": str(index), "model": {}}
+            features = FeatureConfig(sample_rate=8000, n_fft=512, hop_length=160, n_mels=16, f_max=3000)
+            model = ModelConfig(architecture_version=2, n_mels=16, hidden_size=4, recurrent_layers=1)
+            raw = TrainingDataset(manifest, "train", features, model, root=root, video_index_path=index)
+            selected = transcriber.make_dataset(config, features, model, "train", root)
+            self.assertEqual(len(selected), 1)
+            self.assertEqual(selected.video_paired_window_indices, [0])
+            self.assertEqual(selected.video_coverage["preparedAudioFrames"], 8)
+            self.assertEqual(selected.video_coverage["audioFramesWithUsableVideo"], 0)
+            self.assertEqual(selected.video_coverage["audioFramesWithCoarseContext"], 0)
+            self.assertEqual(selected.video_coverage["trackingGapOnlyWindows"], 1)
+            item, original = selected[0], raw[0]
+            self.assertTrue((item["video"]["frame_indices"] == -1).all())
+            self.assertFalse(item["video"]["structured_available"].any())
+            for name in item["targets"]:
+                torch.testing.assert_close(item["targets"][name], original["targets"][name])
+            self.assertTrue(item["masks"]["note_onset"][50, 0])
+            self.assertTrue(item["masks"]["percussion"][50, 0])
+            self.assertFalse(item["masks"]["note_onset"][:50].any())
+            self.assertFalse(item["masks"]["note_onset"][58:].any())
+            from scripts.technique_supervision import TECHNIQUE_TYPES
+            from scripts.transcriber_data import PAIRED_TECHNIQUE_TARGET_POLICY
+
+            ablation = TrainingDataset(manifest, "train", features, model, root=root)
+            axis = TECHNIQUE_TYPES.index("rasgueado")
+            self.assertTrue(ablation[0]["masks"]["technique"][:, axis].any())
+            ablation.paired_technique_target_policy = PAIRED_TECHNIQUE_TARGET_POLICY
+            self.assertFalse(ablation[0]["masks"]["technique"][:, axis].any())
+            self.assertNotIn("video", ablation[0])
+            with self.assertRaisesRegex(HarnessError, "No source-bound prepared paired windows"):
+                transcriber.make_dataset(config, features, model, "validation", root)
+
+            from scripts.dataset_release import validate_release
+            from scripts.score_alignment import ScoreClock
+            from scripts.training_windows import projected_targets, targets_in_window
+
+            manifest_data, records, bindings = validate_release(manifest)
+            _, payload = records[0]
+            labels = payload["canonical"]
+            notes, gestures = projected_targets(labels, payload["candidate"], ScoreClock(labels, payload["normalization"]))
+            payload["windows"] = [{
+                "windowId": f"synthetic-{start}", "startSample": start, "stopSampleExclusive": start + 16000,
+                "targets": targets_in_window(notes, gestures, start, start + 16000, 8000, percussion_coverage=[[0., 6.]]),
+            } for start in (0, 16000, 32000)]
+            manifest_data["counts"]["windowsBySplit"]["train"] = 3
+            np.savez_compressed(bundle.with_name("inputs.npz"), **observed_arrays)
+            report["arraysSha256"] = sha256(bundle.with_name("inputs.npz"))
+            report["clips"] = [{"startPts": 1000, "endPtsExclusive": 4000}]
+            publish_json(bundle, report)
+            index, _ = build_index(manifest, [bundle], root / "partly-observed-index.json", root=root)
+            config["video"]["index"] = str(index)
+            with patch("scripts.transcriber_data.validate_release", return_value=(manifest_data, records, bindings)):
+                selected = transcriber.make_dataset(config, features, model, "train", root)
+            self.assertEqual(selected.video_paired_window_indices, [0, 1])
+            self.assertEqual(selected.video_coverage["excludedWindows"], 1)
+            self.assertEqual(selected.video_coverage["preparedAudioFrames"], 150)
+            self.assertEqual(selected.video_coverage["windowsWithUsableVideo"], 1)
+            self.assertEqual(selected.video_coverage["trackingGapOnlyWindows"], 1)
+            self.assertGreater(selected.video_coverage["audioFramesWithUsableVideo"], 0)
+            gap = selected[1]
+            self.assertTrue((gap["video"]["frame_indices"] == -1).all())
+            self.assertTrue(gap["masks"]["note_onset"].any())
+            self.assertTrue(gap["masks"]["percussion"].any())
+
     def test_sample_clock_roundoff_is_not_real_timing_extrapolation(self):
         from scripts.transcriber_audio import HarnessError
         from tests.test_score_alignment import clock_fixture
@@ -110,6 +202,64 @@ class TargetEncodingTests(unittest.TestCase):
         self.assertFalse(batch["valid_frames"][0, 3])
         self.assertFalse(batch["masks"]["note_onset"][0, 3].any())
         self.assertEqual(batch["metadata"], [{"private_id": "3"}, {"private_id": "5"}])
+
+    def test_video_collation_rejects_old_shapes_dtypes_and_invalid_observations(self):
+        from scripts.paired_video import empty_video
+        from scripts.transcriber_audio import HarnessError
+        from scripts.video_features import STRUCTURED_DIM
+
+        for change in ("dimension", "views", "mask_dtype", "orientation", "wrist", "motion", "index"):
+            with self.subTest(change=change):
+                video = empty_video(3)
+                if change == "dimension":
+                    video["structured"] = torch.zeros(1, 4, 98)
+                elif change == "views":
+                    video["structured"] = torch.zeros(1, 2, STRUCTURED_DIM)
+                elif change == "mask_dtype":
+                    video["structured_available"] = video["structured_available"].float()
+                elif change == "index":
+                    video["frame_indices"][0] = 1
+                else:
+                    video["structured_available"][0, 2, 98:140] = True
+                    video["segment_id"][0, 2] = 0
+                    if change == "orientation":
+                        video["structured_available"][0, 2, 184:186] = True
+                    elif change == "wrist":
+                        video["structured"][0, 2, 98] = .1
+                    else:
+                        video["structured_available"][0, 2, 140:184] = True
+                item = {"features": torch.zeros(3, 16), "conditioning": torch.zeros(3, 12),
+                        "targets": {}, "masks": {}, "metadata": {}, "video": video}
+                with self.assertRaises(HarnessError):
+                    collate_windows([item])
+
+    def test_coarse_collation_masks_padding_and_retains_hand_only_examples(self):
+        from scripts.paired_video import empty_video
+
+        items = []
+        for length, coarse in ((3, True), (5, False)):
+            video = empty_video(length)
+            video["structured_available"][0, 0, 98:140] = True
+            video["segment_id"][0, 0] = 0
+            video["frame_indices"][:] = 0
+            if coarse:
+                video["structured"][0, 0, 186:188] = torch.tensor([-9., -2.])
+                video["structured_available"][0, 0, 186:188] = True
+                video["structured"][0, 0, 190] = 1
+                video["structured_available"][0, 0, 190:192] = True
+            items.append({
+                "features": torch.zeros(length, 16), "conditioning": torch.zeros(length, 12),
+                "targets": {"note_onset": torch.ones(length, 6)},
+                "masks": {"note_onset": torch.ones(length, 6, dtype=torch.bool)},
+                "metadata": {}, "video": video,
+            })
+        batch = collate_windows(items)
+        self.assertEqual(batch["video"]["structured"].shape, (2, 1, 4, 194))
+        self.assertTrue(batch["video"]["structured_available"][1, 0, 0, 98:140].all())
+        self.assertFalse(batch["video"]["structured_available"][1, ..., 186:].any())
+        self.assertFalse(batch["masks"]["note_onset"][0, 3:].any())
+        self.assertTrue(batch["masks"]["note_onset"][1].all())
+        self.assertEqual(batch["video"]["frame_indices"][0].tolist(), [0, 0, 0, -1, -1])
 
 
 if __name__ == "__main__":

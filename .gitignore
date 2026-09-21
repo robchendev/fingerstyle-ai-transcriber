@@ -3,6 +3,7 @@
 /data/
 /docs/SESSION_HANDOFF.md
 .venv/
+.venv-fretboard/
 .tools/
 __pycache__/
 checkpoints/

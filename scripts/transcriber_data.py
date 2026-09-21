@@ -20,6 +20,22 @@ from .dataset_release import release_path, validate_release
 from .transcriber_audio import HarnessError, audio_features, conditioning_features, read_audio_window
 
 
+PAIRED_TECHNIQUE_TARGET_POLICY = "native-positive-only-rasgueado-v1"
+
+
+def _window_frame_times(window, sample_rate, feature_config):
+    samples = ((window["stopSampleExclusive"] - window["startSample"]) * feature_config.sample_rate + sample_rate - 1) // sample_rate
+    frames = (samples + feature_config.hop_length - 1) // feature_config.hop_length
+    return np.arange(frames) * feature_config.hop_seconds
+
+
+def _inside_intervals(times, intervals):
+    inside = np.zeros(len(times), dtype=bool)
+    for start, stop in intervals:
+        inside |= (times >= start) & (times < stop)
+    return inside
+
+
 class EpochShuffleSampler(Sampler):
     def __init__(self, data_source, seed=17):
         self.data_source, self.seed, self.epoch = data_source, seed, 0
@@ -51,7 +67,7 @@ def collate_windows(items):
             output[index, :len(value)] = value
         return output
 
-    return {
+    batch = {
         "features": padded([item["features"] for item in items]),
         "conditioning": padded([item["conditioning"] for item in items]),
         "lengths": lengths,
@@ -60,6 +76,24 @@ def collate_windows(items):
         "masks": {key: padded([item["masks"][key] for item in items]) for key in items[0]["masks"]},
         "metadata": [item["metadata"] for item in items],
     }
+    if any("video" in item for item in items):
+        if not all("video" in item for item in items):
+            raise HarnessError("Cannot mix indexed-video and audio-only dataset items in a batch.")
+        from .paired_video import validate_video_tensors
+
+        videos = [item["video"] for item in items]
+        for item in items:
+            validate_video_tensors(item["video"], len(item["features"]))
+        longest_video = max(len(video["structured"]) for video in videos)
+        batch["video"] = {}
+        for key in videos[0]:
+            extent = longest if key == "frame_indices" else longest_video
+            values = [video[key] for video in videos]
+            output = values[0].new_full((len(values), extent, *values[0].shape[1:]), -1 if key in ("frame_indices", "segment_id") else 0)
+            for index, value in enumerate(values):
+                output[index, :len(value)] = value
+            batch["video"][key] = output
+    return batch
 
 
 def training_conditioning(record, clip_times):
@@ -297,10 +331,26 @@ class TrainingDataset(Dataset):
         value = path.stat()
         return value.st_size, value.st_mtime_ns
 
-    def check_unchanged(self):
+    def _check_release_unchanged(self):
         for path, original in self._guards.items():
             if self._stat(path) != original:
                 raise HarnessError(f"A bound dataset file changed during use; stop and revalidate the release: {path}")
+
+    def check_unchanged(self):
+        self._check_release_unchanged()
+        if self.video_index is not None:
+            self.video_index.check_unchanged()
+
+    def video_window(self, record, absolute_audio_times):
+        if self.video_index is None:
+            return None
+        return self.video_index.window(record["row"]["id"], absolute_audio_times)
+
+    def video_training_intervals(self, record):
+        if not getattr(self, "paired_only", False):
+            return None
+        bundle = self.video_index.bundles.get(record["row"]["id"])
+        return bundle.clip_intervals if bundle is not None else []
 
     def __len__(self):
         return len(self.windows)
@@ -315,9 +365,9 @@ class TrainingDataset(Dataset):
             with np.load(path, allow_pickle=False) as cached:
                 features = np.array(cached["features"], copy=True)
                 times = np.array(cached["times"], copy=True)
-            expected_samples = ((window["stopSampleExclusive"] - window["startSample"]) * self.feature_config.sample_rate + row["sampleRate"] - 1) // row["sampleRate"]
-            expected_frames = (expected_samples + self.feature_config.hop_length - 1) // self.feature_config.hop_length
-            if features.dtype != np.float32 or features.ndim != 2 or features.shape != (expected_frames, self.feature_config.n_mels) or times.shape != (expected_frames,) or not np.isfinite(features).all() or not np.allclose(times, np.arange(expected_frames) * self.feature_config.hop_seconds):
+            expected_times = _window_frame_times(window, row["sampleRate"], self.feature_config)
+            expected_frames = len(expected_times)
+            if features.dtype != np.float32 or features.ndim != 2 or features.shape != (expected_frames, self.feature_config.n_mels) or times.shape != (expected_frames,) or not np.isfinite(features).all() or not np.allclose(times, expected_times):
                 raise HarnessError("Corrupt feature cache; remove it explicitly before retrying.")
             return torch.from_numpy(features), times
         samples, rate = read_audio_window(data.audio_path, window["startSample"], window["stopSampleExclusive"], sample_rate=row["sampleRate"], channels=row["channels"], sample_count=data.entry["audioAsset"]["sampleCount"])
@@ -335,7 +385,7 @@ class TrainingDataset(Dataset):
         return features, times
 
     def __getitem__(self, index):
-        self.check_unchanged()
+        self._check_release_unchanged()
         record, window = self.windows[index]
         features, times = self._features(record, window)
         clip_times = times + window["startSample"] / record["row"]["sampleRate"]
@@ -356,12 +406,28 @@ class TrainingDataset(Dataset):
                 record["connections"], window["startSample"], window["stopSampleExclusive"], record["row"]["sampleRate"],
             )
         targets, masks, collisions = encode_targets(local_window, record["data"].labels, times, self.model_config, negative_onsets_allowed=record["negativeAllowed"])
-        return {
+        intervals = self.video_training_intervals(record)
+        if intervals is not None:
+            prepared = torch.from_numpy(_inside_intervals(clip_times, intervals))
+            for mask in masks.values():
+                mask &= prepared.reshape(-1, *([1] * (mask.ndim - 1)))
+        item = {
             "features": features, "conditioning": conditioning, "targets": targets, "masks": masks,
             "metadata": {"windowId": window["windowId"], "stringFrameCollisionsMasked": collisions},
         }
+        if self.video_index is not None:
+            item["video"] = self.video_window(record, clip_times)
+        if self.paired_technique_target_policy == PAIRED_TECHNIQUE_TARGET_POLICY:
+            item["metadata"]["pairedTechniqueTargetPolicy"] = PAIRED_TECHNIQUE_TARGET_POLICY
+            if "technique" in masks:
+                from .technique_supervision import TECHNIQUE_TYPES
 
-    def __init__(self, manifest_path, split, feature_config, model_config, *, root=ROOT, cache_dir=None):
+                # Missing native GP flags do not exclude physical compound-brush a-m-i.
+                axis = TECHNIQUE_TYPES.index("rasgueado")
+                masks["technique"][:, axis] &= targets["technique"][:, axis] > 0
+        return item
+
+    def __init__(self, manifest_path, split, feature_config, model_config, *, root=ROOT, cache_dir=None, video_index_path=None):
         self.root = Path(root).resolve()
         self.manifest_path = Path(manifest_path).absolute()
         if not self.manifest_path.is_relative_to(self.root):
@@ -373,6 +439,14 @@ class TrainingDataset(Dataset):
         self.feature_config, self.model_config = feature_config, model_config
         manifest, records, bindings = validate_release(self.manifest_path)
         self.manifest_sha256 = bindings[self.manifest_path]
+        self.video_index = None
+        self.video_identity = None
+        self.paired_technique_target_policy = PAIRED_TECHNIQUE_TARGET_POLICY if video_index_path is not None else None
+        if video_index_path is not None:
+            from .paired_video import PairedVideoIndex
+
+            self.video_index = PairedVideoIndex(video_index_path, self.manifest_sha256, records, root=self.root)
+            self.video_identity = {**self.video_index.identity, "targetPolicy": PAIRED_TECHNIQUE_TARGET_POLICY}
         self._guards = {path: self._stat(path) for path in bindings}
         self.cache_dir = Path(cache_dir).resolve() if cache_dir is not None else None
         if self.cache_dir is not None:
@@ -408,3 +482,44 @@ class TrainingDataset(Dataset):
             self.windows.extend((record, window) for window in payload["windows"])
         if len(self.windows) != manifest["counts"]["windowsBySplit"][split]:
             raise HarnessError("Training release window count changed during loading.")
+        # Prepared footage remains paired through tracking failures. Availability
+        # masks govern evidence, not whether genuine audio/GP supervision exists.
+        self.video_paired_window_indices = [
+            index for index, (record, window) in enumerate(self.windows)
+            if self.video_index is not None and record["row"]["id"] in self.video_index.bundles
+            and any(
+                max(start, window["startSample"] / record["row"]["sampleRate"])
+                < min(stop, window["stopSampleExclusive"] / record["row"]["sampleRate"])
+                for start, stop in self.video_index.bundles[record["row"]["id"]].clip_intervals
+            )
+        ]
+        self.video_paired_coverage = {
+            "preparedAudioFrames": 0, "audioFramesWithObservedVideo": 0,
+            "audioFramesWithUsableVideo": 0, "audioFramesWithUsablePluckingVideo": 0,
+            "audioFramesWithGeometry": 0, "audioFramesWithIndependentHand": 0,
+            "audioFramesWithCoarseContext": 0,
+            "audioFramesWithUsableUnassignedVideo": 0,
+            "windowsWithUsableVideo": 0, "trackingGapOnlyWindows": 0,
+        }
+        for index in self.video_paired_window_indices:
+            record, window = self.windows[index]
+            rate = record["row"]["sampleRate"]
+            times = _window_frame_times(window, rate, feature_config) + window["startSample"] / rate
+            bundle = self.video_index.bundles[record["row"]["id"]]
+            prepared = _inside_intervals(times, bundle.clip_intervals)
+            available, techniques = bundle.availability_at(times)
+            observed = available.any(-1) & prepared
+            plucking = available[:, 1] & techniques & prepared
+            unassigned = available[:, 2:].any(-1) & techniques & prepared
+            usable = (available[:, 0] | plucking | unassigned) & prepared
+            geometry, independent, coarse = bundle.feature_availability_at(times)
+            self.video_paired_coverage["preparedAudioFrames"] += int(prepared.sum())
+            self.video_paired_coverage["audioFramesWithObservedVideo"] += int(observed.sum())
+            self.video_paired_coverage["audioFramesWithUsableVideo"] += int(usable.sum())
+            self.video_paired_coverage["audioFramesWithUsablePluckingVideo"] += int(plucking.sum())
+            self.video_paired_coverage["audioFramesWithUsableUnassignedVideo"] += int(unassigned.sum())
+            self.video_paired_coverage["audioFramesWithGeometry"] += int((geometry.any(-1) & prepared).sum())
+            self.video_paired_coverage["audioFramesWithIndependentHand"] += int((independent.any(-1) & prepared).sum())
+            self.video_paired_coverage["audioFramesWithCoarseContext"] += int((coarse.any(-1) & prepared).sum())
+            self.video_paired_coverage["windowsWithUsableVideo"] += int(usable.any())
+            self.video_paired_coverage["trackingGapOnlyWindows"] += int(not observed.any())

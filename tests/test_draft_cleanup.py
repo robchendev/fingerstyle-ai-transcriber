@@ -20,6 +20,45 @@ def note(time, string, confidence, *, harmonic=None, uncertainty=()):
 
 
 class DraftCleanupTests(unittest.TestCase):
+    def test_thumb_slap_override_does_not_lower_other_percussion_or_note_thresholds(self):
+        document = {
+            "notes": [note(0., 1, .75)], "percussion": [
+                {"onsetSeconds": time, "technique": kind, "confidence": .4}
+                for time, kind in ((0., "thumb_slap"), (1., "wrist_thump"), (2., "percussive_hit"))
+            ],
+        }
+        result, report = clean_hypotheses(document, DraftProfile(note_threshold=.8, percussion_threshold=.8, thumb_slap_threshold=.3))
+        self.assertEqual(result["notes"], [])
+        self.assertEqual([event["technique"] for event in result["percussion"]], ["thumb_slap"])
+        self.assertEqual(report["percussionThresholds"], {"thumb_slap": .3, "wrist_thump": .8, "percussive_hit": .8})
+        self.assertFalse(clean_hypotheses(document, DraftProfile(percussion_threshold=.8))[0]["percussion"])
+        for value in (-.1, 1.1, True, float("nan")):
+            with self.assertRaises(ValueError):
+                DraftProfile(thumb_slap_threshold=value)
+
+    def test_rasgueado_candidates_are_not_discarded_by_technique_name(self):
+        ordinary = [note(time, 1, .99) for time in (1.875, 1.9375, 2.)]
+        generated = {**note(1.90, 2, 1., uncertainty=("technique_membership_completed_attack",)),
+                     "completionParent": {"technique": "rasgueado", "onsetSeconds": 1.90}}
+        document = {
+            "notes": [*ordinary, generated], "percussion": [],
+            "techniques": [
+                {"onsetSeconds": 1.90, "technique": "rasgueado", "confidence": 1., "strings": [1, 2],
+                 "stringMembershipConfidence": {str(i): float(i in (1, 2)) for i in range(1, 7)}},
+                *[{"onsetSeconds": time, "technique": "brush", "direction": "Down", "confidence": 1.,
+                   "strings": [1], "stringMembershipConfidence": {str(i): float(i == 1) for i in range(1, 7)}}
+                  for time in (1.875, 1.9375, 2.)],
+            ],
+        }
+        before = deepcopy(document)
+        cleaned, report = clean_hypotheses(document)
+        self.assertEqual(document, before)
+        self.assertEqual(len(cleaned["notes"]), 4)
+        self.assertTrue(any(n.get("completionParent") == generated["completionParent"] for n in cleaned["notes"]))
+        self.assertEqual([t["technique"] for t in cleaned["techniques"]], ["rasgueado", "brush", "brush", "brush"])
+        self.assertFalse(report["removedNotes"])
+        self.assertFalse(report["removedTechniques"])
+
     def test_calibrated_profile_filters_clusters_and_preserves_raw_document(self):
         document = {
             "notes": [
@@ -84,6 +123,13 @@ class DraftCleanupTests(unittest.TestCase):
         }
         cleaned, _ = clean_hypotheses(document)
         self.assertEqual(len(cleaned["notes"]), 1)
+        strict, report = clean_hypotheses(document, DraftProfile(note_threshold=.98, strict_note_confidence=True))
+        self.assertEqual(strict["notes"], [])
+        self.assertEqual(report["removedNotes"][0]["reason"], "below_note_threshold")
+        document["notes"][0]["confidence"] = .99
+        strict, _ = clean_hypotheses(document, DraftProfile(note_threshold=.98, strict_note_confidence=True))
+        self.assertEqual(len(strict["notes"]), 1)
+        document["notes"][0]["confidence"] = .65
         document["techniques"][0]["confidence"] = .85
         cleaned, _ = clean_hypotheses(document)
         self.assertEqual(cleaned["notes"], [])

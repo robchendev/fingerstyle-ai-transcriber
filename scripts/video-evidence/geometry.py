@@ -12,7 +12,7 @@ import av
 import cv2
 import numpy as np
 
-from core import EvidenceError, GuitarCoordinateFrame, private_output, sha256
+from core import EvidenceError, GuitarCoordinateFrame, frames_in_shot_range, private_output, sha256
 
 
 GEOMETRY_POINTS = (
@@ -33,6 +33,7 @@ GEOMETRY_STATES = (
     "unknown",
 )
 STATE_CODES = {state: index for index, state in enumerate(GEOMETRY_STATES)}
+AUTOMATIC_PREPARATION_METHOD = "automatic-geometry-v1"
 
 
 def _safe_directory(path, kind):
@@ -140,7 +141,7 @@ def prepare_geometry_annotations(
             stream = container.streams.video[0]
             best_frames = {}
             shot_index = 0
-            for frame in container.decode(stream):
+            for frame in frames_in_shot_range(container, stream, shots):
                 pts = int(frame.pts)
                 while (
                     shot_index + 1 < len(shots["shots"])
@@ -191,7 +192,11 @@ def prepare_geometry_annotations(
             "pointOrder": list(GEOMETRY_POINTS),
             "coordinateSpace": "normalized_full_frame",
             "shots": rows,
-            "reviewComplete": all(geometry_row_complete(row) for row in rows),
+            "reviewComplete": (
+                existing_document is not None
+                and existing_document.get("reviewComplete") is True
+                and all(geometry_row_complete(row) for row in rows)
+            ),
             "migratedFromAnnotationsSha256": (
                 None
                 if existing_annotations_path is None
@@ -224,12 +229,103 @@ def migrate_annotation_rows(existing_rows, new_shots):
 
 
 def geometry_row_complete(row):
+    if not isinstance(row, dict):
+        return False
     geometry = row.get("geometry")
-    if row.get("state") == "trackable":
-        return isinstance(geometry, dict) and set(geometry) == set(GEOMETRY_POINTS)
-    if row.get("state") == "guitar_partial":
-        return isinstance(geometry, dict) and bool(geometry)
-    return row.get("state") in ("guitar_absent", "transition") and geometry is None
+    if row.get("state") in ("trackable", "guitar_partial"):
+        if not isinstance(geometry, dict) or not geometry or not set(geometry) <= set(GEOMETRY_POINTS):
+            return False
+        if row["state"] == "trackable" and set(geometry) != set(GEOMETRY_POINTS):
+            return False
+        try:
+            for name, point in geometry.items():
+                _point(point, name)
+            if set(REQUIRED_FRAME_POINTS) <= geometry.keys():
+                GuitarCoordinateFrame.from_landmarks(geometry)
+        except EvidenceError:
+            return False
+        return True
+    return row.get("state") in ("guitar_absent", "transition", "calibration_unstable") and geometry is None
+
+
+def annotations_ready(document):
+    """Readiness is not a claim of human review or usable coordinate coverage."""
+    if not isinstance(document, dict):
+        return False
+    if document.get("reviewComplete") is True:
+        return True
+    if (
+        document.get("preparationComplete") is not True
+        or document.get("preparationMethod") != AUTOMATIC_PREPARATION_METHOD
+        or document.get("reviewComplete") is not False
+        or any(not isinstance(document.get(name), str) or not document[name] for name in ("videoSha256", "shotsSha256"))
+    ):
+        return False
+    rows = document.get("shots")
+    if not isinstance(rows, list) or not rows or not all(geometry_row_complete(row) for row in rows):
+        return False
+    ids = [row.get("shotId") for row in rows]
+    if any(type(value) is not int or value < 0 for value in ids) or len(set(ids)) != len(ids):
+        return False
+    if any(any(type(row.get(name)) is not int for name in ("startPts", "endPtsExclusive", "keyframePts"))
+           or not isinstance(row.get("keyframeImage"), str) or not row["keyframeImage"] for row in rows):
+        return False
+    if any(right["startPts"] < left["endPtsExclusive"] or right["shotId"] <= left["shotId"]
+           for left, right in zip(rows, rows[1:])):
+        return False
+    try:
+        validate_geometry_annotations(document, {"shots": rows}, document.get("videoSha256"), document.get("shotsSha256"))
+    except (EvidenceError, KeyError, TypeError):
+        return False
+    summary = document.get("proposalSummary")
+    if not isinstance(summary, dict):
+        return False
+    accepted = summary.get("autoAcceptedShotIds")
+    unavailable = summary.get("unavailableShotIds")
+    review = summary.get("reviewRequiredShotIds", summary.get("reviewNeededShotIds"))
+    if any(not isinstance(values, list) or any(type(value) is not int for value in values) or len(set(values)) != len(values) for values in (accepted, unavailable, review)):
+        return False
+    # Refined rows may be human-reviewed without claiming the untouched rows were.
+    reviewed = document.get("humanReviewedShotIds", [])
+    if not isinstance(reviewed, list) or any(type(value) is not int for value in reviewed):
+        return False
+    visible_ids = {row["shotId"] for row in rows if row["state"] in ("trackable", "guitar_partial")}
+    masked_ids = set(ids) - visible_ids
+    return (
+        set(accepted) == visible_ids - set(reviewed)
+        and set(unavailable) == masked_ids
+        and set(review) <= masked_ids - set(reviewed)
+        and set(reviewed) <= set(ids)
+        and all(row["state"] != "unknown" for row in rows)
+    )
+
+
+def automatic_cut_intervals(shots):
+    review = shots.get("automaticReview")
+    if review is None:
+        return []
+    if not isinstance(review, dict) or review.get("method") != "conservative-cut-boundaries-v1":
+        raise EvidenceError("Unsupported automatic cut uncertainty method.")
+    intervals = review.get("uncertainIntervals")
+    if not isinstance(intervals, list):
+        raise EvidenceError("Automatic cut uncertainty requires an interval list.")
+    for interval in intervals:
+        if (
+            not isinstance(interval, dict)
+            or any(type(interval.get(name)) is not int for name in ("startPts", "endPtsExclusive"))
+            or interval["startPts"] >= interval["endPtsExclusive"]
+            or not isinstance(interval.get("reason"), str) or not interval["reason"]
+        ):
+            raise EvidenceError("Automatic cut uncertainty requires integer source-PTS bounds and a reason.")
+    return intervals
+
+
+def cut_uncertainty_mask(pts, intervals):
+    values = np.asarray(pts, dtype=np.int64)
+    masked = np.zeros(values.shape, dtype=bool)
+    for interval in intervals:
+        masked |= (values >= interval["startPts"]) & (values < interval["endPtsExclusive"])
+    return masked
 
 
 def _point(value, name):
@@ -260,7 +356,7 @@ def validate_geometry_annotations(document, shots, video_hash, shots_hash):
         raise EvidenceError("Geometry annotations must contain every shot exactly once.")
     normalized = []
     for expected_shot, row in zip(shots["shots"], rows):
-        if not isinstance(row, dict) or set(row) != {
+        required_fields = {
             "shotId",
             "startPts",
             "endPtsExclusive",
@@ -269,7 +365,8 @@ def validate_geometry_annotations(document, shots, video_hash, shots_hash):
             "state",
             "geometry",
             "reviewNote",
-        }:
+        }
+        if not isinstance(row, dict) or not required_fields <= row.keys() or row.keys() - required_fields - {"additionalKeyframes"}:
             raise EvidenceError("Geometry annotation row has an invalid schema.")
         if (
             row["shotId"] != expected_shot["shotId"]
@@ -282,7 +379,9 @@ def validate_geometry_annotations(document, shots, video_hash, shots_hash):
         if state not in GEOMETRY_STATES:
             raise EvidenceError(f"Unsupported guitar geometry state: {state}")
         geometry = row["geometry"]
-        if state in ("guitar_absent", "transition", "unknown"):
+        if state in ("guitar_absent", "transition", "unknown") or (
+            state == "calibration_unstable" and geometry is None
+        ):
             if geometry is not None:
                 raise EvidenceError(f"{state} shots cannot claim guitar geometry.")
             points = {}
@@ -302,9 +401,27 @@ def validate_geometry_annotations(document, shots, video_hash, shots_hash):
                     name: geometry[name]
                     for name in REQUIRED_FRAME_POINTS
                 })
+        additional = row.get("additionalKeyframes", [])
+        if not isinstance(additional, list):
+            raise EvidenceError("Additional geometry keyframes must be a list.")
+        normalized_seeds = []
+        seed_pts = {row["keyframePts"]}
+        for seed in additional:
+            if not isinstance(seed, dict) or set(seed) != {"keyframePts", "keyframeImage", "geometry", "reviewNote"}:
+                raise EvidenceError("Additional geometry keyframe has an invalid schema.")
+            pts = seed["keyframePts"]
+            if type(pts) is not int or pts in seed_pts or not row["startPts"] <= pts < row["endPtsExclusive"]:
+                raise EvidenceError("Additional geometry keyframes require unique in-shot PTS.")
+            if state not in ("trackable", "guitar_partial") or not isinstance(seed["geometry"], dict) or not seed["geometry"] or not set(seed["geometry"]) <= set(GEOMETRY_POINTS):
+                raise EvidenceError("Additional keyframes require explicit guitar landmarks in a guitar-visible shot.")
+            if set(REQUIRED_FRAME_POINTS) <= seed["geometry"].keys():
+                GuitarCoordinateFrame.from_landmarks(seed["geometry"])
+            seed_pts.add(pts)
+            normalized_seeds.append({**seed, "geometry": {name: _point(point, f"shot {row['shotId']} additional {name}") for name, point in seed["geometry"].items()}})
         normalized.append({
             **row,
             "geometry": points,
+            "additionalKeyframes": normalized_seeds,
         })
     return normalized
 
@@ -402,36 +519,47 @@ def track_segment(grays, seed_index, seed_points, seed_confidence, threshold=1.5
     return coordinates, confidence, source
 
 
-def _process_segment(grays, pts, annotation, analysis_width, threshold):
+def _process_segment(grays, pts, annotation, analysis_width, threshold, *, uncertain_intervals=()):
     point_count = len(GEOMETRY_POINTS)
     coordinates = np.full((len(pts), point_count, 2), np.nan, dtype=np.float32)
     confidence = np.zeros((len(pts), point_count), dtype=np.float32)
     source = np.zeros((len(pts), point_count), dtype=np.int8)
     states = np.full(len(pts), STATE_CODES[annotation["state"]], dtype=np.int8)
+    cut_mask = cut_uncertainty_mask(pts, uncertain_intervals)
+    states[cut_mask] = STATE_CODES["transition"]
     if not annotation["geometry"]:
         return coordinates, confidence, source, states
-    try:
-        seed_index = pts.index(annotation["keyframePts"])
-    except ValueError as error:
-        raise EvidenceError(
-            f"Geometry keyframe PTS was not decoded for shot {annotation['shotId']}."
-        ) from error
+    values = np.asarray(pts, dtype=np.int64)
+    barriers = np.zeros(max(0, len(pts) - 1), dtype=bool)
+    for interval in uncertain_intervals:
+        # A cut between sampled PTS still breaks flow, even when no frame is inside it.
+        barriers |= (values[:-1] < interval["endPtsExclusive"]) & (values[1:] >= interval["startPts"])
+    boundaries = [0, *(np.flatnonzero(barriers) + 1).tolist(), len(pts)]
     height, width = grays[0].shape
-    seed_points = np.full((point_count, 2), np.nan, dtype=np.float32)
-    seed_confidence = np.zeros(point_count, dtype=np.float32)
-    for point_index, name in enumerate(GEOMETRY_POINTS):
-        point = annotation["geometry"].get(name)
-        if point is None:
+    for seed in [annotation, *annotation.get("additionalKeyframes", [])]:
+        try:
+            seed_index = pts.index(seed["keyframePts"])
+        except ValueError as error:
+            raise EvidenceError(f"Geometry keyframe PTS was not decoded for shot {annotation['shotId']}.") from error
+        if cut_mask[seed_index]:
             continue
-        seed_points[point_index] = (point[0] * width, point[1] * height)
-        seed_confidence[point_index] = point[2]
-    coordinates, confidence, source = track_segment(
-        grays,
-        seed_index,
-        seed_points,
-        seed_confidence,
-        threshold,
-    )
+        component = int(np.searchsorted(boundaries, seed_index, side="right")) - 1
+        start, end = boundaries[component:component + 2]
+        seed_points = np.full((point_count, 2), np.nan, dtype=np.float32)
+        seed_confidence = np.zeros(point_count, dtype=np.float32)
+        for point_index, name in enumerate(GEOMETRY_POINTS):
+            point = seed["geometry"].get(name)
+            if point is None:
+                continue
+            seed_points[point_index] = (point[0] * width, point[1] * height)
+            seed_confidence[point_index] = point[2]
+        candidate_points, candidate_confidence, candidate_source = track_segment(
+            grays[start:end], seed_index - start, seed_points, seed_confidence, threshold,
+        )
+        use = candidate_confidence > confidence[start:end]
+        coordinates[start:end][use] = candidate_points[use]
+        confidence[start:end][use] = candidate_confidence[use]
+        source[start:end][use] = candidate_source[use]
     coordinates[:, :, 0] /= analysis_width
     coordinates[:, :, 1] /= height
     if annotation["state"] == "trackable":
@@ -439,6 +567,8 @@ def _process_segment(grays, pts, annotation, analysis_width, threshold):
         states[np.any(required <= 0, axis=1)] = STATE_CODES["calibration_unstable"]
     elif annotation["state"] == "guitar_partial":
         states[np.all(confidence <= 0, axis=1)] = STATE_CODES["calibration_unstable"]
+    coordinates[cut_mask], confidence[cut_mask], source[cut_mask] = np.nan, 0, 0
+    states[cut_mask] = STATE_CODES["transition"]
     return coordinates, confidence, source, states
 
 
@@ -464,8 +594,9 @@ def track_geometry(
         raise EvidenceError("Geometry optical-flow threshold must be positive.")
     document = json.loads(annotations_path.read_text(encoding="utf-8"))
     annotations = validate_geometry_annotations(document, shots, video_hash, shots_hash)
-    if document.get("reviewComplete") is not True:
-        raise EvidenceError("Geometry annotations must be explicitly marked reviewComplete.")
+    if not annotations_ready(document):
+        raise EvidenceError("Geometry annotations require completed review or supported automatic preparation.")
+    uncertain_intervals = automatic_cut_intervals(shots)
     output = _safe_directory(output_directory, "geometry tracking")
     all_pts = []
     all_shot_ids = []
@@ -489,6 +620,7 @@ def track_geometry(
                 annotations[shot_index],
                 analysis_width,
                 float(flow_threshold),
+                uncertain_intervals=uncertain_intervals,
             )
             all_pts.extend(segment_pts)
             all_shot_ids.extend([shot_index] * len(segment_pts))
@@ -497,7 +629,7 @@ def track_geometry(
             all_source.extend(source)
             all_states.extend(states)
 
-        for frame in container.decode(stream):
+        for frame in frames_in_shot_range(container, stream, shots):
             pts = int(frame.pts)
             while (
                 shot_index + 1 < len(shots["shots"])
@@ -536,6 +668,8 @@ def track_geometry(
         "videoSha256": video_hash,
         "shotsSha256": shots_hash,
         "annotationsSha256": sha256(annotations_path),
+        "annotationPreparationMethod": document.get("preparationMethod", "reviewed-annotations"),
+        "annotationsReviewComplete": document.get("reviewComplete") is True,
         "timeBase": shots["timeBase"],
         "frameCount": len(all_pts),
         "shotCount": len(shots["shots"]),
@@ -546,10 +680,21 @@ def track_geometry(
         "framesWithCoordinateFrame": int(np.count_nonzero(np.all(required > 0, axis=1))),
         "coordinateFrameCoverage": float(np.mean(np.all(required > 0, axis=1))),
         "trackingResetCount": len(shots["shots"]),
+        "additionalGeometryKeyframes": sum(len(row.get("additionalKeyframes", [])) for row in annotations),
+        "geometrySeedPolicy": "Per-point strongest tracked seed within the same shot and uninterrupted cut-safe region; no interpolation through lost tracks.",
         "reviewRequired": True,
         "trainingPerformed": False,
         "arrays": arrays_path.name,
     }
+    if shots.get("automaticReview") is not None:
+        report["automaticCutMask"] = {
+            "method": shots["automaticReview"]["method"],
+            "uncertainIntervalCount": len(uncertain_intervals),
+            "maskedFrameCount": int(cut_uncertainty_mask(all_pts, uncertain_intervals).sum()),
+            "intervalSource": "Hash-bound shot report automaticReview.uncertainIntervals; native source PTS.",
+            "policy": "Mask coordinates/confidence/source and mark transition; no optical flow across uncertain intervals.",
+            "meaning": "Technical unavailability, not a musical negative.",
+        }
     report_path = output / "geometry.json"
     _publish(report_path, report)
     return report_path, report

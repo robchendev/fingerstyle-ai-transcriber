@@ -597,6 +597,9 @@ class RuntimeTests(unittest.TestCase):
     def test_checkpoint_without_new_percussion_report_fields_remains_loadable(self):
         summary, _ = self.train()
         checkpoint = runtime.load_checkpoint(summary["latest_checkpoint"])
+        checkpoint["schema_version"] = 1
+        checkpoint.pop("resume_state")
+        checkpoint["training_config"].pop("max_seconds")
         for entry in checkpoint["history"]:
             entry["validation"]["loss_statistics"].pop("percussion_negative")
             entry["validation"].pop("percussion_frame")

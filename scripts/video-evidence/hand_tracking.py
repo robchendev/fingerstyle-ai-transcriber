@@ -13,7 +13,7 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
-from core import EvidenceError, private_output, sha256
+from core import EvidenceError, frames_in_shot_range, private_output, sha256
 
 
 def _safe_directory(path):
@@ -165,15 +165,30 @@ def _observations(result, image_width, image_height, crop=None, inverse_affine=N
     return hands, frame_image, frame_world, frame_handedness, frame_scores
 
 
-def merge_observations(*observations):
+def same_hand_landmarks(left, right, image_size=(1, 1)):
+    points = (0, 5, 9, 13, 17)
+    a, b = left[list(points), :2], right[list(points), :2]
+    if not np.isfinite(a).all() or not np.isfinite(b).all():
+        return False
+    scale = np.asarray(image_size, dtype=np.float64)
+    if scale.shape != (2,) or not np.isfinite(scale).all() or (scale <= 0).any():
+        raise EvidenceError("Hand merging requires positive finite image dimensions.")
+    a, b = a * scale, b * scale
+    palm_a = float(np.median(np.linalg.norm(a[1:] - a[0], axis=1)))
+    palm_b = float(np.median(np.linalg.norm(b[1:] - b[0], axis=1)))
+    wrist_distance = float(np.linalg.norm(a[0] - b[0]))
+    landmark_distance = float(np.median(np.linalg.norm(a - b, axis=1)))
+    return wrist_distance <= .75 * max(palm_a, palm_b) and landmark_distance <= .5 * min(palm_a, palm_b)
+
+
+def merge_observations(*observations, image_size=(1, 1)):
     candidates = []
     for hands, image, world, handedness, scores in observations:
         for hand_index in range(hands):
-            wrist = image[hand_index, 0, :2]
             duplicate = next(
                 (
                     candidate_index for candidate_index, candidate in enumerate(candidates)
-                    if np.linalg.norm(candidate[0][0, :2] - wrist) < .08
+                    if same_hand_landmarks(candidate[0], image[hand_index], image_size)
                 ),
                 None,
             )
@@ -297,7 +312,7 @@ def track_hands(
         shot_index = 0
         prior_shot = None
         segment_start_pts = None
-        for frame in container.decode(stream):
+        for frame in frames_in_shot_range(container, stream, shots_document):
             if frame.pts is None:
                 raise EvidenceError("Decoded frame has no presentation timestamp.")
             pts = int(frame.pts)
@@ -381,7 +396,7 @@ def track_hands(
                                 best = observation
                             if best[0] == 2:
                                 break
-                        combined = merge_observations(combined, best)
+                        combined = merge_observations(combined, best, image_size=(image_width, image_height))
                         if combined[0] == 2:
                             break
                     if prefer_guided_detection(selected[0], combined[0]):
@@ -412,12 +427,16 @@ def track_hands(
             guided_rois.append(normalized_crops)
             count += 1
             detected_frames += hands > 0
+            if count == 1 or count % 250 == 0:
+                print(f"Hand tracking: {count}/{shots_document['frameCount']} frames | shot {shot_index + 1}/{len(shots)} | guided improvements {guided_improvements}", flush=True)
         for tracker in (full_tracker, guided_tracker, pose_tracker):
             if tracker is not None:
                 tracker.close()
         full_tracker = guided_tracker = pose_tracker = None
         if count == 0:
             raise EvidenceError("Hand tracking decoded no frames.")
+        if count != shots_document["frameCount"] or pts_values[0] != shots_document["firstPts"] or pts_values[-1] != shots_document["lastPts"]:
+            raise EvidenceError("Hand tracking coverage differs from shot inspection.")
         arrays_path = output / "hands.npz"
         np.savez_compressed(
             arrays_path,
@@ -452,6 +471,7 @@ def track_hands(
             "guidedCropAttempts": guided_attempts,
             "framesImprovedByGuidedCrop": guided_improvements,
             "guidedCropSelectionRule": "accept_only_when_hand_count_increases",
+            "observationMergePolicy": "source-pixel-wrist-and-palm-landmark-agreement-relative-to-hand-size",
             "guidedCropRotationsDegrees": [0, 45, -45],
             "guidedHandConfidence": .25,
             "guidedMaximumPoseWristDistance": .38,

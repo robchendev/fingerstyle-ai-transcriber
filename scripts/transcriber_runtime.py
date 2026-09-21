@@ -21,7 +21,7 @@ from .connection_supervision import CONNECTION_TYPES, V4_NOTE_TECHNIQUE_TYPES, v
 from torch.utils.data import BatchSampler, DataLoader, SequentialSampler
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _PRIOR_NAMES = frozenset({"harmonic_sparsity", "percussion_sparsity"})
 _NOTE_ONSET_STATS = ("note_onset_positive", "note_onset_negative")
 _PERCUSSION_STATS = ("percussion_positive", "percussion_negative")
@@ -84,6 +84,7 @@ class TrainingConfig:
     device: str = "auto"
     max_steps: int | None = None
     sparsity_weight: float = 0.02
+    max_seconds: float | None = None
 
     def __post_init__(self):
         _integer(self.epochs, "epochs", 1)
@@ -97,6 +98,44 @@ class TrainingConfig:
         if self.max_steps is not None:
             _integer(self.max_steps, "max_steps", 1)
         _finite(self.sparsity_weight, "sparsity_weight")
+        if self.max_seconds is not None:
+            _finite(self.max_seconds, "max_seconds", positive=True)
+
+
+class TrainingBudgetExpired(Exception):
+    """Cooperative stop at a safe boundary, never an asynchronous interruption."""
+
+
+class TrainingBudget:
+    """Per-invocation monotonic budget, including caller setup and checkpoint I/O.
+
+    Reserve up to two minutes (10% of short budgets) for checkpoint publication.
+    Native operations are not interrupted; overruns are reported, not concealed.
+    """
+
+    def __init__(self, max_seconds, *, started_at=None, deadline=None, reserve_seconds=120.):
+        self.started_at = time.perf_counter() if started_at is None else _finite(started_at, "budget start")
+        self.max_seconds = None if max_seconds is None else _finite(max_seconds, "max_seconds", positive=True)
+        self.reserve_seconds = min(_finite(reserve_seconds, "checkpoint reserve"), self.max_seconds * .1) if self.max_seconds is not None else 0.
+        self.deadline = self.started_at + self.max_seconds if self.max_seconds is not None else None
+        if deadline is not None:
+            deadline = _finite(deadline, "budget deadline")
+            if self.deadline is None or not math.isclose(deadline, self.deadline, abs_tol=1e-6, rel_tol=0):
+                raise ValueError("Budget deadline must equal invocation start plus max_seconds")
+            self.deadline = deadline
+
+    def check(self):
+        if self.deadline is not None and time.perf_counter() >= self.deadline - self.reserve_seconds:
+            raise TrainingBudgetExpired()
+
+    def report(self):
+        elapsed = time.perf_counter() - self.started_at
+        return {
+            "max_seconds": self.max_seconds, "elapsed_seconds": elapsed,
+            "checkpoint_reserve_seconds": self.reserve_seconds,
+            "budget_overrun_seconds": max(0., elapsed - self.max_seconds) if self.max_seconds is not None else 0.,
+            "budget_policy": "per-invocation cooperative wall clock including setup, validation and checkpoint I/O; native operations can overrun",
+        }
 
 
 def resolve_device(device="auto"):
@@ -340,14 +379,44 @@ def _validate_loader_signature(signature):
     _json_copy(signature["sampler_seed"])
 
 
+def _joint_video_config(identity):
+    from .transcriber_video import VideoConfig
+    from .video_features import SCHEMA_VERSION as VIDEO_SCHEMA_VERSION, STRUCTURED_DIM
+
+    video = identity.get("video")
+    if not isinstance(video, dict) or not isinstance(video.get("config"), dict):
+        raise ValueError("Invalid joint checkpoint video configuration")
+    values = video["config"]
+    if "image_size" in values or values.get("input_schema_version") != VIDEO_SCHEMA_VERSION:
+        raise ValueError("Historical or unversioned paired checkpoints are unsupported; expected numeric video input schema 4. Repackage cached observations into new bundles; do not reinterpret old checkpoints.")
+    if "freeze_audio" in values or values.get("architecture_version") != 4:
+        raise ValueError("Frozen, historical or unversioned paired checkpoints are unsupported; expected joint video architecture_version 4")
+    if values.get("structured_dim") != STRUCTURED_DIM:
+        raise ValueError("Historical paired checkpoints are unsupported; expected four-view 194D guitar-hand-coarse inputs")
+    _keys(values, asdict(VideoConfig()), "joint video model configuration")
+    initialization = identity.get("initialization")
+    if initialization is not None and initialization != {
+        "kind": "joint-audio-numeric-video-from-scratch",
+        "audioParametersFrozen": False, "optimizerStateImported": False,
+    }:
+        raise ValueError("Joint checkpoints cannot use staged or imported acoustic initialization")
+    return VideoConfig(**values)
+
+
 def _validate_checkpoint(payload):
-    _keys(payload, _CHECKPOINT_KEYS, "checkpoint")
-    if type(payload["schema_version"]) is not int or payload["schema_version"] != SCHEMA_VERSION:
+    if not isinstance(payload, dict) or type(payload.get("schema_version")) is not int or payload["schema_version"] not in (1, SCHEMA_VERSION):
         raise ValueError("Unsupported checkpoint schema version")
+    version = payload["schema_version"]
+    _keys(payload, _CHECKPOINT_KEYS | ({"resume_state"} if version == 2 else set()), "checkpoint")
     if not isinstance(payload["run_id"], str) or not re.fullmatch("[0-9a-f]{32}", payload["run_id"]):
         raise ValueError("Invalid run identity")
     _identity(payload["identity"])
-    _keys(payload["training_config"], asdict(TrainingConfig()), "training config")
+    if "video" in payload["identity"]:
+        _joint_video_config(payload["identity"])
+    config_keys = set(asdict(TrainingConfig()))
+    if version == 1:
+        config_keys.discard("max_seconds")
+    _keys(payload["training_config"], config_keys, "training config")
     config = TrainingConfig(**payload["training_config"])
     runtime = payload["runtime"]
     _keys(runtime, {
@@ -395,6 +464,26 @@ def _validate_checkpoint(payload):
                 raise ValueError(f"AdamW option {key} differs from this runtime")
         if "decoupled_weight_decay" in group and group["decoupled_weight_decay"] is not True:
             raise ValueError("AdamW must use decoupled weight decay")
+    if "video" in payload["identity"]:
+        from .transcriber_model import FingerstyleTranscriber, ModelConfig
+        from .transcriber_video import AudioVideoTranscriber
+
+        # Validate every joint parameter without allocating weights or consuming RNG.
+        with torch.device("meta"):
+            expected = AudioVideoTranscriber(
+                FingerstyleTranscriber(ModelConfig(**payload["identity"]["model"])),
+                _joint_video_config(payload["identity"]),
+            )
+        parameter_shapes = [parameter.shape for parameter in expected.parameters()]
+        if len(optimizer["param_groups"]) != 1 or optimizer["param_groups"][0]["params"] != list(range(len(parameter_shapes))):
+            raise ValueError("Joint optimizer must contain all acoustic, numeric-video and fusion parameters in model order")
+        if set(state) != set(expected.state_dict()) or any(state[name].shape != value.shape for name, value in expected.state_dict().items()):
+            raise ValueError("Joint checkpoint model tensors differ from its declared architecture")
+        for index, moments in optimizer["state"].items():
+            if type(index) is not int or not 0 <= index < len(parameter_shapes):
+                raise ValueError("Unknown joint optimizer parameter")
+            if not isinstance(moments, dict) or any(not isinstance(moments.get(name), torch.Tensor) or moments[name].shape != parameter_shapes[index] for name in ("exp_avg", "exp_avg_sq")):
+                raise ValueError("Joint optimizer moment shapes differ from the model parameters")
     cursor = payload["cursor"]
     _keys(cursor, {"epoch", "next_batch_index", "global_step"}, "cursor")
     for key, value in cursor.items():
@@ -437,8 +526,13 @@ def _validate_checkpoint(payload):
         raise ValueError("Invalid checkpoint history")
     _json_copy(payload["history"])
     previous_step = 0
+    previous_updates = previous_skips = 0
+    optimizer_counts = None
     for entry in payload["history"]:
-        _keys(entry, {"epoch", "global_step", "epoch_complete", "validation"}, "history entry")
+        fields = {"epoch", "global_step", "epoch_complete", "validation"}
+        if "optimizer_updates" in entry or "optimizer_skipped_batches" in entry:
+            fields |= {"optimizer_updates", "optimizer_skipped_batches"}
+        _keys(entry, fields, "history entry")
         _integer(entry["epoch"], "history epoch")
         step = _integer(entry["global_step"], "history global step", 1)
         if step <= previous_step or step > cursor["global_step"] or type(entry["epoch_complete"]) is not bool:
@@ -446,16 +540,57 @@ def _validate_checkpoint(payload):
         if not isinstance(entry["validation"], dict):
             raise ValueError("Invalid validation history")
         _finite(entry["validation"].get("loss"), "validation loss")
+        if "optimizer_updates" in entry:
+            if not isinstance(payload["identity"].get("video"), dict):
+                raise ValueError("Optimizer skip accounting requires a joint audio/video identity")
+            updates = _integer(entry["optimizer_updates"], "optimizer updates")
+            skips = _integer(entry["optimizer_skipped_batches"], "optimizer skipped batches")
+            if updates < previous_updates or skips < previous_skips or updates + skips != step:
+                raise ValueError("Optimizer activity and processed batch cursor disagree")
+            previous_updates, previous_skips = optimizer_counts = updates, skips
+        elif optimizer_counts is not None:
+            raise ValueError("Checkpoint history lost optimizer activity counts")
+        elif "video" in payload["identity"]:
+            raise ValueError("Joint checkpoint history requires actual optimizer update and skipped-batch counts")
         previous_step = step
+    if version == 2:
+        resume_state = payload["resume_state"]
+        _keys(resume_state, {"phase", "validation_pending", "event_evaluation_required", "optimizer_updates", "optimizer_skipped_batches", "stopped_by"}, "resume state")
+        phase = resume_state["phase"]
+        if phase not in ("initial_validation", "training", "validation"):
+            raise ValueError("Invalid resume phase")
+        if resume_state["stopped_by"] not in (None, "max_seconds"):
+            raise ValueError("Invalid resume stop reason")
+        if type(resume_state["event_evaluation_required"]) is not bool:
+            raise ValueError("Invalid resume event-evaluation policy")
+        if type(resume_state["validation_pending"]) is not bool or resume_state["validation_pending"] != (phase == "initial_validation" or previous_step < cursor["global_step"]):
+            raise ValueError("Resume validation status differs from its history")
+        if (phase == "initial_validation" and cursor["global_step"]) or (phase == "validation" and not resume_state["validation_pending"]):
+            raise ValueError("Resume phase differs from its validation cursor")
+        if resume_state["validation_pending"] and resume_state["stopped_by"] != "max_seconds":
+            raise ValueError("Incomplete validation requires an explicit budget pause")
+        updates = _integer(resume_state["optimizer_updates"], "resume optimizer updates")
+        skips = _integer(resume_state["optimizer_skipped_batches"], "resume optimizer skipped batches")
+        if updates + skips != cursor["global_step"] or updates < previous_updates or skips < previous_skips:
+            raise ValueError("Resume optimizer counts differ from the cursor/history")
+        if previous_step == cursor["global_step"] and optimizer_counts is not None and optimizer_counts != (updates, skips):
+            raise ValueError("Resume optimizer counts differ from validated counts")
+        optimizer_counts = updates, skips
+    if optimizer_counts is not None:
+        if bool(optimizer["state"]) != bool(optimizer_counts[0]):
+            raise ValueError("Optimizer state and actual update count disagree")
+        if any(float(state["step"].item()) > optimizer_counts[0] for state in optimizer["state"].values()):
+            raise ValueError("AdamW step exceeds actual optimizer updates")
     if cursor["global_step"] == 0:
         if payload["history"] or payload["best_score"] is not None or optimizer["state"]:
             raise ValueError("Untrained checkpoint cannot claim training history")
-    elif (
+    elif version == 1 and (
         not payload["history"] or previous_step != cursor["global_step"]
-        or payload["best_score"] is None or not optimizer["state"]
+        or payload["best_score"] is None or (not optimizer["state"] and optimizer_counts is None)
     ):
         raise ValueError("Trained checkpoint is missing its validation history")
-    if payload["history"] and payload["best_score"] != min(entry["validation"]["loss"] for entry in payload["history"]):
+    expected_best = min((entry["validation"]["loss"] for entry in payload["history"]), default=None)
+    if payload["best_score"] != expected_best:
         raise ValueError("Best score differs from the recorded validation history")
     return payload
 
@@ -487,6 +622,13 @@ def _batch_to_device(batch, device):
         for name, value in batch[key].items():
             _tensor(value, f"{key}.{name}", finite=key != "targets")
             result[key][name] = value.to(device)
+    if "video" in batch:
+        if not isinstance(batch["video"], Mapping):
+            raise ValueError("Batch video must be a mapping")
+        result["video"] = {}
+        for name, value in batch["video"].items():
+            _tensor(value, f"video.{name}")
+            result["video"][name] = value.to(device)
     features, conditioning = result["features"], result["conditioning"]
     valid, lengths = result["valid_frames"], result["lengths"]
     if features.ndim != 3 or conditioning.ndim != 3 or features.shape[:2] != conditioning.shape[:2]:
@@ -510,7 +652,8 @@ def _batch_to_device(batch, device):
 
 def _outputs(model, batch):
     # Metadata and target voices never enter the forward call.
-    outputs = model(batch["features"], batch["conditioning"], batch["lengths"])
+    optional = {"video": batch["video"]} if "video" in batch else {}
+    outputs = model(batch["features"], batch["conditioning"], batch["lengths"], **optional)
     if not isinstance(outputs, dict):
         raise ValueError("Model forward must return an output dictionary")
     for name, value in outputs.items():
@@ -913,7 +1056,7 @@ def _progress_due(completed, total, now, last_log):
     return completed == 1 or completed == total or completed % 10 == 0 or now - last_log >= 5
 
 
-def evaluate_model(model, loader, device, *, sparsity_weight=0.02, progress=None, phase="Validation"):
+def evaluate_model(model, loader, device, *, sparsity_weight=0.02, progress=None, phase="Validation", budget=None):
     """Frame-level, mask-aware metrics; not event or complete-score accuracy."""
     _finite(sparsity_weight, "sparsity_weight")
     device = resolve_device(str(device))
@@ -940,7 +1083,7 @@ def evaluate_model(model, loader, device, *, sparsity_weight=0.02, progress=None
     try:
         model.eval()
         with torch.no_grad():
-            for source_batch in loader:
+            for source_batch in _budget_batches(loader, budget):
                 batch = _batch_to_device(source_batch, device)
                 outputs = _outputs(model, batch)
                 _, stats = _loss(outputs, batch, loss_function, weights, sparsity_weight)
@@ -974,7 +1117,23 @@ def evaluate_model(model, loader, device, *, sparsity_weight=0.02, progress=None
 
 
 def _fixed_config(config):
-    return {key: value for key, value in config.items() if key not in ("epochs", "max_steps")}
+    return {key: value for key, value in config.items() if key not in ("epochs", "max_steps", "max_seconds")}
+
+
+def _budget_batches(loader, budget):
+    if budget is not None:
+        budget.check()
+    iterator = iter(loader)
+    while True:
+        if budget is not None:
+            budget.check()
+        try:
+            batch = next(iterator)
+        except StopIteration:
+            return
+        if budget is not None:
+            budget.check()
+        yield batch
 
 
 def _require_same_rng(before, after, *, source="Data loading"):
@@ -1054,23 +1213,31 @@ def _best_event_selection(history, run_id):
     return best
 
 
-def _evaluate_events(model, evaluator, *, metric=None):
+def _evaluate_events(model, evaluator, *, metric=None, budget=None):
     modes = [(module, module.training) for module in model.modules()]
     rng = _capture_rng()
+    hook = None
     try:
+        if budget is not None:
+            budget.check()
+            hook = model.register_forward_pre_hook(lambda *_: budget.check())
         model.eval()
         with torch.no_grad():
             result = evaluator(model)
+        if budget is not None:
+            budget.check()
         _require_same_rng(rng, _capture_rng(), source="Event evaluation")
         return _event_result(result, metric=metric)
     finally:
+        if hook is not None:
+            hook.remove()
         for module, mode in modes:
             module.training = mode
         _restore_rng(rng)
 
 
 def run_training(model, train_loader, validation_loader, config, run_dir, identity, *, resume=None, progress=None,
-                 event_evaluator=None):
+                 event_evaluator=None, started_at=None, deadline=None, checkpoint_reserve_seconds=120.):
     """Perform bounded AdamW updates only when explicitly called by the owner.
 
     Epochs and max_steps are total ceilings. Exact resume requires unchanged,
@@ -1079,17 +1246,37 @@ def run_training(model, train_loader, validation_loader, config, run_dir, identi
     Optional decoded-event evaluation runs after each training validation, not
     the initial preflight. Its highest stable-metric score selects best-events.pt;
     best.pt remains the lowest-loss checkpoint and latest.pt the resume cursor.
+    For joint audio/video models, global_step counts consumed batches;
+    history separately records cumulative optimizer updates and zero-gradient
+    skips. Skipped batches change neither weights, weight decay nor momentum.
+    max_seconds is a fresh per-invocation cooperative budget. Pass the caller's
+    monotonic started_at/deadline to include setup; native I/O can overrun it.
     """
     started = time.perf_counter()
     training_windows = validation_windows = event_validation_windows = 0
     if not isinstance(config, TrainingConfig):
         raise ValueError("config must be a TrainingConfig")
+    budget = TrainingBudget(config.max_seconds, started_at=started if started_at is None else started_at,
+                            deadline=deadline, reserve_seconds=checkpoint_reserve_seconds)
     if event_evaluator is not None and not callable(event_evaluator):
         raise ValueError("event_evaluator must be callable or None")
     identity = _identity(identity)
     model_config = getattr(model, "config", None)
     if model_config is not None and is_dataclass(model_config) and not _json_equal(asdict(model_config), identity["model"]):
         raise ValueError("Model configuration differs from identity.model")
+    video_config = getattr(model, "video_config", None)
+    joint_model = video_config is not None
+    if joint_model and (
+        not is_dataclass(video_config)
+        or not _json_equal(asdict(video_config), identity.get("video", {}).get("config"))
+    ):
+        raise ValueError("Joint model configuration differs from identity.video.config")
+    if joint_model:
+        _joint_video_config(identity)
+        if any(not parameter.requires_grad for parameter in model.parameters()):
+            raise ValueError("Joint training requires all acoustic, numeric-video and fusion parameters to be trainable")
+    elif "video" in identity:
+        raise ValueError("Joint identity requires a joint audio/video model")
     device = resolve_device(config.device)
     runtime = {
         "torch_version": str(torch.__version__), "numpy_version": str(np.__version__),
@@ -1116,17 +1303,23 @@ def run_training(model, train_loader, validation_loader, config, run_dir, identi
         if _plain_path(resume) != run_dir / "latest.pt":
             raise ValueError("Resume must use latest.pt from this exact run directory")
         source_stamps = {
-            name: _file_stamp(run_dir / name) for name in ("run.json", "latest.pt", "best.pt")
+            name: _file_stamp(run_dir / name) for name in ("run.json", "latest.pt")
         }
         _emit(progress, f"Loading resume checkpoint: {resume}")
         checkpoint = load_checkpoint(resume, expected_identity=identity)
+        pending = checkpoint.get("resume_state", {})
+        if pending.get("stopped_by") == "max_seconds" and pending["event_evaluation_required"] != (event_evaluator is not None):
+            raise ValueError("A budget-paused run must retain its event-evaluation policy on resume")
         run_id = checkpoint["run_id"]
         manifest = _read_json(run_dir / "run.json")
         _keys(manifest, {"schema_version", "run_id", "identity", "config"}, "run manifest")
-        _keys(manifest["config"], asdict(TrainingConfig()), "run training config")
+        manifest_config_keys = set(asdict(TrainingConfig()))
+        if manifest["schema_version"] == 1:
+            manifest_config_keys.discard("max_seconds")
+        _keys(manifest["config"], manifest_config_keys, "run training config")
         TrainingConfig(**manifest["config"])
         if (
-            manifest["schema_version"] != SCHEMA_VERSION or manifest["run_id"] != run_id
+            manifest["schema_version"] not in (1, SCHEMA_VERSION) or manifest["run_id"] != run_id
             or not _json_equal(manifest["identity"], identity)
             or not _json_equal(_fixed_config(manifest["config"]), _fixed_config(asdict(config)))
             or not _json_equal(_fixed_config(checkpoint["training_config"]), _fixed_config(asdict(config)))
@@ -1142,12 +1335,16 @@ def run_training(model, train_loader, validation_loader, config, run_dir, identi
         for filename in ("run.json", "metrics.json", "latest.pt", "best.pt"):
             if (run_dir / filename).exists():
                 _regular_file(run_dir / filename)
-        best = load_checkpoint(run_dir / "best.pt", expected_identity=identity)
-        if (
-            best["run_id"] != run_id or best["cursor"]["global_step"] > cursor["global_step"]
-            or not best["history"] or best["history"][-1]["validation"]["loss"] != checkpoint["best_score"]
-        ):
+        if (run_dir / "best.pt").exists() != (checkpoint["best_score"] is not None):
             raise ValueError("best.pt and latest.pt do not describe a consistent run")
+        if checkpoint["best_score"] is not None:
+            source_stamps["best.pt"] = _file_stamp(run_dir / "best.pt")
+            best = load_checkpoint(run_dir / "best.pt", expected_identity=identity)
+            if (
+                best["run_id"] != run_id or best["cursor"]["global_step"] > cursor["global_step"]
+                or not best["history"] or best["history"][-1]["validation"]["loss"] != checkpoint["best_score"]
+            ):
+                raise ValueError("best.pt and latest.pt do not describe a consistent run")
         best_event = _best_event_selection(checkpoint["history"], run_id)
         for filename in event_files:
             present = (run_dir / filename).exists()
@@ -1179,8 +1376,9 @@ def run_training(model, train_loader, validation_loader, config, run_dir, identi
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
         model.to(device)
+        trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
         optimizer = torch.optim.AdamW(
-            model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay,
+            trainable_parameters, lr=config.learning_rate, weight_decay=config.weight_decay,
             **_OPTIMIZER_OPTIONS,
         )
         if checkpoint is None:
@@ -1190,9 +1388,11 @@ def run_training(model, train_loader, validation_loader, config, run_dir, identi
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(config.seed)
             epoch = next_batch = global_step = 0
+            optimizer_updates = optimizer_skips = 0
             best_score = None
             history = []
             epoch_start = train_loader.generator.get_state()
+            phase = "initial_validation"
         else:
             model.load_state_dict(checkpoint["model_state"], strict=True)
             optimizer.load_state_dict(checkpoint["optimizer_state"])
@@ -1201,14 +1401,32 @@ def run_training(model, train_loader, validation_loader, config, run_dir, identi
                     raise ValueError("Optimizer moment shapes differ from the model parameters")
             epoch, next_batch, global_step = (checkpoint["cursor"][key] for key in ("epoch", "next_batch_index", "global_step"))
             best_score, history = checkpoint["best_score"], checkpoint["history"]
+            counts = checkpoint.get("resume_state", history[-1] if history else {})
+            optimizer_updates = counts.get("optimizer_updates", global_step)
+            optimizer_skips = counts.get("optimizer_skipped_batches", 0)
+            phase = checkpoint.get("resume_state", {}).get("phase", "training")
             train_loader.generator.set_state(checkpoint["loader_state"]["train"])
             validation_loader.generator.set_state(checkpoint["loader_state"]["validation"])
             epoch_start = checkpoint["loader_state"]["epoch_start"]
             _restore_rng(checkpoint["rng"])
         initial_epoch, initial_step = epoch, global_step
-        validation = evaluate_model(model, validation_loader, device, sparsity_weight=config.sparsity_weight, progress=progress, phase="Initial validation")
-        _require_validation(validation)
-        validation_windows += validation["windows"]
+        initial_updates, initial_skips = optimizer_updates, optimizer_skips
+        validation = history[-1]["validation"] if history else None
+        expired = False
+        try:
+            budget.check()
+            budget_resume = checkpoint is not None and checkpoint.get("resume_state", {}).get("stopped_by") == "max_seconds"
+            if not budget_resume or phase == "initial_validation":
+                initial_validation = evaluate_model(model, validation_loader, device, sparsity_weight=config.sparsity_weight,
+                                                    progress=progress, phase="Initial validation", budget=budget)
+                _require_validation(initial_validation)
+                validation_windows += initial_validation["windows"]
+                if phase == "initial_validation":
+                    phase = "training"
+                validation = initial_validation
+            budget.check()
+        except TrainingBudgetExpired:
+            expired = True
         if checkpoint is None:
             if run_dir.exists():
                 if not run_dir.is_dir() or any(run_dir.iterdir()):
@@ -1223,87 +1441,8 @@ def run_training(model, train_loader, validation_loader, config, run_dir, identi
         _write_json(run_dir / "run.json", {
             "schema_version": SCHEMA_VERSION, "run_id": run_id, "identity": identity, "config": asdict(config),
         }, replace=checkpoint is not None)
-        while epoch < config.epochs and (config.max_steps is None or global_step < config.max_steps):
-            epoch_started = last_log = time.perf_counter()
-            first_batch = next_batch
-            batch_count = runtime["train_loader"]["batches"]
-            batch_limit = batch_count if config.max_steps is None else min(batch_count, next_batch + config.max_steps - global_step)
-            _emit(progress, f"Epoch {epoch + 1}/{config.epochs}: starting at batch {next_batch + 1}/{batch_count} | step {global_step}")
-            if callable(getattr(train_loader.sampler, "set_epoch", None)):
-                before = _capture_rng()
-                train_loader.sampler.set_epoch(epoch)
-                _require_same_rng(before, _capture_rng())
-            resuming_partial = next_batch > 0
-            saved_generator = train_loader.generator.get_state()
-            if resuming_partial:
-                train_loader.generator.set_state(epoch_start)
-            else:
-                epoch_start = train_loader.generator.get_state()
-            iterator = _iterator(train_loader)
-            for _ in range(next_batch):
-                _checked_next(iterator)
-            if resuming_partial and not torch.equal(train_loader.generator.get_state(), saved_generator):
-                raise ValueError("Cannot reproduce the checkpoint's mid-epoch loader RNG state")
-            model.train()
-            epoch_index = epoch
-            while next_batch < runtime["train_loader"]["batches"]:
-                batch = _batch_to_device(_checked_next(iterator), device)
-                optimizer.zero_grad(set_to_none=True)
-                outputs = _outputs(model, batch)
-                loss, stats = _loss(outputs, batch, loss_function, weights, config.sparsity_weight)
-                if _objective(stats, weights, config.sparsity_weight) is None:
-                    raise ValueError("Training batch has no meaningful supervised objective")
-                loss.backward()
-                gradients = [parameter.grad for parameter in model.parameters() if parameter.grad is not None]
-                if not gradients:
-                    raise ValueError("Training loss produced no model gradients")
-                if any(not torch.isfinite(gradient).all().item() for gradient in gradients):
-                    raise ValueError("Nonfinite model gradient")
-                torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip, error_if_nonfinite=True)
-                optimizer.step()
-                for name, value in model.state_dict().items():
-                    _tensor(value, f"updated model.{name}")
-                global_step += 1
-                next_batch += 1
-                training_windows += batch["features"].shape[0]
-                now = time.perf_counter()
-                processed = next_batch - first_batch
-                if progress is not None and _progress_due(processed, batch_limit - first_batch, now, last_log):
-                    eta = (now - epoch_started) / processed * (batch_limit - next_batch)
-                    _emit(progress, f"Epoch {epoch + 1}/{config.epochs} | batch {next_batch}/{batch_count} | step {global_step} | batch loss {loss.detach().item():.6f} | elapsed {format_duration(now - started)} | epoch training ETA {format_duration(eta)}")
-                    last_log = now
-                if config.max_steps is not None and global_step >= config.max_steps:
-                    break
-            epoch_complete = next_batch == runtime["train_loader"]["batches"]
-            if epoch_complete:
-                before = _capture_rng()
-                if next(iterator, None) is not None:
-                    raise ValueError("Training loader exceeded its declared batch count")
-                _require_same_rng(before, _capture_rng())
-                epoch += 1
-                next_batch = 0
-            validation = evaluate_model(model, validation_loader, device, sparsity_weight=config.sparsity_weight, progress=progress, phase=f"Epoch {epoch_index + 1} validation")
-            _require_validation(validation)
-            validation_windows += validation["windows"]
-            event_improved = False
-            if event_evaluator is not None:
-                _emit(progress, f"Epoch {epoch_index + 1} decoded-event validation: starting.")
-                events = _evaluate_events(
-                    model, event_evaluator, metric=best_event["metric"] if best_event else None,
-                )
-                validation["decoded_events"] = events
-                event_validation_windows += events["windows"]
-                event_improved = best_event is None or events["score"] > best_event["score"]
-                _emit(progress, f"Decoded-event {events['metric']}: {events['score']:.6f} | {events['windows']} windows")
-            history.append({
-                "epoch": epoch_index, "global_step": global_step,
-                "epoch_complete": epoch_complete, "validation": validation,
-            })
-            improved = best_score is None or validation["loss"] < best_score
-            if improved:
-                best_score = validation["loss"]
-            if event_improved:
-                best_event = _best_event_selection(history, run_id)
+
+        def save_checkpoint(*, improved=False, event_improved=False, stopped_by=None):
             payload = {
                 "schema_version": SCHEMA_VERSION, "run_id": run_id, "identity": identity,
                 "training_config": asdict(config), "runtime": runtime, "global_step": global_step,
@@ -1315,6 +1454,13 @@ def run_training(model, train_loader, validation_loader, config, run_dir, identi
                     "validation": validation_loader.generator.get_state(), "epoch_start": epoch_start,
                 },
                 "history": history,
+                "resume_state": {
+                    "phase": phase,
+                    "validation_pending": phase == "initial_validation" or global_step > (history[-1]["global_step"] if history else 0),
+                    "event_evaluation_required": event_evaluator is not None,
+                    "optimizer_updates": optimizer_updates, "optimizer_skipped_batches": optimizer_skips,
+                    "stopped_by": stopped_by,
+                },
             }
             _validate_checkpoint(payload)
             _emit(progress, "Saving checkpoint and metrics...")
@@ -1328,19 +1474,149 @@ def run_training(model, train_loader, validation_loader, config, run_dir, identi
             _atomic_write(run_dir / "latest.pt", lambda stream: torch.save(payload, stream))
             _write_json(run_dir / "metrics.json", history)
             saved = "latest.pt, best.pt and metrics.json" if improved else "latest.pt and metrics.json"
-            _emit(progress, f"Saved {saved} | best validation loss {best_score:.6f}")
-            state = "complete" if epoch_complete else "paused at step ceiling"
-            _emit(progress, f"Epoch {epoch_index + 1}/{config.epochs}: {state} | elapsed {format_duration(time.perf_counter() - epoch_started)}")
+            _emit(progress, f"Saved {saved} | best validation loss {best_score}")
+
+        try:
+            if expired:
+                raise TrainingBudgetExpired()
+            if global_step > (history[-1]["global_step"] if history else 0) and config.max_steps is not None and global_step >= config.max_steps:
+                phase = "validation"
+            while phase == "validation" or epoch < config.epochs and (config.max_steps is None or global_step < config.max_steps):
+                budget.check()
+                epoch_started = last_log = time.perf_counter()
+                if phase != "validation":
+                    first_batch = next_batch
+                    batch_count = runtime["train_loader"]["batches"]
+                    batch_limit = batch_count if config.max_steps is None else min(batch_count, next_batch + config.max_steps - global_step)
+                    _emit(progress, f"Epoch {epoch + 1}/{config.epochs}: starting at batch {next_batch + 1}/{batch_count} | step {global_step}")
+                    if callable(getattr(train_loader.sampler, "set_epoch", None)):
+                        before = _capture_rng()
+                        train_loader.sampler.set_epoch(epoch)
+                        _require_same_rng(before, _capture_rng())
+                    resuming_partial = next_batch > 0
+                    saved_generator = train_loader.generator.get_state()
+                    if resuming_partial:
+                        train_loader.generator.set_state(epoch_start)
+                    else:
+                        epoch_start = saved_generator
+                    try:
+                        iterator = _iterator(train_loader)
+                        for _ in range(next_batch):
+                            budget.check()
+                            _checked_next(iterator)
+                        if resuming_partial and not torch.equal(train_loader.generator.get_state(), saved_generator):
+                            raise ValueError("Cannot reproduce the checkpoint's mid-epoch loader RNG state")
+                        model.train()
+                        while next_batch < batch_limit:
+                            budget.check()
+                            batch = _batch_to_device(_checked_next(iterator), device)
+                            budget.check()
+                            optimizer.zero_grad(set_to_none=True)
+                            outputs = _outputs(model, batch)
+                            loss, stats = _loss(outputs, batch, loss_function, weights, config.sparsity_weight)
+                            supervised = _objective(stats, weights, config.sparsity_weight) is not None
+                            if not supervised and not joint_model:
+                                raise ValueError("Training batch has no meaningful supervised objective")
+                            if supervised and loss.requires_grad:
+                                loss.backward()
+                            elif supervised:
+                                raise ValueError("Training loss produced no model gradients")
+                            gradients = [parameter.grad for parameter in trainable_parameters if parameter.grad is not None]
+                            if supervised and not gradients:
+                                raise ValueError("Training loss produced no model gradients")
+                            if any(not torch.isfinite(gradient).all().item() for gradient in gradients):
+                                raise ValueError("Nonfinite model gradient")
+                            if joint_model:
+                                for parameter in trainable_parameters:
+                                    if parameter.grad is not None and not torch.count_nonzero(parameter.grad).item():
+                                        parameter.grad = None
+                            if any(parameter.grad is not None for parameter in trainable_parameters):
+                                torch.nn.utils.clip_grad_norm_(trainable_parameters, config.gradient_clip, error_if_nonfinite=True)
+                                optimizer.step()
+                                optimizer_updates += 1
+                            else:
+                                optimizer_skips += 1
+                            for name, value in model.state_dict().items():
+                                _tensor(value, f"updated model.{name}")
+                            global_step += 1
+                            next_batch += 1
+                            training_windows += batch["features"].shape[0]
+                            now = time.perf_counter()
+                            processed = next_batch - first_batch
+                            if progress is not None and _progress_due(processed, batch_limit - first_batch, now, last_log):
+                                eta = (now - epoch_started) / processed * (batch_limit - next_batch)
+                                activity = f" | optimizer updates {optimizer_updates}, skipped {optimizer_skips}" if joint_model else ""
+                                _emit(progress, f"Epoch {epoch + 1}/{config.epochs} | batch {next_batch}/{batch_count} | step {global_step}{activity} | batch loss {loss.detach().item():.6f} | elapsed {format_duration(now - started)} | epoch training ETA {format_duration(eta)}")
+                                last_log = now
+                    except TrainingBudgetExpired:
+                        # Reconstructing/skipping loader batches must not advance its saved RNG.
+                        if next_batch == first_batch:
+                            train_loader.generator.set_state(saved_generator)
+                        raise
+                    if next_batch == batch_count:
+                        before = _capture_rng()
+                        if next(iterator, None) is not None:
+                            raise ValueError("Training loader exceeded its declared batch count")
+                        _require_same_rng(before, _capture_rng())
+                        epoch += 1
+                        next_batch = 0
+                    phase = "validation"
+                epoch_complete = next_batch == 0
+                epoch_index = epoch - 1 if epoch_complete else epoch
+                budget.check()
+                current_validation = evaluate_model(model, validation_loader, device, sparsity_weight=config.sparsity_weight,
+                                                    progress=progress, phase=f"Epoch {epoch_index + 1} validation", budget=budget)
+                _require_validation(current_validation)
+                validation_windows += current_validation["windows"]
+                event_improved = False
+                if event_evaluator is not None:
+                    budget.check()
+                    _emit(progress, f"Epoch {epoch_index + 1} decoded-event validation: starting.")
+                    events = _evaluate_events(model, event_evaluator, metric=best_event["metric"] if best_event else None, budget=budget)
+                    current_validation["decoded_events"] = events
+                    event_validation_windows += events["windows"]
+                    event_improved = best_event is None or events["score"] > best_event["score"]
+                    _emit(progress, f"Decoded-event {events['metric']}: {events['score']:.6f} | {events['windows']} windows")
+                budget.check()
+                validation = current_validation
+                history.append({
+                    "epoch": epoch_index, "global_step": global_step,
+                    "epoch_complete": epoch_complete, "validation": validation,
+                })
+                if joint_model:
+                    history[-1].update(optimizer_updates=optimizer_updates, optimizer_skipped_batches=optimizer_skips)
+                improved = best_score is None or validation["loss"] < best_score
+                if improved:
+                    best_score = validation["loss"]
+                if event_improved:
+                    best_event = _best_event_selection(history, run_id)
+                phase = "training"
+                save_checkpoint(improved=improved, event_improved=event_improved)
+                state = "complete" if epoch_complete else "paused at step ceiling"
+                _emit(progress, f"Epoch {epoch_index + 1}/{config.epochs}: {state} | elapsed {format_duration(time.perf_counter() - epoch_started)}")
+                budget.check()
+        except TrainingBudgetExpired:
+            expired = True
+            _emit(progress, "Wall-clock budget reached; saving exact resume state without incomplete validation scores.")
+            save_checkpoint(stopped_by="max_seconds")
+        budget_report = budget.report()
         return _json_copy({
             "run_dir": str(run_dir), "global_step": global_step, "epoch": epoch,
             "next_batch_index": next_batch, "best_score": best_score, "validation": validation,
-            "stopped_by": "epochs" if epoch >= config.epochs else "max_steps",
-            "latest_checkpoint": str(run_dir / "latest.pt"), "best_checkpoint": str(run_dir / "best.pt"),
+            "status": "paused" if expired else "complete",
+            "training_started": optimizer_updates > initial_updates,
+            "stopped_by": "max_seconds" if expired else "epochs" if epoch >= config.epochs else "max_steps",
+            "validation_pending": phase == "initial_validation" or global_step > (history[-1]["global_step"] if history else 0),
+            "resume_phase": phase, "epochs_remaining": max(0, config.epochs - epoch),
+            "latest_checkpoint": str(run_dir / "latest.pt"), "best_checkpoint": str(run_dir / "best.pt") if best_score is not None else None,
             "best_event_checkpoint": str(run_dir / best_event["checkpoint"]) if best_event else None,
             "best_event_score": best_event["score"] if best_event else None,
-            "elapsed_seconds": time.perf_counter() - started,
+            **budget_report, "training_elapsed_seconds": time.perf_counter() - started,
             "epochs_requested": config.epochs, "epochs_completed_this_run": epoch - initial_epoch,
             "training_steps_processed": global_step - initial_step,
+            "optimizer_updates": optimizer_updates - initial_updates,
+            "optimizer_skipped_batches": optimizer_skips - initial_skips,
+            "total_optimizer_updates": optimizer_updates, "total_optimizer_skipped_batches": optimizer_skips,
             "training_windows_processed": training_windows, "validation_windows_processed": validation_windows,
             "event_validation_windows_processed": event_validation_windows,
             "dataset_windows": {"train": runtime["train_loader"]["dataset_size"], "validation": runtime["validation_loader"]["dataset_size"]},

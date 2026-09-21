@@ -1,6 +1,7 @@
 """Assign two readable GP voices while minimizing avoidable tied fragments."""
 
 from copy import deepcopy
+from collections import defaultdict
 from fractions import Fraction
 
 from .transcriber_audio import HarnessError
@@ -48,7 +49,15 @@ def optimize_voices(document):
         }
     intervals = [_interval(note) for note in result["notes"]]
     model = cp_model.CpModel()
-    voices = [model.new_int_var(0, VOICE_COUNT - 1, f"voice_{index}") for index in range(len(result["notes"]))]
+    groups = defaultdict(list)
+    for index, interval in enumerate(intervals):
+        groups[interval].append(index)
+    group_intervals = list(groups)
+    group_voices = [model.new_int_var(0, VOICE_COUNT - 1, f"voice_{index}") for index in range(len(groups))]
+    voices = [None] * len(intervals)
+    for interval, voice in zip(group_intervals, group_voices):
+        for index in groups[interval]:
+            voices[index] = voice
     objective = []
     for index, note in enumerate(result["notes"]):
         original = note.get("voiceIndex")
@@ -59,19 +68,25 @@ def optimize_voices(document):
         model.add(voices[index] != preferred).only_enforce_if(changed)
         model.add(voices[index] == preferred).only_enforce_if(changed.Not())
         objective.append(12 * changed)
-    for left in range(len(result["notes"])):
-        left_start, left_end = intervals[left]
-        for right in range(left + 1, len(result["notes"])):
-            right_start, right_end = intervals[right]
-            if right_start >= left_end or left_start >= right_end:
+    same_voice = {}
+    for left, (start, end) in enumerate(group_intervals):
+        boundaries = defaultdict(list)
+        for right, interval in enumerate(group_intervals):
+            points = [point for point in interval if start < point < end]
+            if not points:
                 continue
-            same = model.new_bool_var(f"same_{left}_{right}")
-            model.add(voices[left] == voices[right]).only_enforce_if(same)
-            model.add(voices[left] != voices[right]).only_enforce_if(same.Not())
-            if (left_start, left_end) == (right_start, right_end):
-                objective.append(20 * same.Not())
-            else:
-                objective.append(40 * same)
+            pair = min(left, right), max(left, right)
+            if pair not in same_voice:
+                same = model.new_bool_var(f"same_{pair[0]}_{pair[1]}")
+                model.add(group_voices[left] == group_voices[right]).only_enforce_if(same)
+                model.add(group_voices[left] != group_voices[right]).only_enforce_if(same.Not())
+                same_voice[pair] = same
+            for point in points:
+                boundaries[point].append(same_voice[pair])
+        for ordinal, same in enumerate(boundaries.values()):
+            split = model.new_bool_var(f"split_{left}_{ordinal}")
+            model.add_max_equality(split, same)
+            objective.append(40 * len(groups[(start, end)]) * split)
     model.minimize(sum(objective))
     solver = cp_model.CpSolver()
     solver.parameters.max_deterministic_time = 20
@@ -102,6 +117,7 @@ def optimize_voices(document):
         "bestObjectiveBound": solver.best_objective_bound,
         "wallTimeSeconds": solver.wall_time,
         "voiceCount": VOICE_COUNT,
+        "policy": "Equal onset/end chord members share a voice; minimize actual distinct internal boundaries per sustained note, not pairwise overlap counts.",
         "changedCount": len(changes),
         "estimatedSegmentsBefore": before,
         "estimatedSegmentsAfter": after,

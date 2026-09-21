@@ -220,6 +220,11 @@ class FingerstyleTranscriber(nn.Module):
         })
 
     def forward(self, features: Tensor, conditioning: Tensor, lengths: Tensor | None = None) -> dict[str, Tensor]:
+        hidden, valid = self.encode(features, conditioning, lengths)
+        return self.decode_hidden(hidden, valid)
+
+    def encode(self, features: Tensor, conditioning: Tensor,
+               lengths: Tensor | None = None) -> tuple[Tensor, Tensor]:
         if not isinstance(features, Tensor):
             raise TypeError("features must be a torch.Tensor")
         if features.ndim != 3 or min(features.shape[:2]) < 1:
@@ -245,6 +250,17 @@ class FingerstyleTranscriber(nn.Module):
         packed = pack_padded_sequence(hidden, lengths.detach().cpu(), batch_first=True, enforce_sorted=False)
         packed, _ = self.recurrent(packed)
         hidden, _ = pad_packed_sequence(packed, batch_first=True, total_length=frames)
+        return hidden, valid
+
+    def decode_hidden(self, hidden: Tensor, valid: Tensor) -> dict[str, Tensor]:
+        if not isinstance(hidden, Tensor):
+            raise TypeError("hidden must be a torch.Tensor")
+        if hidden.ndim != 3 or min(hidden.shape[:2]) < 1:
+            raise ValueError("hidden must have shape (B, T, 2 * hidden_size), with B and T positive")
+        batch, frames = hidden.shape[:2]
+        _tensor("hidden", hidden, (batch, frames, 2 * self.config.hidden_size),
+                dtype=self.conv1.weight.dtype, device=self.conv1.weight.device, floating=True, finite=True)
+        _tensor("valid", valid, (batch, frames), dtype=torch.bool, device=hidden.device)
         outputs = {}
         for name, head in self.heads.items():
             values = head(hidden).reshape(batch, frames, *self.head_shapes[name])

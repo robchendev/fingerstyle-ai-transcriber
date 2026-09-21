@@ -12,6 +12,7 @@ from .gp_events import validate_provided_timing
 class DraftProfile:
     note_threshold: float = 0.9
     percussion_threshold: float = 0.6
+    thumb_slap_threshold: float | None = None
     harmonic_threshold: float = 0.8
     include_harmonics: bool = False
     brush_threshold: float = 0.9
@@ -27,10 +28,21 @@ class DraftProfile:
     grace_threshold: float = 0.8
     chord_tolerance_seconds: float = 0.04
     same_string_gap_seconds: float = 0.0
+    strict_note_confidence: bool = False
+    rhythm_policy: str = "adaptive"
 
     def __post_init__(self):
         if type(self.include_harmonics) is not bool:
             raise TypeError("include_harmonics must be boolean.")
+        if type(self.strict_note_confidence) is not bool:
+            raise TypeError("strict_note_confidence must be boolean.")
+        if self.rhythm_policy not in ("adaptive", "fingerstyle"):
+            raise ValueError("rhythm_policy must be adaptive or fingerstyle.")
+        if self.thumb_slap_threshold is not None and (
+            type(self.thumb_slap_threshold) not in (int, float) or not math.isfinite(self.thumb_slap_threshold)
+            or not 0 <= self.thumb_slap_threshold <= 1
+        ):
+            raise ValueError("thumb_slap_threshold must be from zero through one or omitted.")
         for name in (
             "note_threshold", "percussion_threshold", "harmonic_threshold",
             "brush_threshold", "arpeggio_threshold", "pick_stroke_threshold", "rasgueado_threshold",
@@ -172,7 +184,8 @@ def _clean_harmonics(notes, profile):
 def _clean_percussion(percussion, note_times, profile, removed, onset_adjustments, grouping_tolerance):
     filtered = []
     for event in percussion:
-        if _confidence(event) < profile.percussion_threshold:
+        threshold = profile.thumb_slap_threshold if event.get("technique") == "thumb_slap" and profile.thumb_slap_threshold is not None else profile.percussion_threshold
+        if _confidence(event) < threshold:
             removed.append({"reason": "below_percussion_threshold", "event": event})
         else:
             filtered.append(deepcopy(event))
@@ -216,6 +229,13 @@ def clean_hypotheses(document, profile=DraftProfile()):
     if not isinstance(profile, DraftProfile):
         raise TypeError("profile must be DraftProfile.")
     source = deepcopy(document)
+    acoustic_attacks = {}
+    for note in document["notes"]:
+        if "technique_membership_completed_attack" not in note.get("uncertainty", []) and _confidence(note) >= .5:
+            onset = _onset(note)
+            acoustic_attacks[onset] = max(acoustic_attacks.get(onset, 0.), _confidence(note))
+    source["acousticAttackEvidence"] = [{"onsetSeconds": onset, "confidence": confidence}
+                                       for onset, confidence in sorted(acoustic_attacks.items())]
     grouping_tolerance = profile.chord_tolerance_seconds
     metadata = document.get("metadata")
     if metadata is not None:
@@ -232,7 +252,7 @@ def clean_hypotheses(document, profile=DraftProfile()):
     selected = []
     for note in source["notes"]:
         membership_completed = "technique_membership_completed_attack" in note.get("uncertainty", [])
-        if _confidence(note) < profile.note_threshold and not membership_completed:
+        if _confidence(note) < profile.note_threshold and (profile.strict_note_confidence or not membership_completed):
             removed_notes.append({"reason": "below_note_threshold", "event": note})
         else:
             selected.append(note)
@@ -360,10 +380,17 @@ def clean_hypotheses(document, profile=DraftProfile()):
         "profile": asdict(profile),
         "effectiveChordGroupingSeconds": grouping_tolerance,
         "reattackPolicy": "Distinct same-string attack times split chord clusters; different simultaneous pitches survive for fingering resolution. Temporal suppression is disabled by default.",
+        "rasgueadoPolicy": "Retain rasgueado evidence and its supported note candidates. GP conversion normalizes qualifying dense downstroke groups and never emits the native Rasgueado playback effect.",
+        "attackEvidencePolicy": "Independent acoustic onset scores at least0.5 may support chord-completion timing without automatically promoting their low-confidence pitches.",
         "sourceCounts": {"notes": len(document["notes"]), "percussion": len(document["percussion"])},
         "retainedCounts": {"notes": len(retained_notes), "percussion": len(percussion)},
         "removedNoteCount": len(removed_notes) + len(removed_orphan_members),
         "removedPercussionCount": len(removed_percussion),
+        "percussionThresholds": {
+            "wrist_thump": profile.percussion_threshold,
+            "thumb_slap": profile.percussion_threshold if profile.thumb_slap_threshold is None else profile.thumb_slap_threshold,
+            "percussive_hit": profile.percussion_threshold,
+        },
         "removedHarmonicCount": len(removed_harmonics),
         "sourceTechniqueCount": len(techniques),
         "retainedTechniqueCount": len(retained_techniques),

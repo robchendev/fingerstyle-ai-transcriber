@@ -68,6 +68,48 @@ class WindowFixture:
 
 
 class EventEvaluationTests(unittest.TestCase):
+    def test_joint_event_scoring_is_limited_to_prepared_intervals_not_tracking_availability(self):
+        dataset = WindowFixture(True)
+        dataset.video_training_intervals = lambda record: [[2.5, 3.5]]
+        report = evaluate_events(TimeModel(), dataset, "cpu")
+        self.assertEqual(report["recordings"][0]["scoredClipRanges"], [[2.5, 3.5]])
+        metrics = report["metricsByToleranceSeconds"]["0.1"]
+        self.assertEqual(metrics["wrist_thump"]["true_positive"], 1)
+        self.assertEqual(metrics["thumb_slap"]["false_positive"], 0)
+        self.assertEqual(metrics["thumb_slap"]["unscorable_predictions"], 1)
+
+    def test_event_evaluation_forwards_coarse_contract_through_missing_context(self):
+        from scripts.paired_video import empty_video, validate_video_tensors
+
+        dataset = WindowFixture(True)
+        dataset.video_training_intervals = lambda record: [[2.5, 3.5]]
+        observed = []
+
+        def video_window(record, times):
+            video = empty_video(len(times))
+            if times[0] == 0:
+                video["structured_available"][0, 0, 98:140] = True
+                video["structured_available"][0, 0, 186:188] = True
+                video["structured"][0, 0, 186:188] = torch.tensor([-5., -1.])
+                video["segment_id"][0, 0] = 0
+                video["frame_indices"].zero_()
+            validate_video_tensors(video, len(times))
+            return video
+
+        class VideoTimeModel(TimeModel):
+            def forward(self, features, conditioning, lengths, *, video):
+                observed.append(video)
+                return super().forward(features, conditioning, lengths)
+
+        dataset.video_window = video_window
+        report = evaluate_events(VideoTimeModel(), dataset, "cpu")
+        self.assertEqual(len(observed), 2)
+        self.assertEqual(observed[0]["structured"].shape, (1, 1, 4, 194))
+        self.assertTrue(observed[0]["structured_available"][..., 186:188].any())
+        self.assertFalse(observed[1]["structured_available"].any())
+        self.assertEqual(report["recordings"][0]["scoredClipRanges"], [[2.5, 3.5]])
+        self.assertEqual(report["metricsByToleranceSeconds"]["0.1"]["wrist_thump"]["true_positive"], 1)
+
     def test_matching_is_one_to_one_maximal_not_nearest_first(self):
         truth = [{"onsetSeconds": time, "string": 6} for time in (0., .1)]
         predictions = [{"onsetSeconds": time, "string": 6} for time in (.06, .16)]

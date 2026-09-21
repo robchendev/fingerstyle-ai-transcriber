@@ -2,6 +2,7 @@ from io import BytesIO
 from fractions import Fraction
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 import hashlib
 import math
 import unittest
@@ -12,7 +13,7 @@ from scripts.dataset_io import ROOT
 from scripts.dataset_io import publish_json, read_json
 from scripts.gp_events import decode_score, rhythm_duration
 from scripts.gp_normalization import GPIF_ENTRY
-from scripts.gp_output import GRID, TempoMap, _rhythmic_positions, write_gp_outputs
+from scripts.gp_output import GRID, TempoMap, _rhythmic_positions, _split_duration, _spell_interval, write_gp_outputs
 from scripts.draft_cleanup import DraftProfile
 from scripts import transcriber
 from scripts.transcriber_audio import HarnessError
@@ -81,6 +82,44 @@ def gp_root(path):
 
 
 class GpOutputTests(unittest.TestCase):
+    def test_fingerstyle_export_does_not_write_double_dots_or_dotted_sixteenths(self):
+        document = hypotheses()
+        document["notes"] = [{**document["notes"][0], "onsetSeconds": time, "notatedDurationQuarter": .37,
+                              "string": 1, "fret": 0, "soundingPitchMidi": 64, "voiceIndex": 0, "confidence": .99, "uncertainty": []}
+                             for time in (0., .31, .57, .81, 1.31)]
+        document["percussion"] = []
+        beats = {"kind": "audio-beat-evidence", "audioSha256": "audio",
+                 "beatSeconds": [i / 2 for i in range(11)], "downbeatSeconds": [0., 2., 4.]}
+        with TemporaryDirectory(dir=ROOT) as directory:
+            directory = Path(directory)
+            template, full, single = directory / "template.gpt", directory / "full.gp", directory / "single.gp"
+            template.write_bytes(archive_bytes(output_template()))
+            with self.assertRaisesRegex(HarnessError, "requires beat evidence"):
+                write_gp_outputs(template, document, full, single, profile=DraftProfile(rhythm_policy="fingerstyle"))
+            write_gp_outputs(template, document, full, single, profile=DraftProfile(rhythm_policy="fingerstyle"), beat_evidence=beats)
+            for path in (full, single):
+                root = gp_root(path)
+                for rhythm in root.findall("./Rhythms/Rhythm"):
+                    dots = rhythm.find("AugmentationDot")
+                    self.assertFalse(dots is not None and (int(dots.get("count")) > 1 or rhythm.findtext("NoteValue") in ("16th", "32nd")))
+                    self.assertIsNone(rhythm.find("PrimaryTuplet"))
+                    self.assertNotIn(rhythm.findtext("NoteValue"), ("32nd", "64th", "128th"))
+
+    def test_strict_note_threshold_also_applies_to_optional_symbolic_completion(self):
+        document = hypotheses()
+        document["notes"] = [{**document["notes"][0], "confidence": .99}]
+        profile = DraftProfile(note_threshold=.98, strict_note_confidence=True)
+        with TemporaryDirectory(dir=ROOT) as directory:
+            directory = Path(directory)
+            template = directory / "template.gpt"
+            template.write_bytes(archive_bytes(output_template()))
+            def complete(model, source, **kwargs):
+                self.assertEqual(kwargs["threshold"], .98)
+                return source, {"addedCount": 0, "replacedCount": 0, "removedCount": 0}
+            with patch("scripts.symbolic_completer.complete_document", side_effect=complete) as completion:
+                write_gp_outputs(template, document, directory / "full.gp", directory / "single.gp", profile=profile, completer=object())
+            completion.assert_called_once()
+
     def test_v4_grace_slide_has_zero_score_advance_and_terminal_slides_stay_local(self):
         document = hypotheses()
         document["notes"] = [{
@@ -166,6 +205,169 @@ class GpOutputTests(unittest.TestCase):
                 self.assertEqual(positions, [Fraction(15, 4), Fraction(31, 8), Fraction(4)])
                 self.assertEqual(len(root.findall("./Beats/Beat/Properties/Property[@name='Brush']")), 1)
 
+    def test_three_downstrokes_do_not_trigger_native_rasgueado_or_extra_attacks(self):
+        document = hypotheses()
+        onsets = (1.875, 1.9375, 2.)
+        document["notes"] = [{
+            **document["notes"][0], "onsetSeconds": onset, "string": 1, "fret": 0,
+            "soundingPitchMidi": 64, "voiceIndex": 0, "harmonic": None,
+            "confidence": .99, "notatedDurationQuarter": .125, "uncertainty": [],
+        } for onset in onsets]
+        document["percussion"] = []
+        document["techniques"] = [{
+            "onsetSeconds": onset, "technique": "brush", "direction": "Down",
+            "strings": [1], "confidence": 1.,
+            "stringMembershipConfidence": {str(i): float(i == 1) for i in range(1, 7)},
+        } for onset in onsets]
+        document["techniques"].append({**document["techniques"][0], "technique": "rasgueado"})
+        document["techniques"].append(dict(document["techniques"][0]))
+        beats = {"kind": "audio-beat-evidence", "audioSha256": "audio",
+                 "beatSeconds": [i / 2 for i in range(11)], "downbeatSeconds": [0., 2., 4.]}
+        with TemporaryDirectory(dir=ROOT) as directory:
+            directory = Path(directory)
+            template, full, single = directory / "template.gpt", directory / "full.gp", directory / "single.gp"
+            template.write_bytes(archive_bytes(output_template()))
+            write_gp_outputs(template, document, full, single, beat_evidence=beats)
+            for path in (full, single):
+                root = gp_root(path)
+                self.assertFalse(root.findall(".//Property[@name='Rasgueado']"))
+                self.assertEqual([p.findtext("Direction") for p in root.findall("./Beats/Beat/Properties/Property[@name='Brush']")], ["Down"] * 3)
+                self.assertEqual(len(root.findall("./Beats/Beat/XProperties/XProperty[@id='687935489']")), 3)
+                score = decode_score(root, document["metadata"]["openStringMidi"], 0)
+                attacks = [Fraction(*b["scoreOnsetQuarter"]) for b in score["scoreEvents"]
+                           for n in b["notes"] if not n["tie"]["destination"]]
+                self.assertEqual(attacks, [Fraction(15, 4), Fraction(31, 8), Fraction(4)])
+
+    def test_rhythm_spelling_preserves_dots_triplets_and_offbeat_boundaries(self):
+        self.assertEqual(_split_duration(Fraction(3, 2)), [(Fraction(3, 2), ("Quarter", 1, None))])
+        self.assertEqual(_split_duration(Fraction(1, 3)), [(Fraction(1, 3), ("Eighth", 0, (3, 2)))])
+        simple = {"start": Fraction(0), "meter": [4, 4]}
+        spelled = _spell_interval(Fraction(5, 2), Fraction(7, 2), simple)
+        self.assertEqual(spelled, [(Fraction(1, 2), ("Eighth", 0, None))] * 2)
+        compound = {"start": Fraction(0), "meter": [6, 8]}
+        self.assertEqual(_spell_interval(Fraction(0), Fraction(3, 2), compound), [(Fraction(3, 2), ("Quarter", 1, None))])
+        self.assertEqual(_spell_interval(Fraction(3, 2), Fraction(3), compound), [(Fraction(3, 2), ("Quarter", 1, None))])
+        self.assertEqual(_spell_interval(Fraction(2, 3), Fraction(1), compound), [(Fraction(1, 3), ("Eighth", 0, (3, 2)))])
+        triplet = _spell_interval(Fraction(1, 3), Fraction(3, 2), simple)
+        self.assertEqual(triplet, [(Fraction(2, 3), ("Quarter", 0, (3, 2))), (Fraction(1, 2), ("Eighth", 0, None))])
+        self.assertEqual(_spell_interval(Fraction(3, 4), Fraction(5, 4), simple),
+                         [(Fraction(1, 4), ("16th", 0, None))] * 2)
+        with self.assertRaisesRegex(HarnessError, "cannot be spelled"):
+            _split_duration(Fraction(1, 5))
+
+    def test_metrical_ties_preserve_note_endpoints_and_do_not_split_plain_quavers(self):
+        for onset, duration, expected in (
+            (Fraction(0), Fraction(1, 2), [Fraction(1, 2)]),
+            (Fraction(5, 2), Fraction(1), [Fraction(1, 2), Fraction(1, 2)]),
+            (Fraction(3, 4), Fraction(1, 2), [Fraction(1, 4), Fraction(1, 4)]),
+            (Fraction(0), Fraction(3, 2), [Fraction(3, 2)]),
+        ):
+            with self.subTest(onset=onset, duration=duration), TemporaryDirectory(dir=ROOT) as directory:
+                directory = Path(directory)
+                document = hypotheses()
+                document["notes"] = [{
+                    **document["notes"][0], "onsetSeconds": float(onset) / 2, "notatedDurationQuarter": float(duration),
+                    "string": 1, "fret": 0, "soundingPitchMidi": 64, "voiceIndex": 0, "confidence": .99, "uncertainty": [],
+                }]
+                document["percussion"] = []
+                template, full, single = directory / "template.gpt", directory / "full.gp", directory / "single.gp"
+                template.write_bytes(archive_bytes(output_template()))
+                write_gp_outputs(template, document, full, single)
+                for path in (full, single):
+                    score = decode_score(gp_root(path), document["metadata"]["openStringMidi"], 0)
+                    fragments = [(b, n) for b in score["scoreEvents"] for n in b["notes"]]
+                    self.assertEqual([Fraction(*b["advanceQuarter"]) for b, _ in fragments], expected)
+                    self.assertEqual(Fraction(*fragments[0][0]["scoreOnsetQuarter"]), onset)
+                    self.assertEqual(sum(expected), duration)
+                    self.assertEqual([bool(n["tie"]["destination"]) for _, n in fragments], [False] + [True] * (len(expected) - 1))
+                    self.assertFalse([i for i in score["issues"] if i["code"] in ("underfull_measure", "overfull_measure")])
+
+    def test_unattached_technique_cannot_fragment_a_sustained_note(self):
+        document = hypotheses()
+        document["notes"] = [{
+            **document["notes"][0], "onsetSeconds": 0., "notatedDurationQuarter": .5,
+            "string": 1, "fret": 0, "soundingPitchMidi": 64, "voiceIndex": 0, "confidence": .99, "uncertainty": [],
+        }]
+        document["percussion"] = []
+        document["techniques"] = [{
+            "onsetSeconds": .1875, "technique": "brush", "direction": "Down", "confidence": .99, "strings": [1],
+            "stringMembershipConfidence": {str(i): float(i == 1) for i in range(1, 7)},
+        }]
+        with TemporaryDirectory(dir=ROOT) as directory:
+            directory = Path(directory)
+            template, full, single = directory / "template.gpt", directory / "full.gp", directory / "single.gp"
+            template.write_bytes(archive_bytes(output_template()))
+            report = write_gp_outputs(template, document, full, single)
+            self.assertEqual(report["techniqueAttachment"][0]["reason"], "no_nearby_pitched_attack")
+            for path in (full, single):
+                root = gp_root(path)
+                self.assertEqual(len(root.findall("./Notes/Note")), 1)
+                self.assertFalse(root.findall("./Notes/Note/Tie"))
+                self.assertFalse(root.findall("./Beats/Beat/Properties/Property[@name='Brush']"))
+
+    def test_final_supported_beat_keeps_its_attack_with_a_spellable_duration(self):
+        document = hypotheses()
+        document["audioDurationSeconds"] = 2.1
+        document["notes"] = [{
+            **document["notes"][0], "onsetSeconds": seconds, "notatedDurationQuarter": .5,
+            "string": 1, "fret": 0, "soundingPitchMidi": 64, "voiceIndex": 0, "confidence": .99, "uncertainty": [],
+        } for seconds in (0., 2.)]
+        document["percussion"] = []
+        beats = {"kind": "audio-beat-evidence", "audioSha256": "audio",
+                 "beatSeconds": [0., .5, 1., 1.5, 2.], "downbeatSeconds": [0., 2.]}
+        with TemporaryDirectory(dir=ROOT) as directory:
+            directory = Path(directory)
+            template, full, single = directory / "template.gpt", directory / "full.gp", directory / "single.gp"
+            template.write_bytes(archive_bytes(output_template()))
+            write_gp_outputs(template, document, full, single, beat_evidence=beats)
+            for path in (full, single):
+                score = decode_score(gp_root(path), document["metadata"]["openStringMidi"], 0)
+                attacks = [b for b in score["scoreEvents"] if any(not n["tie"]["destination"] for n in b["notes"])]
+                self.assertEqual([b["scoreOnsetQuarter"] for b in attacks], [[0, 1], [4, 1]])
+                self.assertEqual(attacks[-1]["advanceQuarter"], [1, 8])
+
+    def test_percussion_rest_carrier_uses_the_triplet_grid_instead_of_a_binary_fragment(self):
+        document = hypotheses()
+        document["notes"] = [{
+            **document["notes"][0], "onsetSeconds": float(q) / 2,
+            "scoreOnsetQuarter": [q.numerator, q.denominator], "scoreDurationQuarter": [1, 3],
+            "string": 1, "fret": 0, "soundingPitchMidi": 64, "voiceIndex": 0, "confidence": .99, "uncertainty": [],
+        } for q in (Fraction(1, 3), Fraction(2, 3))]
+        document["scoreAudioEndQuarter"] = [4, 1]
+        document["percussion"] = [{"onsetSeconds": 0., "scoreOnsetQuarter": [0, 1], "technique": "thumb_slap", "confidence": .99}]
+        with TemporaryDirectory(dir=ROOT) as directory:
+            directory = Path(directory)
+            template, full, single = directory / "template.gpt", directory / "full.gp", directory / "single.gp"
+            template.write_bytes(archive_bytes(output_template()))
+            write_gp_outputs(template, document, full, single)
+            for path in (full, single):
+                root = gp_root(path)
+                self.assertFalse([rhythm for rhythm in root.findall("./Rhythms/Rhythm") if rhythm.findtext("NoteValue") in ("64th", "128th")])
+                decoded = decode_score(root, document["metadata"]["openStringMidi"], 0)
+                self.assertFalse([i for i in decoded["issues"] if i["code"] in ("underfull_measure", "overfull_measure")])
+
+    def test_dense_downstroke_normalization_reaches_both_gp_outputs(self):
+        from tests.test_stroke_normalization import burst
+
+        document = {**hypotheses(), **burst()}
+        beats = {"kind": "audio-beat-evidence", "audioSha256": "audio",
+                 "beatSeconds": [i / 2 for i in range(11)], "downbeatSeconds": [0., 2., 4.]}
+        with TemporaryDirectory(dir=ROOT) as directory:
+            directory = Path(directory)
+            template, full, single = directory / "template.gpt", directory / "full.gp", directory / "single.gp"
+            template.write_bytes(archive_bytes(output_template()))
+            report = write_gp_outputs(template, document, full, single, beat_evidence=beats)
+            self.assertEqual(report["strokeNormalization"]["changedGroupCount"], 1)
+            for path in (full, single):
+                root = gp_root(path)
+                score = decode_score(root, document["metadata"]["openStringMidi"], 0)
+                attacks = [Fraction(*b["scoreOnsetQuarter"]) for b in score["scoreEvents"]
+                           for n in b["notes"] if not n["tie"]["destination"]]
+                self.assertEqual(sorted(attacks), sorted([Fraction(15, 4), Fraction(31, 8), Fraction(4)] * 2))
+                self.assertEqual([b.findtext("FreeText") for b in root.findall("./Beats/Beat") if b.findtext("FreeText")], ["a", "m", "i"])
+                self.assertFalse(root.findall(".//Property[@name='Rasgueado']"))
+                self.assertEqual(len(root.findall("./Beats/Beat/Properties/Property[@name='Brush']")), 3)
+
     def test_tempo_map_integrates_constant_and_linear_tempo(self):
         mapping = TempoMap({
             "tempo": {"bpm": 60, "beatUnit": [1, 4], "linear": True},
@@ -224,7 +426,8 @@ class GpOutputTests(unittest.TestCase):
                 note for note in full_root.findall("./Notes/Note")
                 if note.findtext("./Properties/Property[@name='String']/String") == "0"
             ]
-            self.assertEqual(len(bass), 2)
+            self.assertEqual(len(bass), 3)
+            self.assertEqual(sum(n.find("Tie").get("destination") != "true" for n in bass), 1)
             empty_voice = single_root.find("./Voices/Voice[Beats]")
             rhythm_ids = empty_voice.findtext("Beats").split()
             self.assertLess(len(rhythm_ids), 12)
