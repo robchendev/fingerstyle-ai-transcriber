@@ -1,4 +1,4 @@
-"""Local PyTorch commands. Training is an explicit human-run operation."""
+"""Local PyTorch commands. Training is an explicit explicit operation."""
 
 import argparse
 from collections import Counter
@@ -966,10 +966,10 @@ def argument_parser():
     export.add_argument("--predictions", required=True)
     export.add_argument("--template", required=True)
     export.add_argument("--beat-evidence", help="Private analyze-beats output for beat-anchored constrained rhythm inference.")
-    export.add_argument("--fingering-arranger", help="Optional trained symbolic arranger checkpoint; training is a separate human-owner command.")
+    export.add_argument("--fingering-arranger", help="Optional trained symbolic arranger checkpoint; training is a separate reviewer command.")
     export.add_argument("--hand-position-evidence", help="Optional audio/beat-hash-bound visual or explicitly labeled reference-oracle hand-position sidecar.")
     export.add_argument("--playing-evidence", help="Optional private guitar-playing-evidence report; requires --beat-evidence. Soft fret ranges only; gesture hypotheses are reported, never encoded automatically.")
-    export.add_argument("--symbolic-completer", help="Optional GP-trained missing-onset/chord checkpoint; training is a separate human-owner command.")
+    export.add_argument("--symbolic-completer", help="Optional GP-trained missing-onset/chord checkpoint; training is a separate reviewer command.")
     export.add_argument("--symbolic-completion-threshold", type=float, default=.8)
     export.add_argument("--symbolic-completion-technique-threshold", type=float, default=.8)
     export.add_argument("--full-output", default="runs/transcription.full-voices.gp")

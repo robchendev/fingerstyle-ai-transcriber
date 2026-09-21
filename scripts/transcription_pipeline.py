@@ -631,7 +631,7 @@ def transcription_status(args):
 
 
 def review_transcription(args):
-    """Delegate explicit human decisions to the existing isolated video worker."""
+    """Delegate explicit manual decisions to the existing isolated video worker."""
     _, directory = _directory(args)
     with _lock(directory):
         state = _read_state(directory)

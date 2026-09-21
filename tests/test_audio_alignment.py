@@ -181,7 +181,7 @@ class FirstAttackTests(unittest.TestCase):
         self.assertEqual(result["fixedFrameAnchors"][-1], (4, 6))
         self.assertIn("post_attack_sustain_unmapped", result["diagnostics"]["flags"])
         self.assertLess(result["diagnostics"]["audio_coverage_fraction"], 1)
-        self.assertFalse(result["diagnostics"]["last_attack_is_human_approved"])
+        self.assertFalse(result["diagnostics"]["last_attack_is_review_approved"])
 
     def test_lead_in_does_not_advance_score_and_late_music_is_retained(self):
         from scripts.audio_alignment import align_first_attack
@@ -193,7 +193,7 @@ class FirstAttackTests(unittest.TestCase):
         self.assertEqual((result["reference_indices"][-1], result["audio_indices"][-1]), (5, 10))
         self.assertEqual(result["fixedFrameAnchors"], [(0, 5)])
         self.assertEqual(result["diagnostics"]["first_attack_audio_seconds"], .25)
-        self.assertFalse(result["diagnostics"]["first_attack_is_human_approved"])
+        self.assertFalse(result["diagnostics"]["first_attack_is_review_approved"])
         np.testing.assert_array_equal(audio.times, before)
 
     def test_earliest_compatible_attack_not_loudest_later_attack_or_wrong_pitch_noise(self):
@@ -325,7 +325,7 @@ class DtwTests(unittest.TestCase):
         np.testing.assert_array_equal(first["reference_indices"], [0, 0, 0, 0])
         self.assertTrue(first["diagnostics"]["degenerate"])
         self.assertTrue(first["diagnostics"]["uninformative"])
-        self.assertTrue(first["diagnostics"]["requires_human_review"])
+        self.assertTrue(first["diagnostics"]["requires_manual_review"])
         self.assertFalse(first["diagnostics"]["cost_is_probability"])
 
     def test_wrong_pitch_sequence_is_flagged_not_confident(self):
@@ -362,7 +362,7 @@ class DtwTests(unittest.TestCase):
         np.testing.assert_array_equal(result["audio_indices"], np.arange(7))
         self.assert_complete_path(result, 12, 7, "subsequence")
         self.assertIsNone(result["diagnostics"]["mean_tonal_mismatch"])
-        self.assertTrue(result["diagnostics"]["requires_human_review"])
+        self.assertTrue(result["diagnostics"]["requires_manual_review"])
 
     def test_invalid_features_and_ranges_fail(self):
         valid = feature_sequence([0, 4, 7])

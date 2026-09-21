@@ -344,7 +344,7 @@ def automatic_candidate(labels, normalization, audio_path):
         with sf.SoundFile(audio_path) as stream:
             duration = len(stream) / stream.samplerate
             if not 8000 <= stream.samplerate <= 48000:
-                raise AlignmentError("Automatic DSP supports 8000-48000 Hz; keep the native audio and supply human anchors.")
+                raise AlignmentError("Automatic DSP supports 8000-48000 Hz; keep the native audio and supply manual anchors.")
         samples, rate = sf.read(audio_path, dtype="float32", always_2d=True)
         audio = audio_features(samples, rate)
         reference = reference_features(events, clock.duration_seconds)
@@ -354,7 +354,7 @@ def automatic_candidate(labels, normalization, audio_path):
         validate_mapping(dense, clock, duration)
         return {"denseMapping": dense, "method": "first-attack-dtw", "diagnostics": result["diagnostics"], "timingRisks": mapping_risks(dense), "omittedMatchingCues": omitted, "trainingReady": False}
     except (AlignmentError, AlignmentInputError) as error:
-        return {"denseMapping": [], "method": "needs-human-anchors", "error": str(error), "trainingReady": False}
+        return {"denseMapping": [], "method": "needs-manual-anchors", "error": str(error), "trainingReady": False}
 
 
 def prepare_pair(workspace, pair, *, accept_conventions=False, ffmpeg_dir=None):
@@ -463,9 +463,9 @@ def anchored_candidate(anchors, positions, duration, clock):
                 raise ValueError("Different timestamps name the same score position.")
             continue
         if compact and point["clipSeconds"] <= compact[-1]["clipSeconds"]:
-            raise ValueError("Human anchors must advance strictly in both score and audio time.")
+            raise ValueError("Manual anchors must advance strictly in both score and audio time.")
         compact.append(point)
-    return {"denseMapping": compact if len(compact) >= 2 else [], "method": "human-anchors-linear-nominal-time", "anchors": anchors, "trainingReady": False}
+    return {"denseMapping": compact if len(compact) >= 2 else [], "method": "manual-anchors-linear-nominal-time", "anchors": anchors, "trainingReady": False}
 
 
 def parse_ranges(values, duration):
@@ -486,7 +486,7 @@ def parse_ranges(values, duration):
 
 def effective_ranges(approved, excluded, mapping):
     if not mapping and approved:
-        raise ValueError("Provide at least two explicit human anchors before approving ranges without a usable automatic candidate.")
+        raise ValueError("Provide at least two explicit manual anchors before approving ranges without a usable automatic candidate.")
     result = []
     for left, right in approved:
         if not mapping[0]["clipSeconds"] <= left < right <= mapping[-1]["clipSeconds"]:
@@ -579,7 +579,7 @@ def review_pair(workspace, pair, args):
     editing = bool(args.anchor or args.clear_anchors or args.approve_range is not None or args.clear_ranges or args.exclude_range is not None or args.clear_exclusions or args.split or args.acknowledge_uncertainty or args.confirm_percussion_completeness or any(getattr(args, option) for option in CONFIRMATIONS))
     if editing:
         if not args.reviewer or not args.reviewer.strip():
-            raise ValueError("Recording a decision requires --reviewer with your human reviewer identity.")
+            raise ValueError("Recording a decision requires --reviewer with your reviewer identity.")
         review["reviewer"] = args.reviewer
         approval["reviewer"] = args.reviewer
     mapping = candidate["denseMapping"]
@@ -639,7 +639,7 @@ def release_dataset(workspace, version, validation_groups, identifiers=None, *, 
         approval = deepcopy(review["approval"])
         split = "validation" if pair["groupId"] in validation_groups else "train"
         if any(approval.get(field) is not True for field in CONFIRMATIONS.values()) or approval.get("split") not in (None, split) or approval.get("groupId") != pair["groupId"]:
-            raise ValueError(f"{pair['id']}: missing human source/notation/use/group/range approval, or reviewed split differs from --validation-group.")
+            raise ValueError(f"{pair['id']}: missing manual source/notation/use/group/range approval, or reviewed split differs from --validation-group.")
         labels, normalization, clock, _ = score_positions(directory)
         candidate = review["candidate"]
         validate_mapping(candidate["denseMapping"], clock, state["audio"]["sampleCount"] / state["audio"]["sampleRate"])
@@ -648,7 +648,7 @@ def release_dataset(workspace, version, validation_groups, identifiers=None, *, 
             raise ValueError(f"{pair['id']}: explicitly --acknowledge-uncertainty after reviewing the retained masks/issues, or quarantine the pair.")
         ranges = effective_ranges(review["requestedClipRanges"], review["excludedClipRanges"], candidate["denseMapping"])
         if ranges != approval.get("approvedClipRanges") or approval.get("candidateSha256") != candidate_digest(candidate) or approval.get("sourceGpSha256") != state["inputs"]["sourceGpSha256"] or approval.get("audioSha256") != state["audio"]["sha256"]:
-            raise ValueError("Human approval no longer matches this source, candidate or approved ranges.")
+            raise ValueError("Manual approval no longer matches this source, candidate or approved ranges.")
         rate = state["audio"]["sampleRate"]
         spans = range_sample_bounds(ranges, rate)
         notes, gestures = projected_targets(labels, candidate, clock)
@@ -664,7 +664,7 @@ def release_dataset(workspace, version, validation_groups, identifiers=None, *, 
             "schemaVersion": 1, "kind": "local-training-targets", "id": pair["id"],
             "canonical": labels, "normalization": normalization, "candidate": candidate, "windows": windows,
             "approval": approval, "sourceAudioSha256": state["inputs"]["sourceAudioSha256"],
-            "preparationSha256": candidate_digest(state), "trainingExecution": "human-owner-only",
+            "preparationSha256": candidate_digest(state), "trainingExecution": "explicit-command",
             "preparationRuntime": state["inputs"]["runtime"], "preparationImplementation": state["inputs"]["implementation"],
         }
         entry = {
@@ -683,7 +683,7 @@ def release_dataset(workspace, version, validation_groups, identifiers=None, *, 
         "schemaVersion": 1, "kind": "local-release-authorization", "reviewer": reviewer,
         "version": version, "validationGroups": validation_groups, "authorizedUse": True,
         "approveExperimentalRangesAndSplit": True, "groupingConfirmed": True,
-        "distributionAuthorized": False, "trainingExecution": "human-owner-only",
+        "distributionAuthorized": False, "trainingExecution": "explicit-command",
         "selectedScope": release_scope([(entry, payloads[entry["id"]]) for entry in entries]),
     }
     authorization["sha256"] = candidate_digest(authorization)
@@ -693,7 +693,7 @@ def release_dataset(workspace, version, validation_groups, identifiers=None, *, 
         "schemaVersion": 1, "kind": "local-training-dataset", "trainingReady": True,
         "visibility": "private", "distributionAuthorized": False,
         "entries": entries, "counts": {"windowsBySplit": counts}, "version": version,
-        "trainingExecution": "human-owner-only", "validationGroups": validation_groups,
+        "trainingExecution": "explicit-command", "validationGroups": validation_groups,
         "releaseAuthorization": authorization,
     }
     releases = regular_path(workspace / "releases")
@@ -717,7 +717,7 @@ def release_dataset(workspace, version, validation_groups, identifiers=None, *, 
         for pair in selected:
             load_current(workspace, pair)
         if any(sha256(regular_path(path)) != digest for path, digest in review_hashes.items()):
-            raise ValueError("Human review changed during release.")
+            raise ValueError("Manual review changed during release.")
         if destination.exists():
             previous, _, _ = validate_release(destination / "manifest.json")
             if previous != manifest:
@@ -728,7 +728,7 @@ def release_dataset(workspace, version, validation_groups, identifiers=None, *, 
     finally:
         if staging.exists():
             shutil.rmtree(staging)
-    return {"manifestPath": str(destination / "manifest.json"), "trainingReady": True, "counts": manifest["counts"], "releaseAuthorization": authorization, "trainingExecution": "human-owner-only"}
+    return {"manifestPath": str(destination / "manifest.json"), "trainingReady": True, "counts": manifest["counts"], "releaseAuthorization": authorization, "trainingExecution": "explicit-command"}
 
 
 def status(workspace):
@@ -742,7 +742,7 @@ def status(workspace):
             rows.append({**identity, "status": "reviewed" if approved else "needs-review"})
         except (OSError, ValueError) as error:
             rows.append({**identity, "status": "blocked", "reason": str(error)})
-    return {"workspace": str(workspace), "pairs": rows, "trainingExecution": "human-owner-only"}
+    return {"workspace": str(workspace), "pairs": rows, "trainingExecution": "explicit-command"}
 
 
 def parser():
@@ -754,7 +754,7 @@ def parser():
     add.add_argument("--id", required=True)
     add.add_argument("--group", required=True, help="Stable related-song/arrangement/shared-recording group.")
     add.add_argument("--performer", help="Optional explicitly supplied stable performer ID.")
-    add.add_argument("--title", help="Optional human-readable name; stable IDs remain unchanged.")
+    add.add_argument("--title", help="Optional readable name; stable IDs remain unchanged.")
     add.add_argument("--gp", required=True, type=Path)
     add.add_argument("--audio", required=True, type=Path)
     prepare = commands.add_parser("prepare", help="Inspect, normalize, convert once and propose deterministic DSP timing.")
@@ -766,7 +766,7 @@ def parser():
     invalidation.add_argument("--reason", required=True)
     review = commands.add_parser("review", help="Show bars/first attack, audition WAV cues, anchor and approve bounded ranges.")
     review.add_argument("--id", required=True)
-    review.add_argument("--reviewer", help="Human reviewer identity, required when recording decisions.")
+    review.add_argument("--reviewer", help="reviewer identity, required when recording decisions.")
     review.add_argument("--anchor", action="append", help="Performance ordinal=audio seconds; first-attack/end are also accepted.")
     review.add_argument("--clear-anchors", action="store_true")
     ranges = review.add_mutually_exclusive_group()
@@ -790,11 +790,11 @@ def parser():
     release.add_argument("--version", required=True)
     release.add_argument("--validation-group", dest="validation_groups", action="append", required=True, help="Existing relationship group to hold out; repeat for multiple independent groups.")
     release.add_argument("--ids", nargs="+", help="Explicit subset; omit uncertain pairs rather than fabricating approval.")
-    release.add_argument("--reviewer", help="Human owner authorizing this complete release scope and split.")
+    release.add_argument("--reviewer", help="reviewer authorizing this complete release scope and split.")
     release.add_argument("--authorize-release", action="store_true", help="Explicitly authorize the chosen validation groups and ALL selected pairs/ranges (all pairs unless --ids is supplied).")
     commands.add_parser("status", help="Report stale, blocked and reviewed pairs without running training.")
     for name in ("batch", "batch-status", "batch-review", "batch-release", "batch-train"):
-        batch = commands.add_parser(name, help="Explicit owner-started preparation and training pipeline." if name == "batch-train" else "Repeatable GP/audio/video preparation; never starts training.")
+        batch = commands.add_parser(name, help="Explicit explicit preparation and training pipeline." if name == "batch-train" else "Repeatable GP/audio/video preparation; never starts training.")
         batch.add_argument("--manifest", required=True, type=Path)
         batch.add_argument("--output-directory", required=True, type=Path)
         if name == "batch-release":

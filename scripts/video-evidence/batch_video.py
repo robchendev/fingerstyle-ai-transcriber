@@ -793,7 +793,7 @@ def _unavailable_annotations(shots_path, directory):
         "videoSha256": shots["videoSha256"], "shotsSha256": sha256(shots_path),
         "pointOrder": list(GEOMETRY_POINTS), "coordinateSpace": "normalized_full_frame", "shots": rows,
         "reviewComplete": False, "preparationComplete": True, "preparationMethod": AUTOMATIC_PREPARATION_METHOD,
-        "geometryPolicy": "existing-only; no detector, geometric proposal or human annotation required",
+        "geometryPolicy": "existing-only; no detector, geometric proposal or manual annotation required",
         "proposalSummary": {"autoAcceptedShotIds": [], "unavailableShotIds": [row["shotId"] for row in rows], "reviewRequiredShotIds": []},
         "trainingPerformed": False,
     }

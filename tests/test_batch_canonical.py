@@ -86,7 +86,7 @@ class BatchCanonicalTests(unittest.TestCase):
             self.assertEqual(awaiting["status"], "needs-review")
             self.assertEqual([action["action"] for action in awaiting["actions"]], ["finalize-release"])
             self.assertIn("--authorize-release", awaiting["actions"][0]["command"])
-            self.assertIn("HUMAN_REVIEWER", awaiting["actions"][0]["command"])
+            self.assertIn("REVIEWER", awaiting["actions"][0]["command"])
             self.assertEqual(
                 [(row["id"], row["split"], row["approvedClipRanges"]) for row in awaiting["actions"][0]["selectedScope"]],
                 [("score-A", "train", [[.4, 16.4]]), ("score-B", "validation", [[.4, 16.4]])],
@@ -96,7 +96,7 @@ class BatchCanonicalTests(unittest.TestCase):
         self.assertEqual(result["status"], "ready")
         self.assertEqual(result["actions"], [])
         manifest, records, _ = validate_release(result["manifestPath"])
-        self.assertEqual(manifest["trainingExecution"], "human-owner-only")
+        self.assertEqual(manifest["trainingExecution"], "explicit-command")
         self.assertEqual(manifest["releaseAuthorization"]["reviewer"], "synthetic-owner")
         self.assertEqual([entry["id"] for entry, _ in records], ["score-A", "score-B"])
         self.assertEqual(manifest["validationGroups"], ["group-score-B"])
@@ -280,7 +280,7 @@ class BatchCanonicalTests(unittest.TestCase):
         self.assertEqual(read_json(action["rulesPath"])["rules"], [])
         self.assertTrue(any(beat["referenceOnly"] for beat in read_json(action["notationPath"])["beats"]))
 
-    def test_run_never_accepts_owner_conventions_or_human_decisions_by_default(self):
+    def test_run_never_accepts_owner_conventions_or_review_decisions_by_default(self):
         self.batch.pop("acceptOwnerConventions")
         result = batch_canonical.ensure_canonical(self.batch)
         self.assertEqual(result["status"], "needs-review")

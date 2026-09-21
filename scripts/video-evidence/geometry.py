@@ -249,7 +249,7 @@ def geometry_row_complete(row):
 
 
 def annotations_ready(document):
-    """Readiness is not a claim of human review or usable coordinate coverage."""
+    """Readiness is not a claim of manual review or usable coordinate coverage."""
     if not isinstance(document, dict):
         return False
     if document.get("reviewComplete") is True:
@@ -285,8 +285,8 @@ def annotations_ready(document):
     review = summary.get("reviewRequiredShotIds", summary.get("reviewNeededShotIds"))
     if any(not isinstance(values, list) or any(type(value) is not int for value in values) or len(set(values)) != len(values) for values in (accepted, unavailable, review)):
         return False
-    # Refined rows may be human-reviewed without claiming the untouched rows were.
-    reviewed = document.get("humanReviewedShotIds", [])
+    # Refined rows may be reviewed without claiming the untouched rows were.
+    reviewed = document.get("reviewedShotIds", [])
     if not isinstance(reviewed, list) or any(type(value) is not int for value in reviewed):
         return False
     visible_ids = {row["shotId"] for row in rows if row["state"] in ("trackable", "guitar_partial")}

@@ -128,7 +128,7 @@ class TrainingPreparationTests(unittest.TestCase):
 
     def approve(self, identifier, *, exclude=False, end="16.4", split=None):
         args = [
-            "review", "--id", identifier, "--reviewer", "synthetic-human",
+            "review", "--id", identifier, "--reviewer", "synthetic-reviewer",
             "--anchor", "1=0.4", "--anchor", "2=4.4", "--anchor", "3=8.4",
             "--anchor", "4=12.4", "--anchor", f"end={end}",
             "--approve-range", f"0.4:{end}", "--split", split or ("validation" if identifier == "pair-B" else "train"),
@@ -299,7 +299,7 @@ class TrainingPreparationTests(unittest.TestCase):
         validate_release(old_release / "manifest.json")
 
     def test_optional_title_is_retained_in_registry_binding_status_and_review(self):
-        title = "A Human-Readable Song (Fingerstyle)"
+        title = "A Readable Song (Fingerstyle)"
         self.add("sample-0123", title=title)
         self.add("sample-0123", 2)
         pairs = read_json(self.workspace / "pairs.json")["pairs"]
@@ -482,11 +482,11 @@ class TrainingPreparationTests(unittest.TestCase):
         with patch("scripts.prepare_training_data.automatic_candidate", return_value=candidate):
             self.run_cli("prepare", "--ids", "pair-A")
         self.approve("pair-B")
-        args = ("review", "--id", "pair-A", "--reviewer", "synthetic-human", "--approve-range", "0:2", "--authorize-use", "--confirm-pitch", "--confirm-notation", "--confirm-grouping", "--approve-experimental-ranges")
+        args = ("review", "--id", "pair-A", "--reviewer", "synthetic-reviewer", "--approve-range", "0:2", "--authorize-use", "--confirm-pitch", "--confirm-notation", "--confirm-grouping", "--approve-experimental-ranges")
         report = self.run_cli(*args)
         self.assertEqual(report["timingRisks"], candidate["timingRisks"])
         self.run_cli("release", "--version", "plateau", "--validation-group", "group-pair-B", error="acknowledge-uncertainty")
-        self.run_cli("review", "--id", "pair-A", "--reviewer", "synthetic-human", "--acknowledge-uncertainty")
+        self.run_cli("review", "--id", "pair-A", "--reviewer", "synthetic-reviewer", "--acknowledge-uncertainty")
         _, records, _ = validate_release(self.release("plateau")["manifestPath"])
         self.assertEqual(records[0][1]["candidate"]["denseMapping"], candidate["denseMapping"])
         (directory / "raw.gp").write_bytes(archive_bytes(fresh_score("changed owned source")))
@@ -570,7 +570,7 @@ class TrainingPreparationTests(unittest.TestCase):
         self.run_cli("invalidate", "--id", "pair-A", "--reason", "synthetic owner-selected new GP revision")
         self.run_cli("prepare", "--ids", "pair-A")
         self.assertFalse((self.workspace / "pairs" / "pair-A" / "review.json").exists())
-        self.run_cli("release", "--version", "v2", "--validation-group", "group-pair-B", error="missing human")
+        self.run_cli("release", "--version", "v2", "--validation-group", "group-pair-B", error="missing manual")
         self.approve("pair-A")
         self.run_cli("release", "--version", "v1", "--validation-group", "group-pair-B", error="NEW version")
         self.release("v2")
@@ -581,27 +581,27 @@ class TrainingPreparationTests(unittest.TestCase):
 
     def test_sparse_anchor_confirmation_is_not_range_or_split_approval(self):
         self.prepare_two()
-        self.run_cli("review", "--id", "pair-A", "--reviewer", "synthetic-human", "--anchor", "1=0.4", "--anchor", "end=16.4", "--confirm-notation")
+        self.run_cli("review", "--id", "pair-A", "--reviewer", "synthetic-reviewer", "--anchor", "1=0.4", "--anchor", "end=16.4", "--confirm-notation")
         self.approve("pair-B")
-        self.run_cli("release", "--version", "v1", "--validation-group", "group-pair-B", error="missing human")
-        self.run_cli("review", "--id", "pair-A", "--reviewer", "synthetic-human", "--approve-experimental-ranges", error="requires explicit")
+        self.run_cli("release", "--version", "v1", "--validation-group", "group-pair-B", error="missing manual")
+        self.run_cli("review", "--id", "pair-A", "--reviewer", "synthetic-reviewer", "--approve-experimental-ranges", error="requires explicit")
         self.approve("pair-A")
-        self.run_cli("review", "--id", "pair-A", "--reviewer", "synthetic-human", "--anchor", "2=4.6")
-        self.run_cli("release", "--version", "v1", "--validation-group", "group-pair-B", error="missing human")
-        self.run_cli("review", "--id", "pair-A", "--reviewer", "synthetic-human", "--anchor", "3=2.0", error="strictly")
+        self.run_cli("review", "--id", "pair-A", "--reviewer", "synthetic-reviewer", "--anchor", "2=4.6")
+        self.run_cli("release", "--version", "v1", "--validation-group", "group-pair-B", error="missing manual")
+        self.run_cli("review", "--id", "pair-A", "--reviewer", "synthetic-reviewer", "--anchor", "3=2.0", error="strictly")
 
-    def test_failed_automatic_alignment_can_be_completed_with_human_anchors(self):
+    def test_failed_automatic_alignment_can_be_completed_with_manual_anchors(self):
         self.add("pair-A", rate=96000)
         self.add("pair-B", 2)
         prepared = self.run_cli("prepare", "--accept-owner-conventions")
-        self.assertEqual(prepared[0]["alignment"], "needs-human-anchors")
+        self.assertEqual(prepared[0]["alignment"], "needs-manual-anchors")
         self.assertIn("48000", prepared[0]["alignmentError"])
-        self.run_cli("review", "--id", "pair-A", "--reviewer", "synthetic-human", "--approve-range", ".4:16.4", error="at least two")
+        self.run_cli("review", "--id", "pair-A", "--reviewer", "synthetic-reviewer", "--approve-range", ".4:16.4", error="at least two")
         self.approve("pair-A")
         self.approve("pair-B")
         _, records, _ = validate_release(self.release()["manifestPath"])
         self.assertEqual(records[0][0]["sampleRate"], 96000)
-        self.assertEqual(records[0][1]["candidate"]["method"], "human-anchors-linear-nominal-time")
+        self.assertEqual(records[0][1]["candidate"]["method"], "manual-anchors-linear-nominal-time")
 
     def test_source_specific_rules_need_no_internal_hash_authoring(self):
         self.add("pair-A", legend=True)

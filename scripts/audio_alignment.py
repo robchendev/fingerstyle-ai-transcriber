@@ -293,7 +293,7 @@ def align_first_attack(reference, audio, *, first_reference_seconds, max_cells=6
 
     Spectral-flux peaks, activity and first-event pitch evidence propose an attack;
     this is not a musical approval or a waveform trim. Quiet/ambiguous openings
-    can require human correction. Unmatched prefixes never become silence labels.
+    can require manual correction. Unmatched prefixes never become silence labels.
     """
     reference_chroma = _validate_features(reference, "reference")
     audio_chroma = _validate_features(audio, "audio")
@@ -334,7 +334,7 @@ def align_first_attack(reference, audio, *, first_reference_seconds, max_cells=6
         first_attack_audio_seconds=float(audio.times[audio_index]),
         first_attack_onset_strength=float(audio.onset[audio_index]),
         first_attack_pitch_similarity=float(audio_chroma[audio_index] @ reference_chroma[reference_index]) if present else None,
-        first_attack_is_human_approved=False,
+        first_attack_is_review_approved=False,
     )
     if audio_index:
         result["diagnostics"]["flags"].append("unmatched_audio_lead_in")
@@ -373,7 +373,7 @@ def align_attack_bounds(reference, audio, *, first_reference_seconds, last_refer
         audio_coverage_fraction=(last_audio - first_audio + 1) / len(audio.times),
         last_attack_reference_seconds=float(reference.times[last_reference]),
         last_attack_audio_seconds=float(audio.times[last_audio]),
-        last_attack_is_human_approved=False,
+        last_attack_is_review_approved=False,
         unmatched_audio_after_last_attack_seconds=float(audio.times[-1] - audio.times[last_audio]),
     )
     result["diagnostics"]["flags"].append("post_attack_sustain_unmapped")
@@ -470,7 +470,7 @@ def align_features(reference, audio, *, mode="global", max_cells=60_000_000, war
         "algorithm": "full_dtw_cumulative_minimum",
         "mode": mode,
         "candidate_only": True,
-        "requires_human_review": True,
+        "requires_manual_review": True,
         "cost_is_probability": False,
         "quality": "flagged" if flags else "unreviewed_candidate",
         "flags": flags,

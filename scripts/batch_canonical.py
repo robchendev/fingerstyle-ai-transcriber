@@ -187,7 +187,7 @@ def _review_reasons(report, directory, state, record):
 
 
 def ensure_canonical(batch, *, root=ROOT):
-    """Prepare proposals only; existing human decisions and frozen releases are reused."""
+    """Prepare proposals only; existing manual decisions and frozen releases are reused."""
     workspace = _inputs(batch, root)
     manifest_path = _manifest_path(batch, workspace)
     if "releaseManifest" in batch or manifest_path.is_file():
@@ -271,10 +271,10 @@ def ensure_canonical(batch, *, root=ROOT):
         release_arguments = ["--version", batch["releaseVersion"], "--ids", *[row["id"] for row in batch["records"]]]
         for group in validation_groups:
             release_arguments.extend(("--validation-group", group))
-        release_arguments.extend(("--reviewer", "HUMAN_REVIEWER", "--authorize-release"))
+        release_arguments.extend(("--reviewer", "REVIEWER", "--authorize-release"))
         actions.append({
             "stage": "canonical-review", "action": "finalize-release",
-            "reason": "All selected pairs are reviewed. Replace HUMAN_REVIEWER with your identity to explicitly authorize this exact release scope; the batch never releases or trains automatically.",
+            "reason": "All selected pairs are reviewed. Replace REVIEWER with your identity to explicitly authorize this exact release scope; the batch never releases or trains automatically.",
             "releaseVersion": batch["releaseVersion"],
             "selectedScope": scope,
             "validationGroups": validation_groups,
@@ -285,7 +285,7 @@ def ensure_canonical(batch, *, root=ROOT):
 
 def review_canonical(batch, identifier, *, reviewer=None, ranges=(), anchors=(), exclude_ranges=(),
                      acknowledge_uncertainty=False, percussion_complete=False, accept=False, root=ROOT):
-    """Inspect by default; only an explicit human acceptance records review decisions."""
+    """Inspect by default; only an explicit manual acceptance records review decisions."""
     workspace = _inputs(batch, root)
     manifest_path = _manifest_path(batch, workspace)
     if "releaseManifest" in batch or manifest_path.exists():
@@ -298,7 +298,7 @@ def review_canonical(batch, identifier, *, reviewer=None, ranges=(), anchors=(),
     if not accept and (ranges or anchors or exclude_ranges or acknowledge_uncertainty or percussion_complete):
         raise ValueError("Recording score decisions requires explicit accept=True.")
     if accept and (not isinstance(reviewer, str) or not reviewer.strip() or not ranges):
-        raise ValueError("Explicit score acceptance requires a human reviewer and nonempty reviewed ranges.")
+        raise ValueError("Explicit score acceptance requires a reviewer and nonempty reviewed ranges.")
     pairs = _registered(batch, workspace, import_missing=False)
     return preparation.review_pair(workspace, pairs[identifier], _review_args(
         reviewer=reviewer, record=records[identifier], ranges=list(ranges) if accept else None,
@@ -308,9 +308,9 @@ def review_canonical(batch, identifier, *, reviewer=None, ranges=(), anchors=(),
 
 
 def finalize_canonical(batch, reviewer, *, root=ROOT):
-    """Human-invoked authorization of the explicit batch scope, never training."""
+    """Explicit authorization of the explicit batch scope, never training."""
     if not isinstance(reviewer, str) or not reviewer.strip():
-        raise ValueError("Finalizing a canonical release requires a human reviewer.")
+        raise ValueError("Finalizing a canonical release requires a reviewer.")
     workspace = _inputs(batch, root)
     manifest_path = _manifest_path(batch, workspace)
     if "releaseManifest" in batch or manifest_path.is_file():

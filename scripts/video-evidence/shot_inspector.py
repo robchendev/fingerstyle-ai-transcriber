@@ -742,7 +742,7 @@ def prepare_automatic_shots(video_path, inspection_path, output_directory):
 
     False positives shorten temporal context. Missed cuts remain possible: this
     policy reuses inspection candidates, not a calibrated transition detector.
-    Human-reviewed/already-automatic inputs are returned unchanged.
+    Reviewed/already-automatic inputs are returned unchanged.
     """
     video_path, inspection_path = Path(video_path), Path(inspection_path)
     source_hash = sha256(inspection_path)
@@ -861,7 +861,7 @@ def prepare_automatic_shots(video_path, inspection_path, output_directory):
         "method": "conservative-cut-boundaries-v1",
         "policyVersion": "motion-coherence-v2",
         "reviewRequired": False,
-        "humanReviewPerformed": False,
+        "manualReviewPerformed": False,
         "uncertainIntervals": intervals,
         "diagnosticIntervals": _merge_intervals(diagnostic_intervals),
         "candidateDispositions": dispositions,
@@ -878,7 +878,7 @@ def prepare_automatic_shots(video_path, inspection_path, output_directory):
         "timelineDecodedFrameCount": timeline_decoded,
         "candidateEvidenceDecodedFrameCount": evidence_decoded,
         "policy": "Preserve strong cuts. Reject spatially coherent motion; require feature discontinuity for low-contrast cuts or motion-compensated/near-exact dual-view blend evidence for dissolves. Merge supported blend masks and split only their edges. Unconfirmed candidates remain diagnostic, not camera shots or masks.",
-        "limitation": "Unconfirmed transitions remain possible and unmasked. Feature-poor, moving, occluded or similar-view transitions can be missed. Correspondence thresholds are engineering criteria, not calibrated cut accuracy or human review.",
+        "limitation": "Unconfirmed transitions remain possible and unmasked. Feature-poor, moving, occluded or similar-view transitions can be missed. Correspondence thresholds are engineering criteria, not calibrated cut accuracy or manual review.",
     }
     report["frameTimelineSha256"] = frame_timeline_sha256(report)
     validate_frame_timeline(report)

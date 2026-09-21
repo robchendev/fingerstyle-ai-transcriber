@@ -79,7 +79,7 @@ def synthetic_release(root, *, plateau=False, percussion_complete=None, unresolv
         "schemaVersion": 1, "kind": "local-release-authorization", "reviewer": "Synthetic reviewer",
         "version": "v1", **group_fields, "authorizedUse": True,
         "approveExperimentalRangesAndSplit": True, "groupingConfirmed": True,
-        "distributionAuthorized": False, "trainingExecution": "human-owner-only",
+        "distributionAuthorized": False, "trainingExecution": "explicit-command",
         "selectedScope": release_scope(records),
     }
     authorization["sha256"] = candidate_digest(authorization)
@@ -89,7 +89,7 @@ def synthetic_release(root, *, plateau=False, percussion_complete=None, unresolv
         publish_json(target, payload)
         entry["targetsSha256"] = sha256(target)
     manifest = root / "manifest.json"
-    publish_json(manifest, {"schemaVersion": 1, "kind": "local-training-dataset", "trainingReady": True, "visibility": "private", "distributionAuthorized": False, "entries": entries, "counts": {"windowsBySplit": {"train": 1, "validation": len(validation_groups)}}, "version": "v1", **group_fields, "trainingExecution": "human-owner-only", "releaseAuthorization": authorization})
+    publish_json(manifest, {"schemaVersion": 1, "kind": "local-training-dataset", "trainingReady": True, "visibility": "private", "distributionAuthorized": False, "entries": entries, "counts": {"windowsBySplit": {"train": 1, "validation": len(validation_groups)}}, "version": "v1", **group_fields, "trainingExecution": "explicit-command", "releaseAuthorization": authorization})
     return manifest
 
 

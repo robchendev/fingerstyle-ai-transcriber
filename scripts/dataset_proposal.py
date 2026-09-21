@@ -64,7 +64,7 @@ def proposed_ranges(candidate, review, duration):
     requested = review.get("requestedClipRanges", [])
     ranges = requested or [[mapping[0]["clipSeconds"], mapping[-1]["clipSeconds"]]]
     for left, right in review.get("excludedClipRanges", []):
-        exclusions.append({"reason": "human_excluded_range", "clipSeconds": [left, right], "guardedClipSeconds": [max(0., left - GUARD_SECONDS), min(duration, right + GUARD_SECONDS)]})
+        exclusions.append({"reason": "review_excluded_range", "clipSeconds": [left, right], "guardedClipSeconds": [max(0., left - GUARD_SECONDS), min(duration, right + GUARD_SECONDS)]})
     for left, right in ranges:
         if not mapping[0]["clipSeconds"] <= left < right <= mapping[-1]["clipSeconds"]:
             raise ValueError("Proposed ranges extend beyond mapped audio; no extrapolation is permitted.")
@@ -147,7 +147,7 @@ def inspect_pair(workspace, pair):
         "sourceBindings": bindings, "reviewWasPresent": review_path.exists(),
         "sourceGpSha256": state["inputs"]["sourceGpSha256"], "audioSha256": state["audio"]["sha256"],
         "candidateSha256": candidate_digest(candidate),
-        "timingReviewStatus": "existing-reviewed-ranges" if reviewed else "proposed-interpolation-not-human-approved",
+        "timingReviewStatus": "existing-reviewed-ranges" if reviewed else "proposed-interpolation-not-review-approved",
     }
 
 
@@ -287,7 +287,7 @@ def render_proposal(document):
         "", "## Decisions before release", "",
         *[f"- {decision}" for decision in document["requiredDecisions"]],
         "", "Localized timing flags are excluded with a half-second guard. Unbounded/rejected timing is quarantined rather than guessed. Unmapped score/audio tails are not extrapolated. Existing reviewed pilot ranges are retained without enlargement.", "",
-        "Low matching cost and the absence of a diagnostic flag are not human timing approval. The proposed interpolation must be explicitly accepted for these experimental ranges before it can become training data. No requirement to repeat completed trims or audition four cues for every file is implied.", "",
+        "Low matching cost and the absence of a diagnostic flag are not manual timing approval. The proposed interpolation must be explicitly accepted for these experimental ranges before it can become training data. No requirement to repeat completed trims or audition four cues for every file is implied.", "",
         "The accompanying JSON contains every included recording's exact sample windows, ranges, local exclusions, grouping and input hashes. It is not a trainer manifest. Keep both files private.", "",
     ])
     if document["coverageWarnings"]:
@@ -358,7 +358,7 @@ def propose_dataset(workspace, name, *, validation_group_count=10, validation_id
             "Accept the listed localized exclusions and quarantine; any changed source, range, split or rule requires a new bound proposal.",
         ],
         "sourceRegistrySha256": registry_hash, "implementationSha256": implementation,
-        "trainingExecution": "human-owner-only", "finalTestSet": False,
+        "trainingExecution": "explicit-command", "finalTestSet": False,
     }
     if sha256(registry_path) != registry_hash:
         raise ValueError("Pair registry changed during proposal generation.")
