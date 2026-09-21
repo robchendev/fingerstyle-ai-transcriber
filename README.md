@@ -8,13 +8,13 @@ Use trimmed local videos. Training also needs matching single-track, six-string 
 
 Source performance: [YouTube video](https://www.youtube.com/watch?v=4yivUKdHd4A). This video was not part of the model's training data.
 
-Performance video, hand tracking and the audio/video features used by the model. Click to play:
+Performance video, hand tracking and the audio/video features used by the model. Click to download the clip:
 
-[![Play the performance analysis clip](docs/demo/analysis-preview.jpg)](docs/demo/analysis.mp4?raw=true)
+[![Download the performance analysis clip](docs/demo/analysis-preview.jpg)](docs/demo/analysis.mp4?raw=true)
 
-Generated Guitar Pro playback for the same passage, bars 25-36. Click to play:
+Generated Guitar Pro playback for the same passage, bars 25-36. Click to download the clip:
 
-[![Play the generated tablature clip](docs/demo/tablature-preview.jpg)](docs/demo/tablature.mp4?raw=true)
+[![Download the generated tablature clip](docs/demo/tablature-preview.jpg)](docs/demo/tablature.mp4?raw=true)
 
 The bundled model in [`models/`](models/) struggles with complex melodies and was trained on a limited dataset. Training on a larger, high-quality dataset may improve results; see the [training guide](docs/TRAINING.md).
 
