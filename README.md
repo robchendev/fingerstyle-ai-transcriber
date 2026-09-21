@@ -16,7 +16,7 @@ Generated Guitar Pro playback for the same passage, bars 25-36:
 
 https://github.com/user-attachments/assets/232375f6-d8c2-4dfa-8a6a-5bf320e48e82
 
-**Settings used for the recorded transcription**
+**User-configurable settings used for this demo**
 
 | Parameter | Value |
 | --- | --- |
@@ -31,7 +31,7 @@ https://github.com/user-attachments/assets/232375f6-d8c2-4dfa-8a6a-5bf320e48e82
 | Tempo | `122 BPM`, quarter-note beat (`1/4`) |
 | Time signature | `4/4` |
 | Plucking hand on screen | Left |
-| Rhythm policy and output | `fingerstyle`, single voice |
+| Rhythm policy | `fingerstyle` |
 
 The bundled model in [`models/`](models/) struggles with complex melodies and was trained on a limited dataset. Training on a larger, high-quality dataset may improve results; see the [training guide](docs/TRAINING.md).
 
