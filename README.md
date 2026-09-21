@@ -1,8 +1,8 @@
 # Fingerstyle Guitar Transcriber
 
-Local PyTorch training and transcription for fingerstyle guitar. Audio and numeric hand observations produce musical predictions; deterministic rhythm, fingering and notation processing writes editable Guitar Pro `.gp` drafts.
+Turn fingerstyle guitar performances into editable Guitar Pro `.gp` drafts using audio and hand tracking. Run the included PyTorch model locally or train one on your own performances and scores.
 
-Inputs are trimmed local performance videos. Training also needs the corresponding modern, single-track six-string GP scores. Transcription requires six pre-capo tuning pitches, a fixed full capo, BPM with beat unit, and time signature. Recordings, scores and generated artifacts stay in ignored local directories.
+Use trimmed local videos. Training also needs matching single-track, six-string scores in modern `.gp` format. For transcription, supply the tuning before applying a capo, capo fret, tempo, beat unit and time signature. Local recordings, scores and outputs are excluded from Git.
 
 ## Setup
 
@@ -19,35 +19,35 @@ New-Item -ItemType Directory -Force .tools\models
 Invoke-WebRequest 'https://cloud.cp.jku.at/public.php/dav/files/7ik4RrBKTS273gp/final0.ckpt' -OutFile '.tools\models\beat-this-final0.ckpt'
 ```
 
-The included transcription weights are at [`models/transcriber.pt`](models/transcriber.pt). MediaPipe and Beat This! are separate upstream models provisioned above; processing runs locally after setup.
+The included transcription model is at [`models/transcriber.pt`](models/transcriber.pt). Setup also downloads MediaPipe for hand tracking and Beat This! for beat detection. Processing runs locally.
 
 ## Transcribe
 
-Supply your own modern GP template to retain its presentation settings. Generated files clear inherited artist, arranger and lyricist attribution fields in the score and stylesheets; the original template is not modified.
+Supply a GP or GPT template for the page layout. Exported files clear the template's artist, arranger and lyricist credits.
 
 ```powershell
 .\.venv\Scripts\python.exe .\transcribe_video.py --video 'data\inputs\performance.mp4' --checkpoint 'models\transcriber.pt' --template 'data\template.gpt' --beat-checkpoint '.tools\models\beat-this-final0.ckpt' --plucking-screen-side left --note-cutoff 0.8 --x-cutoff 0.3 --output-directory 'runs\transcription' --tuning E2 A2 D3 G3 B3 E4 --capo 0 --bpm 120 --beat-unit 1/4 --time-signature 4/4
 ```
 
-Tuning is in physical string 6-to-1 order. Set the plucking side to match the actual camera view. The pipeline extracts the soundtrack, detects scene cuts, tracks hands, runs the model and exports full-voice and single-voice GP drafts. Progress and any required alignment review are reported. It does not open Guitar Pro. Repeat unchanged arguments to resume; changed inputs require a new output directory.
+List tuning from string 6 to string 1. Set the plucking side to its position on screen, not the player's handedness. The command extracts audio, tracks hands and exports full-voice and single-voice GP drafts. It reports progress and any timing corrections needed. Repeat the same command to resume; changed inputs require a new output directory.
 
-Adjust export cutoffs without repeating tracking, inference or beat analysis:
+Adjust export cutoffs without rerunning the model or processing the video:
 
 ```powershell
 .\.venv\Scripts\python.exe .\reexport_gp.py --source-run 'runs\transcription' --note-cutoff 0.85 --x-cutoff 0.35 --output-directory 'runs\reexport'
 ```
 
-Both launchers support `--dry-run`. Cutoffs filter uncalibrated model scores, not probabilities of correctness. Lowering a cutoff cannot recover candidates discarded during inference.
+Both commands support `--dry-run` to preview their settings. A cutoff of `0.8` does not mean 80% accuracy. Lowering a re-export cutoff cannot recover notes already discarded by the model.
 
 ## Train
 
-See [training with your own videos and scores](docs/TRAINING.md) for preparation, grouped train/validation splits, preflight and training from scratch. Use a training run's `best-events.pt` or `latest.pt` through `--checkpoint`; the included inference artifact is not a training-resume checkpoint.
+See [training with your own videos and scores](docs/TRAINING.md) for data preparation, review and training. To transcribe with your trained model, pass its `best-events.pt` or `latest.pt` to `--checkpoint`. The bundled model cannot resume training.
 
 ## Limits
 
-Outputs need musical review and editing. Missing or incorrect notes, fingerings, rhythms and techniques remain possible. Hand tracking supplies posture and motion, not exact fret/string contact. Scene cuts reset tracking; unavailable observations are masked. Experimental guitar calibration is not part of this workflow. The fixed 194-dimensional model interface retains masked reserved slots for checkpoint compatibility.
+Review and edit the generated notes, fingerings, rhythms and techniques. Hand tracking measures posture and movement, not exact string or fret contact.
 
-Partial capos, retuning during a recording and multi-instrument scores are unsupported. Single-voice drafts simplify overlapping parts; the full-voice export preserves the model's separate note durations but is not guaranteed to reproduce editorial voice choices.
+Partial capos, retuning during a recording and multi-instrument scores are unsupported. Single-voice drafts simplify overlapping parts. Full-voice drafts retain overlapping note durations, but may group them differently from a manually written score.
 
 ## Tests
 
@@ -55,5 +55,3 @@ Partial capos, retuning during a recording and multi-instrument scores are unsup
 .\.venv\Scripts\python.exe -m unittest discover -s tests -p 'test_*.py'
 .\scripts\video-evidence\.venv\Scripts\python.exe -m unittest discover -s tests\video -t .
 ```
-
-Video tests use the isolated vision environment. Core tests use synthetic fixtures and the inference/training environment.

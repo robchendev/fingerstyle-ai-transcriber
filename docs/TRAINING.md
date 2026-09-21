@@ -1,12 +1,12 @@
 # Local training
 
-Run commands from the repository root with the root Python environment active. Install the root requirements and the separate `scripts\video-evidence\requirements.txt` environment as described in the README. Put FFmpeg and FFprobe on `PATH`; supply a local MediaPipe hand model. `VIDEO_PYTHON` may select the video environment; otherwise the default is `scripts\video-evidence\.venv\Scripts\python.exe`.
+Complete the [setup instructions](../README.md#setup), activate the root Python environment with `.\.venv\Scripts\Activate.ps1`, and run these commands from the repository root.
 
-Use modern `.gp` scores and already-trimmed local performance videos. No download, browser login or trimming step is provided. Audio is optional: omitted audio is deterministically extracted as native-rate, native-channel PCM-24 FLAC, with decoded timestamps and source hashes retained. An explicit `audio` path must already match the selected performance. Ambiguous streams or discontinuous timestamps require explicit audio and reviewed alignment.
+Use matching `.gp` scores and already-trimmed local performance videos. Audio is extracted automatically. If you supply an `audio` file instead, it must match the performance. Videos with multiple audio tracks or timing errors require a separate audio file and alignment review.
 
 ## Prepare and review
 
-Save this generic example as `runs\batch.json`. Choose independent validation groups yourself; related arrangements, shared recordings and identical sources must not cross splits. Paths are repository-relative or absolute. Replace the example files, model path and screen side with your inputs.
+Save this example as `runs\batch.json` and replace its file paths and plucking-hand screen sides. Paths can be absolute or relative to the repository. Set aside separate groups for validation, which evaluates the model during training. Keep related arrangements and copies of the same recording in the same group and split.
 
 ```json
 {
@@ -23,7 +23,7 @@ Save this generic example as `runs\batch.json`. Choose independent validation gr
 }
 ```
 
-`acceptConventions` accepts `O` as wrist thump, plain `X` as thumb slap and ghost `X` as percussive hit. Unknown short text remains masked. Review `rules.json` for source-specific notation; changes to imported sources or rules require `invalidate --id ID --reason TEXT`, followed by preparation and review again. Frozen releases remain unchanged.
+Set `acceptConventions` to `true` only if your scores use `O` for wrist thump, plain `X` for thumb slap and ghost `X` for percussive hit. Unrecognized markings stay marked as unknown. Review `rules.json` for notation differences. After changing imported files or rules, run `invalidate --id ID --reason TEXT`, then prepare and review again. Previously released datasets stay unchanged.
 
 ```powershell
 python -m scripts.prepare_training_data batch --manifest runs\batch.json --output-directory runs\video-evidence\batches\dataset-v1
@@ -31,7 +31,7 @@ python -m scripts.prepare_training_data batch-status --manifest runs\batch.json 
 python -m scripts.prepare_training_data --workspace data review --id pair-a --cue first-attack --cue end
 ```
 
-Inspect `next-actions.txt`, each pair's `review-report.json`, `notation.json` and `normalized.gp`. Approve audio-second ranges inside the verified score mapping. The following example bounds and anchors are illustrative: replace them with the actual reviewed times for each recording. Use more anchors or `--exclude-range START:END` for local drift; `--acknowledge-uncertainty` retains the reported masks rather than resolving them.
+Check `next-actions.txt`, each pair's `review-report.json`, `notation.json` and `normalized.gp` against the recording. Approve usable audio ranges in seconds and adjust the anchors matching score positions to audio times. Replace the example times below with your reviewed timings. Add anchors to correct timing drift or use `--exclude-range START:END` to leave out a section. `--acknowledge-uncertainty` accepts the reported unknowns without resolving them.
 
 ```powershell
 python -m scripts.prepare_training_data batch-review --manifest runs\batch.json --output-directory runs\video-evidence\batches\dataset-v1 --id pair-a --reviewer reviewer --accept-score --range 0.4:16.4 --anchor 1=0.4 --anchor end=16.4 --acknowledge-uncertainty
@@ -40,7 +40,7 @@ python -m scripts.prepare_training_data batch-release --manifest runs\batch.json
 python -m scripts.prepare_training_data batch --manifest runs\batch.json --output-directory runs\video-evidence\batches\dataset-v1
 ```
 
-Release requires approved nonempty train and validation windows. Preparation then builds the paired video index. Resolve reported alignment or shot actions with `batch-review --alignment-offset SECONDS` or `batch-review --accept-shots` before rerunning the batch. `ready` means valid prepared inputs, not musical accuracy or sufficient class coverage; entirely unavailable training-hand evidence is not ready for joint training. The 194-dimensional format retains masked geometry/coarse-context slots; only independent hand evidence is prepared.
+Both training and validation need approved, usable sections. Follow any requests for audio/video alignment or camera-shot review using `batch-review --alignment-offset SECONDS` or `batch-review --accept-shots`, then rerun the batch. A `ready` result means preparation is complete, not that the labels are musically correct. Video training also needs usable hand-tracking results.
 
 ## Train from scratch
 
@@ -50,12 +50,12 @@ python -m scripts.transcriber preflight --config runs\joint-config.json --forwar
 python -m scripts.transcriber train --config runs\joint-config.json --run-dir runs\joint-training
 ```
 
-Edit the generated configuration's device, thread count, batch size and epoch budget before training. Joint training initializes the acoustic, numeric-video and fusion parameters together; there is no acoustic warm-up or frozen refiner. Default whole-video dropout is `0.2`, enabling audio-only inference. Preflight makes no optimizer updates. Training has no default wall-clock limit; optional limits use `--max-hours`.
+Set the device, thread count, batch size and number of epochs in the generated configuration before training. `preflight` checks the setup. Use `--max-hours` to set a time limit.
 
-Current architecture-v4 checkpoint selection requires scorable validation events and at least one covered non-none note technique, relation or anchored-grace event. A notes-only validation set can pass input preflight but cannot complete decoded-event checkpoint selection; do not treat preflight as a coverage guarantee.
+Validation needs usable labels for notes or percussion and at least one supported technique, such as a bend, hammer-on, slide or grace note. Training cannot select its best model from notes-only validation data, even if `preflight` passes.
 
-Alternatively, `python -m scripts.prepare_training_data batch-train --manifest runs\batch.json --output-directory runs\video-evidence\batches\dataset-v1 --epochs 20 --device cpu --cpu-threads 4` prepares and trains one joint run, pausing on unresolved preparation actions. Rerunning the same command resumes its own checkpoint or reuses a completed result.
+Alternatively, `python -m scripts.prepare_training_data batch-train --manifest runs\batch.json --output-directory runs\video-evidence\batches\dataset-v1 --epochs 20 --device cpu --cpu-threads 4` prepares data and trains the audio/video model, pausing when review is needed. Rerunning the same command resumes training or reuses a completed result.
 
-For audio-only training, import explicit GP/audio pairs with `init`, `add --id ID --group GROUP --gp FILE --audio FILE`, `prepare --accept-conventions`, and `review`; freeze them with `release --version dataset-v1 --validation-group GROUP --reviewer reviewer --authorize-release`. Then run `python -m scripts.transcriber config --manifest data\releases\dataset-v1\manifest.json --output runs\audio-config.json` without `--video-index`, and use the same preflight/train commands with that configuration.
+For audio-only training, use `python -m scripts.prepare_training_data` with `init`, `add --id ID --group GROUP --gp FILE --audio FILE`, `prepare --accept-conventions`, and `review`. Create the dataset with `release --version dataset-v1 --validation-group GROUP --reviewer reviewer --authorize-release`. Then run `python -m scripts.transcriber config --manifest data\releases\dataset-v1\manifest.json --output runs\audio-config.json` without `--video-index`, and use the same preflight/train commands with that configuration.
 
-`models\transcriber.pt` is an inference artifact, **not a training-resume checkpoint**. Start fresh training without it. Resume only an interrupted compatible run using `train --config runs\joint-config.json --run-dir runs\joint-training --resume runs\joint-training\latest.pt`. Source, release and paired-index hashes remain checked on reuse.
+`models\transcriber.pt` is for transcription, **not resuming training**. Start new training without `--resume`. To continue an interrupted run, use `python -m scripts.transcriber train --config runs\joint-config.json --run-dir runs\joint-training --resume runs\joint-training\latest.pt`. Keep that run's source files, released dataset and prepared video data unchanged.
