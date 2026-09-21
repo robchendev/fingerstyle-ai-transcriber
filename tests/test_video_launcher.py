@@ -81,6 +81,41 @@ class VideoLauncherTests(unittest.TestCase):
         self.assertEqual(read_json(path), {"changed": True})
         self.assertIn("refusing to overwrite", self.stderr.getvalue())
 
+    def test_public_model_default_and_audio_only_work_without_local_settings(self):
+        model = self.root / "models" / "transcriber.pt"
+        model.parent.mkdir()
+        model.write_bytes(b"synthetic model")
+        args = list(self.args)
+        index = args.index("--settings")
+        del args[index:index + 2]
+        args[args.index("--video")] = "--audio"
+        args.extend(["--template", str(self.root / "asset"), "--beat-checkpoint", str(self.root / "asset")])
+        self.assertEqual(launcher.main(args), 0)
+        parsed = self.pipeline.call_args.args[0]
+        self.assertEqual(parsed.audio, str(self.video))
+        self.assertIsNone(parsed.video)
+        self.assertEqual(parsed.checkpoint, str(model))
+        self.assertEqual(parsed.plucking_screen_side, "geometry")
+        self.assertEqual(parsed.device, "cpu")
+
+    def test_explicit_assets_override_preset_and_missing_assets_are_actionable(self):
+        replacement = self.root / "replacement"
+        replacement.write_bytes(b"synthetic replacement")
+        flags = ("--checkpoint", "--template", "--beat-checkpoint")
+        extras = [value for flag in flags for value in (flag, str(replacement))]
+        self.assertEqual(launcher.main([*self.args, *extras, "--device", "cpu"]), 0)
+        parsed = self.pipeline.call_args.args[0]
+        for flag in flags:
+            self.assertEqual(getattr(parsed, flag[2:].replace("-", "_")), str(replacement))
+        args = list(self.args)
+        index = args.index("--settings")
+        del args[index:index + 2]
+        for extra, message in (([], "--template"), (["--template", str(replacement)], "--beat-checkpoint")):
+            self.pipeline.reset_mock()
+            self.assertEqual(launcher.main([*args, *extra]), 1)
+            self.pipeline.assert_not_called()
+            self.assertIn(message, self.stderr.getvalue())
+
     def test_invalid_metadata_and_preset_overrides_stop_before_dispatch(self):
         for extra in (["--capo", "25"], ["--bpm", "nan"], ["--bpm", "0"], ["--time-signature", "4/3"], ["--beat-unit", "1/16"],
                       ["--output-directory", str(self.root)], ["--video", str(self.root / "missing.mp4")]):

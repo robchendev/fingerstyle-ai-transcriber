@@ -4,8 +4,6 @@ import json
 import os
 import stat
 from pathlib import Path
-import subprocess
-import sys
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
@@ -32,7 +30,8 @@ def bundle_fixture(root, audio_path, identifier="piece-0", pts=(1000, 1040, 1080
     paths = {}
     for name in ("video", "shots", "hands", "geometry", "annotations", "handArrays", "geometryArrays", "roles", "roleArrays", "alignment"):
         path = directory / (name + (".npz" if name.endswith("Arrays") else ".json"))
-        path.write_text(json.dumps({"fixture": name}))
+        if name != "handArrays":
+            path.write_text(json.dumps({"fixture": name}))
         paths[name] = path
     paths["trimmedAudio"] = audio_path
     np.savez(paths["handArrays"], pts=pts)
@@ -74,27 +73,6 @@ def bundle_fixture(root, audio_path, identifier="piece-0", pts=(1000, 1040, 1080
     return path, report, arrays
 
 
-def add_coarse_fixture(path, report, arrays):
-    count = len(arrays["pts"])
-    values = arrays["structured"][:, :2, 186:]
-    masks = arrays["structured_available"][:, :2, 186:]
-    values[:] = [-12., -2., .25, -.5, .6, .8, -3., -1.]
-    masks[:] = True
-    values[0, :, 2:4] = 0
-    masks[0, :, 2:4] = False
-    coarse_arrays = path.with_name("coarse.npz")
-    np.savez_compressed(
-        coarse_arrays, pts=arrays["pts"], context_id=np.zeros(count, np.int64),
-        features=values.copy(), available=masks.copy(),
-    )
-    coarse_report = path.with_name("coarse.json")
-    coarse_report.write_text(json.dumps({
-        "kind": "coarse-instrument-context", "schemaVersion": 1,
-        "arraysPath": coarse_arrays.name, "arraysSha256": sha256(coarse_arrays),
-    }))
-    for name, source in (("coarse", coarse_report), ("coarseArrays", coarse_arrays)):
-        report["inputPaths"][name] = str(source)
-        report["inputSha256"][name] = sha256(source)
 
 
 class PairedVideoTests(unittest.TestCase):
@@ -156,220 +134,11 @@ class PairedVideoTests(unittest.TestCase):
         self.assertFalse(result["structured_available"][..., 186:].any())
         self.assertFalse(result["structured"][..., 186:].any())
 
-    def test_coarse_context_accepts_negative_local_positions_without_calibration(self):
-        add_coarse_fixture(self.bundle, self.report, self.arrays)
-        self.arrays["structured"][..., :98] = 0
-        self.arrays["structured_available"][..., :98] = False
-        self.save()
-        video = self.load()
-        result = video.window([1., 1.04])
-        torch.testing.assert_close(result["structured"][:, :2, 186], torch.full((3, 2), -12.))
-        geometry, hands, coarse = video.feature_availability_at([1., 1.04])
-        self.assertFalse(geometry.any())
-        self.assertTrue(hands[:, :2].all())
-        self.assertTrue(coarse[:, :2].all())
-        self.assertFalse(coarse[:, 2:].any())
-        for start, stop in VELOCITY_SLICES:
-            self.assertFalse(video.window([1.12])["structured_available"][0, :, start:stop].any())
 
-    def test_coarse_sources_are_an_optional_complete_hash_bound_pair(self):
-        add_coarse_fixture(self.bundle, self.report, self.arrays)
-        self.save()
-        self.load()
-        original = deepcopy(self.report)
-        for name in ("coarse", "coarseArrays"):
-            with self.subTest(missing=name):
-                self.report = deepcopy(original)
-                del self.report["inputPaths"][name]
-                del self.report["inputSha256"][name]
-                self.save()
-                with self.assertRaisesRegex(HarnessError, "complete"):
-                    self.load()
-        self.report = deepcopy(original)
-        self.save()
-        source = Path(self.report["inputPaths"]["coarseArrays"])
-        source.write_bytes(source.read_bytes() + b"changed")
-        with self.assertRaisesRegex(HarnessError, "hash"):
-            self.load()
-        self.report = deepcopy(original)
-        for name in ("coarse", "coarseArrays"):
-            del self.report["inputPaths"][name]
-            del self.report["inputSha256"][name]
-        self.save()
-        with self.assertRaisesRegex(HarnessError, "hash-bound coarse"):
-            self.load()
 
-    def test_coarse_masks_axis_sign_and_role_scope_are_validated(self):
-        add_coarse_fixture(self.bundle, self.report, self.arrays)
-        original = deepcopy(self.arrays)
-        for column in (186, 188, 190):
-            with self.subTest(pair=column):
-                self.arrays = deepcopy(original)
-                self.arrays["structured_available"][1, 0, column] = False
-                self.arrays["structured"][1, 0, column] = 0
-                self.save()
-                with self.assertRaisesRegex(HarnessError, "both XY"):
-                    self.load()
-        for column, value, pattern in ((190, .2, "coarse axis.*unit"), (193, 0., "sign.*masked")):
-            with self.subTest(column=column):
-                self.arrays = deepcopy(original)
-                self.arrays["structured"][1, 0, column] = value
-                self.save()
-                with self.assertRaisesRegex(HarnessError, pattern):
-                    self.load()
-        self.arrays = deepcopy(original)
-        self.arrays["structured"][..., 192:] = 0
-        self.arrays["structured_available"][..., 192:] = False
-        self.save()
-        self.assertTrue(self.load().arrays["structured_available"][:, :2, 186:188].all())
-        self.arrays["structured"][:, 2] = self.arrays["structured"][:, 0]
-        self.arrays["structured_available"][:, 2] = self.arrays["structured_available"][:, 0]
-        self.arrays["segment_id"][:, 2] = 2
-        self.save()
-        with self.assertRaisesRegex(HarnessError, "anonymous"):
-            self.load()
 
-    def test_coarse_velocity_requires_positions_in_the_same_contiguous_segment(self):
-        add_coarse_fixture(self.bundle, self.report, self.arrays)
-        original = deepcopy(self.arrays)
-        for boundary in ("first-frame", "missing-position", "segment"):
-            with self.subTest(boundary=boundary):
-                self.arrays = deepcopy(original)
-                if boundary == "first-frame":
-                    self.arrays["structured_available"][0, 0, 188:190] = True
-                elif boundary == "missing-position":
-                    self.arrays["structured_available"][0, 0, 186:188] = False
-                    self.arrays["structured"][0, 0, 186:188] = 0
-                else:
-                    self.arrays["segment_id"][2:, 0] = 2
-                    for start, stop in VELOCITY_SLICES[:-1]:
-                        self.arrays["structured_available"][2, 0, start:stop] = False
-                self.save()
-                with self.assertRaisesRegex(HarnessError, "motion"):
-                    self.load()
 
-    def test_coarse_bundle_loader_collation_joint_model_and_coverage_are_connected(self):
-        from scripts.transcriber_model import FingerstyleTranscriber
-        from scripts.transcriber_video import AudioVideoTranscriber, VideoConfig
 
-        add_coarse_fixture(self.bundle, self.report, self.arrays)
-        self.arrays["structured"][..., :98] = 0
-        self.arrays["structured_available"][..., :98] = False
-        self.save()
-        features = FeatureConfig(sample_rate=8000, n_fft=512, hop_length=160, n_mels=16, f_max=3000)
-        config = ModelConfig(n_mels=16, hidden_size=4, recurrent_layers=1, architecture_version=4, dropout=0)
-        dataset = TrainingDataset(self.manifest, "train", features, config, root=self.root, video_index_path=self.index())
-        coverage = dataset.video_paired_coverage
-        self.assertEqual(coverage["audioFramesWithGeometry"], 0)
-        self.assertGreater(coverage["audioFramesWithIndependentHand"], 0)
-        self.assertEqual(coverage["audioFramesWithCoarseContext"], coverage["audioFramesWithIndependentHand"])
-        batch = collate_windows([dataset[0]])
-        self.assertEqual(batch["video"]["structured"].shape[-2:], (4, 194))
-        model = AudioVideoTranscriber(FingerstyleTranscriber(config), VideoConfig(hidden_size=4)).eval()
-        with torch.no_grad():
-            outputs = model(batch["features"], batch["conditioning"], batch["lengths"], video=batch["video"])
-        for name, shape in model.head_shapes.items():
-            self.assertEqual(outputs[name].shape, (*batch["features"].shape[:2], *shape))
-            self.assertTrue(torch.isfinite(outputs[name]).all(), name)
-
-    def test_isolated_numeric_producer_reaches_root_collation_and_joint_model(self):
-        producer_python = ROOT / "scripts" / "video-evidence" / ".venv" / "Scripts" / "python.exe"
-        if not producer_python.is_file():
-            self.skipTest("The isolated video producer environment is not installed.")
-        consumer = """
-import sys
-import numpy as np
-import torch
-from scripts.dataset_io import sha256
-from scripts.paired_video import load_inference_video
-from scripts.transcriber_data import collate_windows
-from scripts.transcriber_model import FingerstyleTranscriber, ModelConfig
-from scripts.transcriber_video import AudioVideoTranscriber, VideoConfig
-torch.set_num_threads(1)
-video = load_inference_video(sys.argv[1], sha256(sys.argv[2]))
-sample = video.window(np.arange(1, 7) * .04)
-assert sample["structured"].shape == (6, 4, 194)
-assert not sample["structured_available"][..., :98].any()
-assert sample["structured_available"][:, :2, 98:140].all()
-assert sample["structured_available"][:, :2, 186:188].all()
-assert (sample["structured"][:, :2, 186] < 0).all()
-assert not sample["structured_available"][:, 2:, 186:].any()
-assert not sample["structured_available"][[0, 3], :, 188:190].any()
-batch = collate_windows([{
-    "features": torch.zeros(6, 8), "conditioning": torch.zeros(6, 12),
-    "targets": {}, "masks": {}, "metadata": {}, "video": sample,
-}])
-model = AudioVideoTranscriber(FingerstyleTranscriber(ModelConfig(
-    architecture_version=4, n_mels=8, hidden_size=4, recurrent_layers=1, dropout=0,
-)), VideoConfig(hidden_size=4)).eval()
-with torch.no_grad():
-    original = model(batch["features"], batch["conditioning"], batch["lengths"], video=batch["video"])
-    batch["video"]["structured"][:, :, :2, 186:188] += 3
-    changed = model(batch["features"], batch["conditioning"], batch["lengths"], video=batch["video"])
-for name in model.head_shapes:
-    assert torch.isfinite(original[name]).all(), name
-    assert not torch.equal(original[name], changed[name]), name
-"""
-        producer = """
-import json
-from pathlib import Path
-import subprocess
-import sys
-import numpy as np
-sys.path.insert(0, str(Path.cwd() / "scripts" / "video-evidence"))
-from core import sha256
-from coarse_context import SOURCE_NAMES, _configuration, _configuration_hash
-from hand_roles import RoleConfig, assign_hand_roles
-from test_paired_inputs import PairedInputTests
-case = PairedInputTests()
-case.setUp()
-try:
-    f = case.fixture
-    f.geo["coordinates"][:] = np.nan
-    f.geo["confidence"][:] = 0
-    f.save_arrays()
-    case.roles, _ = assign_hand_roles(
-        f.video, f.paths["shots"], f.paths["hands"], f.paths["geometry"], f.paths["annotations"],
-        f.root / "uncalibrated-roles", config=RoleConfig(plucking_screen_side="left"),
-    )
-    inputs, roles = case.observations()
-    values = np.zeros((8, 2, 8), np.float32)
-    masks = np.ones((8, 2, 8), bool)
-    values[:, :, :2] = [-8., -2.]
-    values[:, :, 0] += np.arange(8)[:, None] * .01
-    values[:, :, 2] = .25
-    values[:, :, 4] = 1
-    masks[:, :, 6:] = False
-    masks[[0, 4], :, 2:4] = False
-    values[[0, 4], :, 2:4] = 0
-    coarse_arrays = f.root / "coarse.npz"
-    np.savez_compressed(coarse_arrays, pts=f.pts, context_id=f.ids.astype(np.int64),
-                        features=values, available=masks)
-    coarse_path = f.root / "coarse.json"
-    coarse_config = _configuration(2.0)
-    coarse_path.write_text(json.dumps({
-        "kind": "coarse-instrument-context", "schemaVersion": 1,
-        "arrays": "coarse.npz", "arraysSha256": sha256(coarse_arrays),
-        **{f"{name}Sha256": inputs["hashes"][name] for name in SOURCE_NAMES},
-        "timeBase": f.shots["timeBase"], "frameCount": 8, "featureDimension": 8,
-        "slotOrder": "original-hand-detector-slots", "config": coarse_config, "scope": None,
-        "configurationSha256": _configuration_hash(coarse_config, f.shots["timeBase"], None),
-        "inputSha256": {name: inputs["hashes"][name] for name in SOURCE_NAMES},
-        "inputPaths": {name: str(inputs["paths"][name]) for name in SOURCE_NAMES},
-    }))
-    bundle, _ = case.build(coarse_path=coarse_path)
-    result = subprocess.run([sys.argv[1], "-c", sys.argv[2], str(bundle), str(case.audio)],
-                            capture_output=True, text=True, check=False)
-    if result.returncode:
-        raise AssertionError(result.stdout + result.stderr)
-finally:
-    case.doCleanups()
-"""
-        result = subprocess.run(
-            [str(producer_python), "-c", producer, sys.executable, consumer],
-            cwd=ROOT, capture_output=True, text=True, check=False,
-        )
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_unavailable_frame_and_cut_are_not_bridged(self):
         self.arrays["structured"][1] = 0

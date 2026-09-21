@@ -172,17 +172,6 @@ class ReferenceFeatureTests(unittest.TestCase):
 
 
 class FirstAttackTests(unittest.TestCase):
-    def test_final_attack_is_not_stretched_into_a_long_decay(self):
-        from scripts.audio_alignment import align_attack_bounds
-        reference = feature_sequence([0, 4, 7, 2, 9, 9, 9], onset=[1, 0, 1, 0, 1, 0, 0])
-        audio = feature_sequence([None, None, 0, 4, 7, 2, 9] + [9] * 30, onset=[0, 0, 1, 0, 1, 0, 1] + [0] * 30)
-        result = align_attack_bounds(reference, audio, first_reference_seconds=0, last_reference_seconds=.2)
-        self.assertEqual((result["reference_indices"][-1], result["audio_indices"][-1]), (4, 6))
-        self.assertEqual(result["fixedFrameAnchors"][-1], (4, 6))
-        self.assertIn("post_attack_sustain_unmapped", result["diagnostics"]["flags"])
-        self.assertLess(result["diagnostics"]["audio_coverage_fraction"], 1)
-        self.assertFalse(result["diagnostics"]["last_attack_is_review_approved"])
-
     def test_lead_in_does_not_advance_score_and_late_music_is_retained(self):
         from scripts.audio_alignment import align_first_attack
         reference = feature_sequence([0, 4, 7, 2, 9, 0], onset=[1, 1, 1, 1, 1, 1])

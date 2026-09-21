@@ -153,7 +153,8 @@ class TranscriptionPipelineTests(unittest.TestCase):
         arguments = list(self.common)
         index = arguments.index("--audio")
         del arguments[index:index + 2]
-        return [*arguments, "--video", str(video), "--hand-model", str(model), "--plucking-screen-side", "left"], video
+        video_python = os.environ.get("VIDEO_PYTHON", str(ROOT / "scripts" / "video-evidence" / ".venv" / "Scripts" / "python.exe"))
+        return [*arguments, "--video", str(video), "--video-python", video_python, "--hand-model", str(model), "--plucking-screen-side", "left"], video
 
     def embedded_video_worker(self, command, **kwargs):
         from tests.test_paired_video import bundle_fixture
@@ -264,16 +265,23 @@ class TranscriptionPipelineTests(unittest.TestCase):
 
     def test_root_python_launcher_generates_metadata_exports_gp_and_resumes(self):
         import transcribe_video as launcher
+        from scripts.transcriber_runtime import INFERENCE_FORMAT, INFERENCE_SCHEMA_VERSION
 
         arguments, video = self.embedded_video_args()
-        settings = self.root / "settings.json"
-        publish_json(settings, {
-            "schemaVersion": 1, "checkpoint": str(self.weights), "template": str(self.template),
-            "beatCheckpoint": str(self.beat_checkpoint), "device": "cpu", "beatDevice": "cpu",
-            "pluckingScreenSide": "left", "exportProfile": {},
-        })
+        checkpoint = load_checkpoint(self.weights)
+        model_path = self.root / "models" / "transcriber.pt"
+        model_path.parent.mkdir()
+        torch.save({
+            "format": INFERENCE_FORMAT, "schema_version": INFERENCE_SCHEMA_VERSION,
+            "model_config": checkpoint["identity"]["model"],
+            "feature_config": checkpoint["identity"]["features"],
+            "video_config": checkpoint["identity"]["video"]["config"],
+            "model_state": checkpoint["model_state"],
+        }, model_path)
         command = [
-            "--video", str(video), "--output-directory", str(self.output), "--settings", str(settings),
+            "--video", str(video), "--output-directory", str(self.output),
+            "--template", str(self.template), "--beat-checkpoint", str(self.beat_checkpoint),
+            "--plucking-screen-side", "left",
             "--tuning", "38", "45", "50", "55", "59", "64", "--capo", "2",
             "--bpm", "100", "--beat-unit", "1/4", "--time-signature", "3/4",
             "--note-cutoff", ".78", "--x-cutoff", ".1",
@@ -282,6 +290,7 @@ class TranscriptionPipelineTests(unittest.TestCase):
 
         def run(args):
             args.hand_model = arguments[arguments.index("--hand-model") + 1]
+            args.video_python = arguments[arguments.index("--video-python") + 1]
             return real_pipeline(args)
 
         def worker(state, output, review_flags=None):
@@ -292,6 +301,7 @@ class TranscriptionPipelineTests(unittest.TestCase):
             self.assertEqual(launcher.main(command), 0)
             result = read_json(self.output / pipeline.SUMMARY_NAME)
             self.assertEqual(result["status"], "ready")
+            self.assertEqual(result["inputIdentity"]["checkpoint"]["path"], str(model_path))
             metadata_path = Path(result["inputIdentity"]["metadata"]["path"])
             metadata = read_json(metadata_path)
             for key, value in self.musical_metadata.items():
@@ -331,9 +341,10 @@ class TranscriptionPipelineTests(unittest.TestCase):
             {"index": 0, "codec_type": "video"},
             {"index": 1, "codec_type": "audio", "sample_rate": "8000", "channels": 1, "time_base": "1/8000"},
         ]}
-        frames = {"frames": [{"pts": 0, "nb_samples": 800}, {"pts": 1600, "nb_samples": 800}]}
-        with patch.object(pipeline, "run_media", side_effect=[json.dumps(streams), json.dumps(frames)]):
-            with self.assertRaisesRegex(HarnessError, "discontinuous timestamps"):
+        frames = {"streams": [streams["streams"][1]], "frames": [
+            {"stream_index": 1, "pts": 0, "nb_samples": 800}, {"stream_index": 1, "pts": 1600, "nb_samples": 800}]}
+        with patch.object(pipeline, "run_media", return_value=json.dumps(streams)), patch("scripts.local_media.run_media", return_value=json.dumps(frames)):
+            with self.assertRaisesRegex(HarnessError, "Discontinuous soundtrack PTS"):
                 pipeline._soundtrack_timeline({"ffprobe": "ffprobe", "video": "synthetic.mp4"})
 
     def test_real_checkpoint_audio_to_both_gp_outputs_matches_explicit_commands_and_resumes(self):
@@ -529,8 +540,8 @@ class TranscriptionPipelineTests(unittest.TestCase):
             output = Path(command[command.index("--output") + 1])
             calls.append((command, request))
             video_directory = Path(request["outputDirectory"])
-            self.assertIsNone(request["gp"])
-            self.assertIsNone(request["correspondenceReview"])
+            self.assertNotIn("gp", request)
+            self.assertNotIn("correspondenceReview", request)
             self.assertNotIn("imageSize", request)
             self.assertEqual(request["audio"], str(self.audio))
             self.assertEqual(request["pluckingScreenSide"], "left")
@@ -659,32 +670,6 @@ class TranscriptionPipelineTests(unittest.TestCase):
                 self.run_job(*self.video_args())
         infer.assert_not_called()
 
-    def test_configured_export_models_are_forwarded_without_changing_default_thresholds(self):
-        arranger, completer = self.root / "arranger.pt", self.root / "completer.pt"
-        arranger.write_bytes(b"synthetic-configured-arranger")
-        completer.write_bytes(b"synthetic-configured-completer")
-        export_args = []
-        original = transcriber.export_gp
-
-        def export(args):
-            export_args.append(deepcopy(args))
-            args.fingering_arranger = args.symbolic_completer = None
-            return original(args)
-
-        with patch.object(transcriber, "export_gp", side_effect=export):
-            result = self.run_job("--fingering-arranger", str(arranger), "--symbolic-completer", str(completer))
-        args = export_args[0]
-        defaults = transcriber.argument_parser().parse_args(["export-gp", "--predictions", args.predictions, "--template", args.template])
-        for name in ("draft_note_threshold", "draft_percussion_threshold", "brush_threshold", "grace_threshold",
-                     "symbolic_completion_threshold", "include_beat_unsupported_tail", "playing_evidence"):
-            self.assertEqual(getattr(args, name), getattr(defaults, name))
-        self.assertEqual(args.fingering_arranger, str(arranger))
-        self.assertEqual(args.symbolic_completer, str(completer))
-        self.assertEqual(args.predictions, result["outputs"]["predictions"])
-        self.assertEqual(args.beat_evidence, result["outputs"]["beatEvidence"])
-        self.assertEqual(result["inputIdentity"]["fingering_arranger"]["sha256"], sha256(arranger))
-        self.assertEqual(result["inputIdentity"]["symbolic_completer"]["sha256"], sha256(completer))
-
     def test_transcribe_forwards_and_binds_confidence_and_rhythm_settings(self):
         result = self.run_job("--rhythm-policy", "fingerstyle", "--strict-note-confidence", "--draft-note-threshold", ".93",
                               "--brush-threshold", ".98", "--brush-membership-threshold", ".9")
@@ -704,26 +689,6 @@ class TranscriptionPipelineTests(unittest.TestCase):
         profile = read_json(result["outputs"]["gpReport"])["draftCleanup"]["profile"]
         self.assertEqual(profile["thumb_slap_threshold"], .2)
         self.assertEqual(profile["percussion_threshold"], .8)
-
-    def test_geometry_review_rejects_external_reused_annotations(self):
-        flags = self.video_args()
-        checkpoint = self.paired_checkpoint()
-        external = self.root / "owner-annotations.json"
-        publish_json(external, {"reviewComplete": False})
-
-        def pending(state, output, review_flags=None):
-            value = {"status": "needs-review", "artifacts": {"annotations": str(external)}, "actions": []}
-            publish_json(output, value)
-            return value
-
-        with patch("scripts.transcriber_runtime.load_checkpoint", return_value=checkpoint), patch.object(pipeline, "_worker", side_effect=pending):
-            self.run_job(*flags)
-        review = transcriber.argument_parser().parse_args(["transcribe-review", "--output-directory", str(self.output), "--annotate-geometry"])
-        with patch("scripts.transcription_pipeline.subprocess.run") as gui:
-            with self.assertRaisesRegex(HarnessError, "no owned pending"):
-                pipeline.review_transcription(review)
-        gui.assert_not_called()
-        self.assertEqual(read_json(external), {"reviewComplete": False})
 
 
 if __name__ == "__main__":

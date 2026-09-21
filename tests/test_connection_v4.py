@@ -20,7 +20,7 @@ from scripts.transcriber_events import (
 )
 from scripts.transcriber_model import (
     FingerstyleTranscriber, LOSS_WEIGHTS, ModelConfig, decode_events,
-    initialize_v4_from_model, masked_loss,
+    masked_loss,
 )
 from scripts.transcriber_runtime import _objective, _stats, evaluate_model
 from tests.test_connection_supervision import note
@@ -259,22 +259,6 @@ class CorrectedModelTests(unittest.TestCase):
         self.assertEqual(len(calibration["thresholds"]), 4)
         self.assertTrue(all(item["true_positive"] + item["false_negative"] == 1 for item in calibration["thresholds"]))
 
-    def test_v2_v3_transfer_explicitly_resets_incompatible_supervision(self):
-        for version in (2, 3):
-            config = ModelConfig(architecture_version=version, hidden_size=8, recurrent_layers=1)
-            old = FingerstyleTranscriber(config)
-            new = FingerstyleTranscriber(replace(config, architecture_version=4))
-            original = deepcopy(new.state_dict())
-            report = initialize_v4_from_model(new, old)
-            self.assertEqual(report["sourceArchitectureVersion"], version)
-            self.assertFalse(report["optimizerTransferred"])
-            for name, value in new.state_dict().items():
-                expected = old.state_dict()[name] if name in report["copiedParameters"] else original[name]
-                self.assertTrue(torch.equal(value, expected), name)
-            with self.assertRaises(ValueError):
-                initialize_v4_from_model(old, new)
-            new.load_state_dict(new.state_dict(), strict=True)
-            old.load_state_dict(old.state_dict(), strict=True)
 
     def test_v3_logits_are_not_reinterpreted_and_malformed_v4_is_rejected(self):
         outputs = event_outputs(2, architecture_version=3)

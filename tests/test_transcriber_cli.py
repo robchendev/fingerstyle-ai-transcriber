@@ -3,7 +3,6 @@ from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from types import SimpleNamespace
 import unittest
 from unittest.mock import ANY, MagicMock, patch
 
@@ -100,20 +99,33 @@ class HarnessCommandTests(unittest.TestCase):
         dataset.assert_not_called()
         seed.assert_not_called()
 
-    def test_fresh_public_training_rejects_default_and_explicit_audio_only_configs_before_loading_data(self):
+    def test_fresh_audio_training_uses_base_model_without_video_or_imported_checkpoint(self):
         with TemporaryDirectory(dir=ROOT) as directory:
             root = Path(directory)
             path = root / "audio-config.json"
             publish_json(path, transcriber.default_config())
             for config_args in ([], ["--config", str(path)]):
-                with self.subTest(config_args=config_args), patch.object(transcriber, "make_dataset") as dataset, patch("scripts.transcriber_model.FingerstyleTranscriber") as model, patch("scripts.transcriber_runtime.run_training") as run, patch("sys.stderr", new=StringIO()) as error:
-                    result = transcriber.main(["train", "--data-root", str(root), "--run-dir", "runs\\not-started", *config_args])
-                self.assertEqual(result, 1)
-                self.assertIn("Fresh training is joint-only", error.getvalue())
-                dataset.assert_not_called()
-                model.assert_not_called()
-                run.assert_not_called()
-                self.assertFalse((root / "runs" / "not-started").exists())
+                dataset = MagicMock(manifest_sha256="synthetic", records=[{}])
+                dataset.__len__.return_value = 1
+                run_dir = f"runs\\audio-{len(config_args)}"
+                with self.subTest(config_args=config_args), patch.object(transcriber, "make_dataset", return_value=dataset), patch.object(transcriber, "make_loader"), patch.object(transcriber, "run_identity", return_value={}), patch.object(transcriber, "seed_everything"), patch.object(transcriber, "print_training_summary"), patch.object(transcriber, "_wrap_video_model") as wrap, patch("scripts.transcriber_model.FingerstyleTranscriber") as model, patch("scripts.transcriber_runtime.load_checkpoint") as load, patch("scripts.transcriber_runtime.run_training", return_value={"elapsed_seconds": 0.}) as run:
+                    result = transcriber.main(["train", "--data-root", str(root), "--run-dir", run_dir, *config_args])
+                self.assertEqual(result, 0)
+                model.assert_called_once()
+                wrap.assert_not_called()
+                load.assert_not_called()
+                self.assertIs(run.call_args.args[0], model.return_value)
+                self.assertIsNone(run.call_args.kwargs["resume"])
+                self.assertEqual(read_json(root / run_dir / "summary.json")["trainingMode"], "audio-from-scratch")
+
+    def test_audio_configuration_accepts_explicit_manifest_without_video_index(self):
+        with TemporaryDirectory(dir=ROOT / "runs") as directory:
+            path = Path(directory) / "config.json"
+            manifest = "data\\releases\\custom\\manifest.json"
+            self.assertEqual(transcriber.main(["config", "--manifest", manifest, "--output", str(path)]), 0)
+            config = read_json(path)
+            self.assertEqual(config["data"]["manifest"], manifest)
+            self.assertNotIn("video", config)
 
     def test_progress_logs_flush_immediately(self):
         with patch("builtins.print") as output:
@@ -158,84 +170,8 @@ class HarnessCommandTests(unittest.TestCase):
                         self.assertEqual(read_json(report)["splits"][split]["windows"], 23)
                     self.assertIn("Preflight: report saved", output.getvalue())
 
-    def test_v2_initialization_copies_v1_weights_but_not_new_heads_or_optimizer(self):
-        from scripts.transcriber_model import FingerstyleTranscriber, ModelConfig
 
-        source_config = ModelConfig()
-        target_config = ModelConfig(architecture_version=2)
-        source_model = FingerstyleTranscriber(source_config)
-        target_model = FingerstyleTranscriber(target_config)
-        new_before = {
-            key: value.clone()
-            for key, value in target_model.state_dict().items()
-            if key.startswith("heads.technique")
-        }
-        checkpoint = {
-            "identity": {"model": asdict(source_config), "manifest_sha256": "manifest"},
-            "global_step": 24800,
-            "model_state": source_model.state_dict(),
-        }
-        with TemporaryDirectory(dir=ROOT) as directory:
-            path = Path(directory) / "source.pt"
-            path.write_bytes(b"checkpoint")
-            with patch("scripts.transcriber_runtime.load_checkpoint", return_value=checkpoint), patch.object(transcriber, "sha256", return_value="source-hash"):
-                report = transcriber.initialize_model(target_model, target_config, path, "manifest")
-        for key, value in source_model.state_dict().items():
-            torch.testing.assert_close(target_model.state_dict()[key], value)
-        for key, value in new_before.items():
-            torch.testing.assert_close(target_model.state_dict()[key], value)
-        self.assertFalse(report["optimizerStateImported"])
-        self.assertEqual(report["sourceGlobalStep"], 24800)
-        with patch("scripts.transcriber_runtime.load_checkpoint", return_value=checkpoint):
-            with self.assertRaises(HarnessError):
-                transcriber.initialize_model(target_model, target_config, path, "different")
 
-    def test_v3_initialization_copies_v2_and_leaves_connection_heads_random(self):
-        from scripts.transcriber_model import FingerstyleTranscriber, ModelConfig
-
-        source_config = ModelConfig(architecture_version=2)
-        target_config = ModelConfig(architecture_version=3)
-        source_model = FingerstyleTranscriber(source_config)
-        target_model = FingerstyleTranscriber(target_config)
-        new_before = {key: value.clone() for key, value in target_model.state_dict().items() if key not in source_model.state_dict()}
-        checkpoint = {
-            "identity": {"model": asdict(source_config), "manifest_sha256": "manifest"},
-            "global_step": 100,
-            "model_state": source_model.state_dict(),
-        }
-        with TemporaryDirectory(dir=ROOT) as directory:
-            path = Path(directory) / "source.pt"
-            path.write_bytes(b"checkpoint")
-            with patch("scripts.transcriber_runtime.load_checkpoint", return_value=checkpoint), patch.object(transcriber, "sha256", return_value="hash"):
-                report = transcriber.initialize_model(target_model, target_config, path, "manifest")
-        for key, value in source_model.state_dict().items():
-            torch.testing.assert_close(target_model.state_dict()[key], value)
-        for key, value in new_before.items():
-            torch.testing.assert_close(target_model.state_dict()[key], value)
-        self.assertEqual(report["sourceArchitectureVersion"], 2)
-        self.assertEqual(report["targetArchitectureVersion"], 3)
-
-    def test_v4_initialization_resets_corrected_heads_from_v2_and_v3(self):
-        from dataclasses import replace
-        from scripts.transcriber_model import FingerstyleTranscriber, ModelConfig
-
-        target_config = ModelConfig(architecture_version=4, hidden_size=4, recurrent_layers=1, n_mels=4)
-        for version in (2, 3):
-            source_config = replace(target_config, architecture_version=version)
-            source = FingerstyleTranscriber(source_config)
-            target = FingerstyleTranscriber(target_config)
-            corrected_before = target.heads["connection_logits"].weight.detach().clone()
-            checkpoint = {
-                "identity": {"model": asdict(source_config), "manifest_sha256": "manifest"},
-                "global_step": 100, "model_state": source.state_dict(),
-            }
-            with patch("scripts.transcriber_runtime.load_checkpoint", return_value=checkpoint), patch.object(transcriber, "sha256", return_value="hash"):
-                report = transcriber.initialize_model(target, target_config, "source.pt", "manifest")
-            self.assertEqual(report["targetArchitectureVersion"], 4)
-            self.assertEqual(report["sourceArchitectureVersion"], version)
-            self.assertFalse(report["optimizerStateImported"])
-            torch.testing.assert_close(target.conv1.weight, source.conv1.weight)
-            torch.testing.assert_close(target.heads["connection_logits"].weight, corrected_before)
 
     def test_event_evaluation_records_explicitly_selected_release_without_training(self):
         with TemporaryDirectory(dir=ROOT) as directory:
@@ -275,7 +211,7 @@ class HarnessCommandTests(unittest.TestCase):
                 with self.subTest(path=path), self.assertRaises(HarnessError):
                     transcriber.private_output(path, root)
 
-    def test_export_gp_cli_uses_validation_calibrated_cleanup_defaults(self):
+    def test_export_gp_cli_uses_shared_cleanup_defaults(self):
         parser = []
         with patch("scripts.gp_output.write_gp_outputs") as write, patch.object(transcriber, "read_json", return_value={"notes": [], "percussion": []}), patch.object(transcriber, "sha256", return_value="hash"), patch.object(transcriber, "publish_json"), patch.object(transcriber, "private_output", side_effect=lambda path, root=None: Path(path)), patch("sys.stdout", new=StringIO()):
             write.return_value = {"fullVoices": {"measureCount": 1}, "singleVoice": {}}
@@ -319,47 +255,12 @@ class HarnessCommandTests(unittest.TestCase):
             track.assert_called_once_with(audio.resolve(), checkpoint.resolve(), device="cpu")
             self.assertEqual(read_json(root / "runs" / "beats.json"), report)
 
-    def test_hand_evidence_sidecar_is_bound_and_does_not_mutate_raw_predictions(self):
-        from copy import deepcopy
-        from scripts.dataset_io import sha256
-
-        with TemporaryDirectory(dir=ROOT) as directory:
-            root = Path(directory)
-            predictions = root / "predictions.json"
-            beats = root / "beats.json"
-            hints = root / "hints.json"
-            source = {"notes": [], "percussion": [], "audioSha256": "0" * 64}
-            publish_json(predictions, source)
-            publish_json(beats, {"audioSha256": "0" * 64})
-            observations = [{"scoreOnsetQuarter": [4, 1], "minimumFret": 6, "maximumFret": 10, "confidence": .9, "source": "visual-pilot:001"}]
-            evidence = {
-                "schemaVersion": 1, "kind": "hand-position-evidence", "audioSha256": "0" * 64,
-                "beatEvidenceSha256": sha256(beats), "evidenceType": "visual", "observations": observations,
-            }
-            publish_json(hints, evidence)
-            arguments = [
-                "export-gp", "--data-root", str(root), "--predictions", str(predictions),
-                "--beat-evidence", str(beats), "--hand-position-evidence", str(hints),
-                "--template", "template.gpt", "--full-output", "runs\\full.gp",
-                "--single-output", "runs\\single.gp",
-            ]
-            def fake_write(template, document, full, single, **kwargs):
-                self.assertEqual(document["handPositionEvidence"], observations)
-                full.parent.mkdir()
-                full.write_bytes(b"synthetic")
-                single.write_bytes(b"synthetic")
-                return {"fullVoices": {"measureCount": 1}, "singleVoice": {}}
-            original = deepcopy(source)
-            with patch("scripts.gp_output.write_gp_outputs", side_effect=fake_write), patch("sys.stdout", new=StringIO()):
-                self.assertEqual(transcriber.main(arguments), 0)
-            self.assertEqual(read_json(predictions), original)
-            saved = read_json(root / "runs" / "gp-output.json")
-            self.assertEqual(saved["handPositionEvidenceInput"]["evidenceType"], "visual")
-            evidence["audioSha256"] = "1" * 64
-            publish_json(hints, evidence)
-            with patch("scripts.gp_output.write_gp_outputs") as write, patch("sys.stderr", new=StringIO()):
-                self.assertEqual(transcriber.main(arguments), 1)
-                write.assert_not_called()
+    def test_removed_optional_export_inputs_are_rejected(self):
+        for option in ("--fingering-arranger", "--symbolic-completer", "--playing-evidence", "--hand-position-evidence"):
+            with self.subTest(option=option), patch("sys.stderr", new=StringIO()), self.assertRaises(SystemExit):
+                transcriber.argument_parser().parse_args([
+                    "export-gp", "--predictions", "predictions.json", "--template", "template.gpt", option, "optional.json",
+                ])
 
     def test_whole_audio_stitching_has_no_uncovered_or_duplicated_frame_positions(self):
         class ConstantModel(torch.nn.Module):

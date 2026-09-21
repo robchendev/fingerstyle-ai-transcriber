@@ -1,6 +1,9 @@
 from copy import deepcopy
 from pathlib import Path
 import shutil
+import subprocess
+import sys
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 from uuid import uuid4
@@ -24,7 +27,7 @@ class BatchCanonicalTests(unittest.TestCase):
         self.workspace = self.root / "workspace"
         self.batch = {
             "workspace": str(self.workspace), "releaseVersion": "synthetic-v1",
-            "acceptOwnerConventions": True, "ffmpegDirectory": None,
+            "acceptConventions": True, "ffmpegDirectory": None,
             "records": [self.record("score-A", "train", 0), self.record("score-B", "validation", 2, suffix=".wav")],
         }
 
@@ -96,7 +99,9 @@ class BatchCanonicalTests(unittest.TestCase):
         self.assertEqual(result["status"], "ready")
         self.assertEqual(result["actions"], [])
         manifest, records, _ = validate_release(result["manifestPath"])
-        self.assertEqual(manifest["trainingExecution"], "explicit-command")
+        self.assertNotIn("trainingExecution", manifest)
+        self.assertNotIn("trainingExecution", manifest["releaseAuthorization"])
+        self.assertTrue(all("trainingExecution" not in payload for _, payload in records))
         self.assertEqual(manifest["releaseAuthorization"]["reviewer"], "synthetic-owner")
         self.assertEqual([entry["id"] for entry, _ in records], ["score-A", "score-B"])
         self.assertEqual(manifest["validationGroups"], ["group-score-B"])
@@ -111,6 +116,132 @@ class BatchCanonicalTests(unittest.TestCase):
         self.assertEqual(batch_canonical.finalize_canonical(self.batch, "synthetic-owner"), result)
         self.assertEqual(frozen, self.snapshot())
         self.assertEqual(originals, {path: sha256(path) for path in originals})
+
+    def test_trimmed_video_without_audio_reaches_frozen_release_and_joint_training(self):
+        import numpy as np
+
+        from scripts.dataset_io import publish_json
+        from scripts.paired_preparation import batch_status, finalize_batch, review_batch, run_batch
+        from tests.test_local_media import make_video
+        from tests.test_paired_video import bundle_fixture
+
+        for index, record in enumerate(self.batch["records"]):
+            score = fresh_score(record["id"], index * 2)
+            ET.SubElement(score.find("./Notes/Note[@id='1']"), "Vibrato").text = "Slight"
+            Path(record["gp"]).write_bytes(archive_bytes(score))
+            video = Path(record["video"]).with_suffix(".mkv")
+            make_video(video, Path(record.pop("audio")), duration=19)
+            record.update(video=str(video), pluckingScreenSide="left")
+        manifest = self.root / "batch.json"
+        document = {
+            **self.batch, "schemaVersion": 1, "kind": "paired-preparation-batch",
+            "handModel": "models\\hand_landmarker.task", "videoPython": sys.executable,
+        }
+        publish_json(manifest, document)
+        output = self.root / "runs" / "video-evidence" / "batches" / "fresh"
+        originals = {record[field]: (sha256(record[field]), Path(record[field]).stat().st_mtime_ns)
+                     for record in self.batch["records"] for field in ("gp", "video")}
+        self.assertEqual(batch_status(manifest, output, root=self.root)["status"], "pending")
+        self.assertFalse(output.exists())
+        bundles = self.root / "bundles"
+        bundles.mkdir()
+        calls = []
+
+        def worker(command, **kwargs):
+            request = read_json(command[command.index("--request") + 1])
+            calls.append(request)
+            receipt = next(read_json(path) for path in (output / "source-cache").glob("*\\receipt.json")
+                           if read_json(path)["videoSha256"] == sha256(request["video"]))
+            self.assertEqual(receipt["videoSha256"], sha256(request["video"]))
+            self.assertEqual(receipt["audioSha256"], sha256(request["audio"]))
+            self.assertEqual(receipt["stream"]["firstDecodedPts"], 1250)
+            self.assertEqual(receipt["stream"]["timeBase"], [1, 1000])
+            self.assertIsNone(request["poseModel"])
+            self.assertEqual(set(request), {"schemaVersion", "kind", "id", "video", "audio", "outputDirectory", "pluckingScreenSide", "reuse", "handModel", "poseModel", "reviewMode"})
+            bundle = bundles / request["id"] / "inputs.json"
+            if not bundle.exists():
+                bundle, report, arrays = bundle_fixture(bundles, Path(request["audio"]), request["id"], pts=range(1650, 17250, 40))
+                report["inputPaths"]["video"] = request["video"]
+                alignment = Path(report["inputPaths"]["alignment"])
+                value = read_json(alignment)
+                value.update(videoSha256=sha256(request["video"]), videoStartSecondsForTrimmedAudioZero=1.25)
+                publish_json(alignment, value)
+                arrays["audio_seconds"] -= 1.25
+                arrays["structured"][..., :98] = 0
+                arrays["structured_available"][..., :98] = False
+                np.savez_compressed(bundle.with_name("inputs.npz"), **arrays)
+                report.update(videoSha256=sha256(request["video"]), arraysSha256=sha256(bundle.with_name("inputs.npz")))
+                report["inputSha256"].update(video=sha256(request["video"]), alignment=sha256(alignment))
+                report["clock"]["offsetSamples"] = -10000
+                publish_json(bundle, report)
+            publish_json(command[command.index("--output") + 1], {
+                "schemaVersion": 1, "kind": "paired-video-preparation-result", "id": request["id"], "status": "ready",
+                "inputSha256": {key: sha256(request[key]) for key in ("video", "audio")},
+                "artifacts": {"bundle": str(bundle)}, "actions": [], "stageSummary": [],
+            })
+            return SimpleNamespace(returncode=0)
+
+        pending = run_batch(manifest, output, root=self.root, runner=worker, progress=lambda message: None)
+        self.assertEqual(pending["status"], "needs-review")
+        self.assertEqual(calls, [])
+        self.assertEqual(len(list((output / "source-cache").glob("*\\receipt.json"))), 2)
+        for record in self.batch["records"]:
+            review_batch(
+                manifest, output, record["id"], reviewer="reviewer", accept_score=True,
+                ranges=["0.4:16.4"], anchors=["1=0.4", "end=16.4"], acknowledge_uncertainty=True, root=self.root,
+            )
+        frozen = finalize_batch(manifest, output, "reviewer", root=self.root)
+        self.assertEqual(frozen["status"], "ready")
+        with patch("scripts.local_media.run_media", side_effect=AssertionError("Do not re-extract unchanged video")):
+            ready = run_batch(manifest, output, root=self.root, runner=worker, progress=lambda message: None)
+            repeated = run_batch(manifest, output, root=self.root, runner=worker, progress=lambda message: None)
+            self.assertEqual(batch_status(manifest, output, root=self.root)["status"], "ready")
+        self.assertEqual(ready["status"], "ready")
+        self.assertEqual(ready["indexPath"], repeated["indexPath"])
+        self.assertFalse(ready["trainingPerformed"])
+        self.assertEqual(read_json(ready["indexPath"])["schemaVersion"], 4)
+        self.assertTrue(all({"gp", "video", "audio", "audioOrigin"} == set(row) for row in ready["identity"]["sources"].values()))
+        for values in ready["coverage"]["splits"].values():
+            self.assertEqual(values["visualCoverage"]["framesWithGuitarGeometry"], 0)
+            self.assertEqual(values["visualCoverage"]["framesWithCoarseContext"], 0)
+            self.assertGreater(values["usableVideoWindows"], 0)
+        training = ROOT / "runs" / f"synthetic-joint-{uuid4().hex}"
+        training.mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, training)
+        config_path = training / "config.json"
+
+        def transcriber(*arguments):
+            result = subprocess.run([sys.executable, "-B", "-m", "scripts.transcriber", *map(str, arguments)], cwd=ROOT, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        transcriber("config", "--manifest", frozen["manifestPath"], "--video-index", ready["indexPath"], "--output", config_path)
+        config = read_json(config_path)
+        self.assertEqual(config["video"]["model"]["structured_dim"], 194)
+        self.assertNotIn("freeze_audio", config["video"]["model"])
+        config["data"].update(manifest=frozen["manifestPath"], batch_size=1, num_threads=1)
+        config["features"].update(sample_rate=8000, n_fft=512, hop_length=160, n_mels=16, f_max=3000)
+        config["model"].update(n_mels=16, hidden_size=8, recurrent_layers=1, dropout=0)
+        config["video"]["model"].update(hidden_size=8, modality_dropout=0)
+        config["training"].update(device="cpu", epochs=1, max_steps=1)
+        publish_json(config_path, config)
+        preflight = self.root / "runs" / "preflight.json"
+        transcriber("preflight", "--config", config_path, "--data-root", self.root, "--forward", "--output", preflight)
+        report = read_json(preflight)
+        self.assertFalse(report["trainingRun"])
+        self.assertEqual(report["initialization"], "joint-audio-numeric-video-from-scratch")
+        self.assertTrue(all(row["windows"] > 0 and row["independent_hand_observation_view_frames"] > 0 for row in report["splits"].values()))
+        run = self.root / "runs" / "joint"
+        transcriber("train", "--config", config_path, "--data-root", self.root, "--run-dir", run)
+        from scripts.transcriber_runtime import load_checkpoint
+
+        checkpoint = load_checkpoint(run / "latest.pt")
+        self.assertEqual(checkpoint["global_step"], 1)
+        self.assertEqual(checkpoint["identity"]["initialization"]["kind"], "joint-audio-numeric-video-from-scratch")
+        self.assertFalse(checkpoint["identity"]["initialization"]["audioParametersFrozen"])
+        self.assertTrue(checkpoint["optimizer_state"]["state"])
+        self.assertTrue((run / "best-events.pt").is_file())
+        self.assertEqual(read_json(run / "summary.json")["trainingMode"], "joint-audio-numeric-video-from-scratch")
+        self.assertEqual(originals, {path: (sha256(path), Path(path).stat().st_mtime_ns) for path in originals})
 
     def test_frozen_subset_never_reads_or_regenerates_preparation(self):
         self.batch["records"].append(self.record("score-C", "train", 4))
@@ -280,18 +411,18 @@ class BatchCanonicalTests(unittest.TestCase):
         self.assertEqual(read_json(action["rulesPath"])["rules"], [])
         self.assertTrue(any(beat["referenceOnly"] for beat in read_json(action["notationPath"])["beats"]))
 
-    def test_run_never_accepts_owner_conventions_or_review_decisions_by_default(self):
-        self.batch.pop("acceptOwnerConventions")
+    def test_run_never_accepts_conventions_or_review_decisions_by_default(self):
+        self.batch.pop("acceptConventions")
         result = batch_canonical.ensure_canonical(self.batch)
         self.assertEqual(result["status"], "needs-review")
         for record in self.batch["records"]:
             directory = self.workspace / "pairs" / record["id"]
-            self.assertFalse(read_json(directory / "rules.json")["acceptOwnerConventions"])
+            self.assertFalse(read_json(directory / "rules.json")["acceptConventions"])
             self.assertFalse((directory / "preparation.json").exists())
-        self.assertTrue(all("owner-v1" in action["reason"] for action in result["actions"]))
-        self.assertTrue(all(action["action"] == "review-owner-conventions" for action in result["actions"]))
-        self.assertTrue(all("--accept-owner-conventions" in action["command"] for action in result["actions"]))
-        self.batch["acceptOwnerConventions"] = True
+        self.assertTrue(all("fingerstyle-v1" in action["reason"] for action in result["actions"]))
+        self.assertTrue(all(action["action"] == "review-conventions" for action in result["actions"]))
+        self.assertTrue(all("--accept-conventions" in action["command"] for action in result["actions"]))
+        self.batch["acceptConventions"] = True
         batch_canonical.ensure_canonical(self.batch)
         before = self.snapshot()
         report = batch_canonical.review_canonical(self.batch, "score-A")
@@ -328,11 +459,11 @@ class BatchCanonicalTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "existing preparation/assets are never adopted"):
             batch_canonical.ensure_canonical(self.batch)
         marker.unlink()
-        self.batch["acceptOwnerConventions"] = False
+        self.batch["acceptConventions"] = False
         batch_canonical.ensure_canonical(self.batch)
         artifact = self.workspace / "pairs" / "score-A" / "normalized.gp"
         artifact.write_bytes(b"unbound derivative")
-        self.batch["acceptOwnerConventions"] = True
+        self.batch["acceptConventions"] = True
         result = batch_canonical.ensure_canonical(self.batch)
         action = next(action for action in result["actions"] if action["id"] == "score-A")
         self.assertIn("not adopted or overwritten", action["reason"])

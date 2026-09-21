@@ -81,3 +81,12 @@ class GPReexportLauncherTests(unittest.TestCase):
         self.assertNotIn("Re-export completed", self.stdout.getvalue())
         self.assertFalse((self.output / "reexport-receipt.json").exists())
         self.assertFalse((self.output / ".transcription.lock").exists())
+
+    def test_unsupported_saved_export_model_is_not_silently_ignored(self):
+        self.state["options"]["fingering_arranger"] = "unsupported.pt"
+        self.state["identity"]["options"] = deepcopy(self.state["options"])
+        publish_json(self.source / "transcription-state.json", self.state)
+        with patch.object(launcher.transcriber, "export_gp") as dispatch:
+            self.assertEqual(launcher.main(self.args), 1)
+            dispatch.assert_not_called()
+        self.assertIn("cannot be reproduced", self.stderr.getvalue())

@@ -78,6 +78,33 @@ def fresh_audio(path, shift=0, *, rate=8000):
 
 
 class TrainingPreparationTests(unittest.TestCase):
+    def test_fresh_generic_conventions_do_not_label_unknown_short_text_as_percussion(self):
+        self.add("pair-A", unknown=True)
+        self.run_cli("prepare", "--accept-conventions")
+        labels = read_json(self.workspace / "pairs" / "pair-A" / "canonical.json")
+        source_provenance = labels["provenance"]["rawCanonicalProvenance"]
+        self.assertEqual(source_provenance["notationConventionsId"], "fingerstyle-v1")
+        self.assertFalse(source_provenance["shortTextIsPercussiveHit"])
+        self.assertEqual(labels["targets"]["gestures"], [])
+        self.assertTrue(any(row["reason"] == "uninterpreted_annotation" for row in labels["review"]["unresolvedGestures"]))
+
+    def test_explicit_generic_conventions_preserve_o_x_and_ghost_x_labels(self):
+        score = fresh_score("synthetic-percussion")
+        for identifier in ("0", "2"):
+            note = score.find(f"./Notes/Note[@id='{identifier}']")
+            ET.SubElement(ET.SubElement(note.find("Properties"), "Property", name="Muted"), "Enable")
+        ET.SubElement(score.find("./Notes/Note[@id='0']"), "AntiAccent").text = "Normal"
+        ET.SubElement(score.find("./Beats/Beat[@id='1']"), "FreeText").text = "O"
+        gp, audio = self.inputs / "percussion.gp", self.inputs / "percussion.wav"
+        gp.write_bytes(archive_bytes(score))
+        fresh_audio(audio)
+        self.run_cli("add", "--id", "percussion", "--group", "source-group", "--gp", str(gp), "--audio", str(audio))
+        self.run_cli("prepare", "--accept-conventions")
+        labels = read_json(self.workspace / "pairs" / "percussion" / "canonical.json")
+        self.assertEqual({row["technique"] for row in labels["targets"]["gestures"]}, {"wrist_thump", "thumb_slap", "percussive_hit"})
+        self.assertTrue(all(row["source"]["interpretationRuleId"].startswith("fingerstyle-v1-")
+                            for row in labels["provenance"]["sourceGestures"]))
+
     def test_explicit_pair_order_is_preserved_for_repeatable_release_windows(self):
         self.add("pair-A")
         self.add("pair-B", 2)
@@ -124,7 +151,7 @@ class TrainingPreparationTests(unittest.TestCase):
     def prepare_two(self, *, unknown=False):
         self.add("pair-A", pickup=True, unknown=unknown)
         self.add("pair-B", 2)
-        return self.run_cli("prepare", "--accept-owner-conventions")
+        return self.run_cli("prepare", "--accept-conventions")
 
     def approve(self, identifier, *, exclude=False, end="16.4", split=None):
         args = [
@@ -146,23 +173,23 @@ class TrainingPreparationTests(unittest.TestCase):
         self.add("pair-A")
         before = {path: sha256(path) for path in self.workspace.rglob("*") if path.is_file()}
 
-        def propose(workspace, name, *, validation_group_count, validation_ids, progress):
+        def propose(workspace, name, *, validation_ids, progress):
             progress("Proposal: synthetic progress.")
             return {"trainingReady": False, "proposalPath": str(workspace / "proposals" / f"{name}.json")}
 
-        for options, count, identifiers in (
-            ([], 10, None),
-            (["--validation-group-count", "2", "--validation-ids", "pair-C", "pair-B"], 2, ["pair-C", "pair-B"]),
-        ):
+        for identifiers in (["pair-B"], ["pair-C", "pair-B"]):
+            options = ["--validation-ids", *identifiers]
             output, errors = StringIO(), StringIO()
             with self.subTest(options=options), patch("scripts.dataset_proposal.propose_dataset", side_effect=propose) as proposal, patch("scripts.prepare_training_data.prepare_pair", side_effect=AssertionError("A proposal must not reprepare sources")), patch("scripts.prepare_training_data.release_dataset", side_effect=AssertionError("A proposal must not activate a release")), redirect_stdout(output), redirect_stderr(errors):
                 self.assertEqual(main(["--workspace", str(self.workspace), "propose", "--name", "representative", *options]), 0, errors.getvalue())
-            proposal.assert_called_once_with(self.workspace, "representative", validation_group_count=count, validation_ids=identifiers, progress=ANY)
+            proposal.assert_called_once_with(self.workspace, "representative", validation_ids=identifiers, progress=ANY)
             progress, _, document = output.getvalue().partition("\n")
             self.assertEqual(progress, "Proposal: synthetic progress.")
             self.assertFalse(json.loads(document)["trainingReady"])
             self.assertEqual(before, {path: sha256(path) for path in self.workspace.rglob("*") if path.is_file()})
         self.assertNotIn("dataset_proposal.py", CODE_FILES)
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            main(["--workspace", str(self.workspace), "propose", "--name", "missing-split"])
 
     def test_release_api_rejects_scalar_unordered_empty_and_duplicate_group_inputs(self):
         for groups in (
@@ -194,7 +221,7 @@ class TrainingPreparationTests(unittest.TestCase):
         self.add("pair-A")
         self.add("pair-B", 2)
         self.add("pair-C", 4)
-        self.run_cli("prepare", "--accept-owner-conventions")
+        self.run_cli("prepare", "--accept-conventions")
         self.add("unselected", 6)
         for identifier in ("pair-A", "pair-B", "pair-C"):
             self.approve(identifier)
@@ -231,7 +258,7 @@ class TrainingPreparationTests(unittest.TestCase):
 
     def test_completeness_confirmation_requires_reviewer_and_grants_no_other_approval(self):
         self.add("pair-A")
-        self.run_cli("prepare", "--accept-owner-conventions")
+        self.run_cli("prepare", "--accept-conventions")
         directory = self.workspace / "pairs" / "pair-A"
         before = {name: sha256(directory / name) for name in ARTIFACTS}
         self.run_cli("review", "--id", "pair-A", "--confirm-percussion-completeness", error="--reviewer")
@@ -249,7 +276,7 @@ class TrainingPreparationTests(unittest.TestCase):
 
     def test_candidate_range_and_source_revisions_invalidate_completeness(self):
         self.add("pair-A")
-        self.run_cli("prepare", "--accept-owner-conventions")
+        self.run_cli("prepare", "--accept-conventions")
         directory = self.workspace / "pairs" / "pair-A"
         for changed in (
             ("--anchor", "2=4.6"), ("--approve-range", "1:16.4"),
@@ -300,23 +327,23 @@ class TrainingPreparationTests(unittest.TestCase):
 
     def test_optional_title_is_retained_in_registry_binding_status_and_review(self):
         title = "A Readable Song (Fingerstyle)"
-        self.add("sample-0123", title=title)
-        self.add("sample-0123", 2)
+        self.add("sample-a", title=title)
+        self.add("sample-b", 2)
         pairs = read_json(self.workspace / "pairs.json")["pairs"]
         self.assertEqual(pairs[0]["title"], title)
         self.assertNotIn("title", pairs[1])
         blocked = self.run_cli("status")["pairs"]
-        self.assertEqual((blocked[0]["id"], blocked[0]["title"], blocked[0]["status"]), ("sample-0123", title, "blocked"))
+        self.assertEqual((blocked[0]["id"], blocked[0]["title"], blocked[0]["status"]), ("sample-a", title, "blocked"))
         self.assertNotIn("title", blocked[1])
-        self.run_cli("prepare", "--accept-owner-conventions")
-        directory = self.workspace / "pairs" / "sample-0123"
+        self.run_cli("prepare", "--accept-conventions")
+        directory = self.workspace / "pairs" / "sample-a"
         self.assertEqual(read_json(directory / "preparation.json")["inputs"]["pair"], pairs[0])
         self.assertEqual(self.run_cli("status")["pairs"][0]["title"], title)
-        review = self.run_cli("review", "--id", "sample-0123")
-        self.assertEqual((review["id"], review["title"]), ("sample-0123", title))
+        review = self.run_cli("review", "--id", "sample-a")
+        self.assertEqual((review["id"], review["title"]), ("sample-a", title))
         self.assertEqual(read_json(directory / "review-report.json")["title"], title)
-        self.assertNotIn("title", self.run_cli("review", "--id", "sample-0123"))
-        self.approve("sample-0123")
+        self.assertNotIn("title", self.run_cli("review", "--id", "sample-b"))
+        self.approve("sample-a")
         reviewed = self.run_cli("status")["pairs"][0]
         self.assertEqual((reviewed["title"], reviewed["status"]), (title, "reviewed"))
 
@@ -334,7 +361,7 @@ class TrainingPreparationTests(unittest.TestCase):
 
     def test_optional_preparation_provenance_is_opaque_and_does_not_rerun_dsp(self):
         self.add("pair-A")
-        self.run_cli("prepare", "--accept-owner-conventions")
+        self.run_cli("prepare", "--accept-conventions")
         directory = self.workspace / "pairs" / "pair-A"
         path = directory / "preparation.json"
         state = read_json(path)
@@ -378,7 +405,7 @@ class TrainingPreparationTests(unittest.TestCase):
         before = {path: (sha256(path), path.stat().st_mtime_ns) for path in (owned_gp, owned_audio)}
         self.assertEqual(sha256(gp), sha256(owned_gp))
         self.assertEqual(sha256(audio), sha256(owned_audio))
-        self.run_cli("prepare", "--accept-owner-conventions")
+        self.run_cli("prepare", "--accept-conventions")
         self.approve("pair-A")
         review = sha256(owned_gp.parent / "review.json")
         gp.write_bytes(b"external source has changed")
@@ -408,7 +435,7 @@ class TrainingPreparationTests(unittest.TestCase):
         gp = directory / "raw.gp"
         gp.write_bytes(archive_bytes(score))
         original = (sha256(gp), gp.stat().st_mtime_ns)
-        self.run_cli("prepare", "--accept-owner-conventions", error="Fine")
+        self.run_cli("prepare", "--accept-conventions", error="Fine")
         rules_path = directory / "rules.json"
         rules = read_json(rules_path)
         rules["fineTarget"] = "last-musical-measure"
@@ -570,7 +597,7 @@ class TrainingPreparationTests(unittest.TestCase):
         self.run_cli("invalidate", "--id", "pair-A", "--reason", "synthetic owner-selected new GP revision")
         self.run_cli("prepare", "--ids", "pair-A")
         self.assertFalse((self.workspace / "pairs" / "pair-A" / "review.json").exists())
-        self.run_cli("release", "--version", "v2", "--validation-group", "group-pair-B", error="missing manual")
+        self.run_cli("release", "--version", "v2", "--validation-group", "group-pair-B", error="missing source/notation/use/group/range approval")
         self.approve("pair-A")
         self.run_cli("release", "--version", "v1", "--validation-group", "group-pair-B", error="NEW version")
         self.release("v2")
@@ -583,17 +610,17 @@ class TrainingPreparationTests(unittest.TestCase):
         self.prepare_two()
         self.run_cli("review", "--id", "pair-A", "--reviewer", "synthetic-reviewer", "--anchor", "1=0.4", "--anchor", "end=16.4", "--confirm-notation")
         self.approve("pair-B")
-        self.run_cli("release", "--version", "v1", "--validation-group", "group-pair-B", error="missing manual")
+        self.run_cli("release", "--version", "v1", "--validation-group", "group-pair-B", error="missing source/notation/use/group/range approval")
         self.run_cli("review", "--id", "pair-A", "--reviewer", "synthetic-reviewer", "--approve-experimental-ranges", error="requires explicit")
         self.approve("pair-A")
         self.run_cli("review", "--id", "pair-A", "--reviewer", "synthetic-reviewer", "--anchor", "2=4.6")
-        self.run_cli("release", "--version", "v1", "--validation-group", "group-pair-B", error="missing manual")
+        self.run_cli("release", "--version", "v1", "--validation-group", "group-pair-B", error="missing source/notation/use/group/range approval")
         self.run_cli("review", "--id", "pair-A", "--reviewer", "synthetic-reviewer", "--anchor", "3=2.0", error="strictly")
 
     def test_failed_automatic_alignment_can_be_completed_with_manual_anchors(self):
         self.add("pair-A", rate=96000)
         self.add("pair-B", 2)
-        prepared = self.run_cli("prepare", "--accept-owner-conventions")
+        prepared = self.run_cli("prepare", "--accept-conventions")
         self.assertEqual(prepared[0]["alignment"], "needs-manual-anchors")
         self.assertIn("48000", prepared[0]["alignmentError"])
         self.run_cli("review", "--id", "pair-A", "--reviewer", "synthetic-reviewer", "--approve-range", ".4:16.4", error="at least two")
@@ -605,7 +632,7 @@ class TrainingPreparationTests(unittest.TestCase):
 
     def test_source_specific_rules_need_no_internal_hash_authoring(self):
         self.add("pair-A", legend=True)
-        self.run_cli("prepare", "--ids", "pair-A", error="accept-owner-conventions")
+        self.run_cli("prepare", "--ids", "pair-A", error="accept-conventions")
         rules_path = self.workspace / "pairs" / "pair-A" / "rules.json"
         rules = read_json(rules_path)
         rules["rules"] = [{
@@ -614,7 +641,7 @@ class TrainingPreparationTests(unittest.TestCase):
             "consumedTokens": ["*"], "consumesDeadNotes": False,
         }]
         rules_path.write_text(json.dumps(rules), encoding="utf-8")
-        self.run_cli("prepare", "--ids", "pair-A", "--accept-owner-conventions")
+        self.run_cli("prepare", "--ids", "pair-A", "--accept-conventions")
         labels = read_json(self.workspace / "pairs" / "pair-A" / "canonical.json")
         self.assertEqual(labels["targets"]["gestures"][0]["technique"], "percussive_hit")
         self.assertEqual(len(labels["measureVisits"]), 4)
@@ -634,7 +661,7 @@ class TrainingPreparationTests(unittest.TestCase):
             prop.find(child).text = text
         gp.write_bytes(archive_bytes(root))
         original = sha256(gp)
-        self.run_cli("prepare", "--accept-owner-conventions", error="inconsistent_partial_capo_metadata")
+        self.run_cli("prepare", "--accept-conventions", error="inconsistent_partial_capo_metadata")
         rules_path = directory / "rules.json"
         rules = read_json(rules_path)
         rules["confirmFullCapoMetadata"] = True
@@ -651,7 +678,7 @@ class TrainingPreparationTests(unittest.TestCase):
         score = fresh_score("no initial tempo")
         score.find("./MasterTrack/Automations").clear()
         (self.workspace / "pairs" / "pair-A" / "raw.gp").write_bytes(archive_bytes(score))
-        self.run_cli("prepare", "--accept-owner-conventions", error="tempo")
+        self.run_cli("prepare", "--accept-conventions", error="tempo")
         self.assertFalse((self.workspace / "pairs" / "pair-A" / "preparation.json").exists())
         self.run_cli("add", "--id", "CON", "--group", "new", "--gp", str(gp), "--audio", str(audio), error="device")
         self.run_cli("add", "--id", "PAIR-a", "--group", "new", "--gp", str(gp), "--audio", str(audio), error="already exists")
@@ -688,7 +715,7 @@ class TrainingPreparationTests(unittest.TestCase):
         for identifier, score, audio in (("pair-A", gp, mp3), ("pair-B", other_gp, flac)):
             self.run_cli("add", "--id", identifier, "--group", f"group-{identifier}", "--gp", str(score), "--audio", str(audio))
         original = {path: sha256(path) for path in (mp3, flac, wave, other)}
-        self.run_cli("prepare", "--accept-owner-conventions")
+        self.run_cli("prepare", "--accept-conventions")
         converted = self.workspace / "pairs" / "pair-A" / "trimmed.flac"
 
         def pcm(path):
@@ -704,7 +731,7 @@ class TrainingPreparationTests(unittest.TestCase):
         self.add("pair-A")
         audio = self.workspace / "pairs" / "pair-A" / "trimmed-source.wav"
         sf.write(audio, np.ones((8000, 2)) * .1, 8000, subtype="FLOAT")
-        self.run_cli("prepare", "--accept-owner-conventions", error="silent quantization")
+        self.run_cli("prepare", "--accept-conventions", error="silent quantization")
         self.assertFalse((self.workspace / "pairs" / "pair-A" / "preparation.json").exists())
 
     def test_release_preserves_complete_tempo_ramp_clock_and_half_open_targets(self):
@@ -718,7 +745,7 @@ class TrainingPreparationTests(unittest.TestCase):
             "<Value>90 2</Value><Linear>false</Linear></Automation>"
         ))
         gp.write_bytes(archive_bytes(root))
-        self.run_cli("prepare", "--accept-owner-conventions")
+        self.run_cli("prepare", "--accept-conventions")
         self.approve("pair-A")
         self.approve("pair-B")
         _, records, _ = validate_release(self.release()["manifestPath"])

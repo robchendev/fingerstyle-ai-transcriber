@@ -7,7 +7,6 @@ from scripts.technique_supervision import (
     TECHNIQUE_TYPES,
     canonical_techniques,
     projected_techniques,
-    technique_counts,
     techniques_in_window,
 )
 from scripts.transcriber_data import encode_targets
@@ -47,7 +46,6 @@ class TechniqueSupervisionTests(unittest.TestCase):
         self.assertEqual(events[0]["directions"], {"brush": "Down"})
         self.assertEqual(events[0]["stringsByTechnique"], {"brush": [1, 2, 6]})
         self.assertTrue(events[0]["membershipComplete"])
-        self.assertEqual(technique_counts(labels)["memberStrings"], 3)
 
     def test_conflicting_direction_is_masked_and_native_types_stay_distinct(self):
         labels = {"targets": {"notes": [

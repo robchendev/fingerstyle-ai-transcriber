@@ -219,6 +219,28 @@ class DatasetReleaseTests(unittest.TestCase):
                 with self.subTest(change=change), self.assertRaisesRegex(ValueError, error):
                     validate_release(manifest_path)
 
+    def test_training_execution_prose_does_not_gate_existing_frozen_releases(self):
+        for marker in (None, "owner-only", "explicit-command"):
+            with self.subTest(marker=marker), TemporaryDirectory(dir=ROOT) as directory:
+                root = Path(directory).resolve()
+                manifest_path = synthetic_release(root)
+                manifest = read_json(manifest_path)
+                authorization = manifest["releaseAuthorization"]
+                for document in (manifest, authorization):
+                    if marker is None:
+                        document.pop("trainingExecution", None)
+                    else:
+                        document["trainingExecution"] = marker
+                authorization["sha256"] = candidate_digest({key: value for key, value in authorization.items() if key != "sha256"})
+                for entry in manifest["entries"]:
+                    target = root / entry["targetsPath"]
+                    payload = read_json(target)
+                    payload["approval"]["releaseAuthorizationSha256"] = authorization["sha256"]
+                    publish_json(target, payload)
+                    entry["targetsSha256"] = sha256(target)
+                publish_json(manifest_path, manifest)
+                self.assertEqual(len(validate_release(manifest_path)[1]), 2)
+
     def test_authorized_validation_groups_cannot_be_absent_from_selected_recordings(self):
         with TemporaryDirectory(dir=ROOT) as directory:
             manifest_path = synthetic_release(Path(directory).resolve(), validation_groups=["piece-2", "piece-1"])

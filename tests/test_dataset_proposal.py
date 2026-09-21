@@ -59,22 +59,20 @@ class DatasetProposalTests(unittest.TestCase):
 
     def test_group_selection_keeps_related_records_and_reviewed_assignments(self):
         rows = [profile("a", group="t", split="train", counts={name: 1000 for name in ("wrist_thump", "thumb_slap", "percussive_hit", "harmonics")}), profile("b", group="v", split="validation"), profile("c", group="v"), profile("d"), profile("e")]
-        groups = select_validation(rows, 2)
-        self.assertIn("v", groups)
-        self.assertNotIn("t", groups)
+        groups = select_validation(rows, ["b", "d"])
+        self.assertEqual(groups, ["v", "d"])
         self.assertEqual(sum(row["groupId"] in groups for row in rows), 3)
-        self.assertEqual(groups, select_validation(rows, 2))
-        with self.assertRaisesRegex(ValueError, "exceed"):
-            select_validation([*rows, profile("f", split="validation")], 1)
         with self.assertRaisesRegex(ValueError, "conflicts"):
-            select_validation(rows, 3, ["a", "b"])
+            select_validation([*rows, profile("f", split="validation")], ["b"])
+        with self.assertRaisesRegex(ValueError, "conflicts"):
+            select_validation(rows, ["a", "b"])
 
     def test_explicit_ids_expand_whole_groups_without_second_split_mechanism(self):
         rows = [profile("a", group="same"), profile("b", group="same"), profile("c")]
-        self.assertEqual(select_validation(rows, 1, ["b"]), ["same"])
-        for selected in ([], ["missing"], ["a", "a"]):
+        self.assertEqual(select_validation(rows, ["b"]), ["same"])
+        for selected in (None, [], ["missing"], ["a", "a"]):
             with self.assertRaises(ValueError):
-                select_validation(rows, 1, selected)
+                select_validation(rows, selected)
 
     def test_overlap_window_counts_do_not_duplicate_unique_event_coverage(self):
         labels, normalization = clock_fixture()
@@ -106,7 +104,7 @@ class DatasetProposalTests(unittest.TestCase):
             ]}
             write_json(root / "pairs.json", registry)
             with patch("scripts.dataset_proposal.inspect_pair", side_effect=deepcopy(rows)):
-                result = propose_dataset(root, "example", validation_group_count=1)
+                result = propose_dataset(root, "example", validation_ids=["b"])
             proposal = read_json(Path(result["proposalPath"]))
             self.assertEqual(proposal["proposalSha256"], candidate_digest({key: value for key, value in proposal.items() if key != "proposalSha256"}))
             self.assertIs(proposal["trainingReady"], False)
@@ -117,16 +115,16 @@ class DatasetProposalTests(unittest.TestCase):
             self.assertEqual(proposal["splitSummary"]["train"]["recordings"], 1)
             before = Path(result["proposalPath"]).read_bytes()
             with patch("scripts.dataset_proposal.inspect_pair", side_effect=deepcopy(rows)):
-                propose_dataset(root, "example", validation_group_count=1)
+                propose_dataset(root, "example", validation_ids=["b"])
             self.assertEqual(Path(result["proposalPath"]).read_bytes(), before)
             duplicate = deepcopy(rows)
             for row in duplicate:
                 row["audioSha256"] = "identical-audio"
             with patch("scripts.dataset_proposal.inspect_pair", side_effect=duplicate), self.assertRaisesRegex(ValueError, "Identical source"):
-                propose_dataset(root, "duplicate", validation_group_count=1)
+                propose_dataset(root, "duplicate", validation_ids=["b"])
             rows[0]["title"] = "changed"
             with patch("scripts.dataset_proposal.inspect_pair", side_effect=rows), self.assertRaisesRegex(ValueError, "different proposal"):
-                propose_dataset(root, "example", validation_group_count=1)
+                propose_dataset(root, "example", validation_ids=["b"])
 
 
 if __name__ == "__main__":

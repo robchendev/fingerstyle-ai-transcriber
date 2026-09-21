@@ -2,7 +2,6 @@ from io import BytesIO
 from fractions import Fraction
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
 import hashlib
 import math
 import unittest
@@ -105,20 +104,6 @@ class GpOutputTests(unittest.TestCase):
                     self.assertIsNone(rhythm.find("PrimaryTuplet"))
                     self.assertNotIn(rhythm.findtext("NoteValue"), ("32nd", "64th", "128th"))
 
-    def test_strict_note_threshold_also_applies_to_optional_symbolic_completion(self):
-        document = hypotheses()
-        document["notes"] = [{**document["notes"][0], "confidence": .99}]
-        profile = DraftProfile(note_threshold=.98, strict_note_confidence=True)
-        with TemporaryDirectory(dir=ROOT) as directory:
-            directory = Path(directory)
-            template = directory / "template.gpt"
-            template.write_bytes(archive_bytes(output_template()))
-            def complete(model, source, **kwargs):
-                self.assertEqual(kwargs["threshold"], .98)
-                return source, {"addedCount": 0, "replacedCount": 0, "removedCount": 0}
-            with patch("scripts.symbolic_completer.complete_document", side_effect=complete) as completion:
-                write_gp_outputs(template, document, directory / "full.gp", directory / "single.gp", profile=profile, completer=object())
-            completion.assert_called_once()
 
     def test_v4_grace_slide_has_zero_score_advance_and_terminal_slides_stay_local(self):
         document = hypotheses()

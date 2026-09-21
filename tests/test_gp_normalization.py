@@ -66,9 +66,9 @@ def archive_bytes(root):
     with ZipFile(result, "w") as archive:
         archive.comment = b"preserve unknown archive comment"
         for name, payload in (
-            ("Content/BinaryStylesheet", b"\x00\xfffont-size=17;future-settings\x80"),
+            ("Content/BinaryStylesheet", b"\x00\x00\x00\x01\x09Font/Size\x01\x00\x00\x00\x11"),
             ("Content/Preferences.json", b'{"font":"source font","unknown":[1,2]}'),
-            ("Content/Stylesheets/score.gpss", b"arbitrary stylesheet bytes"),
+            ("Content/Stylesheets/score.gpss", b"\x0a\x03\x08\xff\x01"),
             ("Content/ScoreViews/1.gpsv", b"untouched view resource"),
             ("future/resource", b"\x01\x02opaque"),
             (GPIF_ENTRY, ET.tostring(root, encoding="utf-8", xml_declaration=True)),

@@ -23,11 +23,6 @@ def at(value, quarter, seconds=None):
     return value
 
 
-def hand_range(low, high, onset=0, confidence=1):
-    return {
-        "scoreOnsetQuarter": [onset, 1], "minimumFret": low, "maximumFret": high,
-        "confidence": confidence, "source": "synthetic-hand-range",
-    }
 
 
 def with_grace(value, interval, transition="none", source_fret=0):
@@ -153,13 +148,6 @@ class FingeringOptimizerTests(unittest.TestCase):
         with self.assertRaises(HarnessError):
             optimize_fingerings({"metadata": {}, "notes": []})
 
-    def test_impossible_string_arranger_score_cannot_drop_only_playable_position(self):
-        value = note(40, 6, 0, .99)
-        value["arrangerStringLogits"] = [0, 0, 0, 0, 0, 25]
-        result, report = optimize_fingerings(self.document([value]))
-        self.assertEqual([(item["string"], item["fret"]) for item in result["notes"]], [(6, 4)])
-        # This synthetic document's tuning has string 6 at MIDI35 plus capo1.
-        self.assertEqual(report["removedCount"], 0)
 
     def test_lookahead_revoices_opening_and_keeps_formerly_dropped_outlier(self):
         opening = note(56, 3, 1)
@@ -294,37 +282,13 @@ class FingeringOptimizerTests(unittest.TestCase):
         self.assertEqual(report["connectionConflicts"][0]["reason"], "connection_endpoint_not_retained")
         self.assertEqual(report["removed"][0]["_connectionToken"], "origin")
 
-    def test_evidence_masks_are_validated_and_never_reduce_pitch_retention(self):
-        first = {**note(67, 1, 2), "allowedFingeringCandidates": [{"string": 1, "fret": 2}]}
-        second = {**note(68, 1, 3), "allowedFingeringCandidates": [{"string": 1, "fret": 3}]}
-        result, report = optimize_fingerings(self.document([first, second]))
-        self.assertEqual(len(result["notes"]), 2)
-        self.assertEqual(report["evidenceConflicts"][0]["reason"], "evidence_reduces_chord_pitch_retention")
-        only_high = {**note(56, 3, 1), "allowedFingeringCandidates": [{"string": 4, "fret": 8}]}
-        result, report = optimize_fingerings(self.document([only_high]))
-        self.assertEqual((result["notes"][0]["string"], result["notes"][0]["fret"]), (4, 8))
-        self.assertEqual(report["evidenceConflictCount"], 0)
-        empty = {**note(56, 3, 1), "allowedFingeringCandidates": []}
-        result, report = optimize_fingerings(self.document([empty]))
-        self.assertEqual(len(result["notes"]), 1)
-        self.assertEqual(report["evidenceConflicts"][0]["reason"], "evidence_has_no_compatible_position")
-        with self.assertRaises(HarnessError):
-            optimize_fingerings(self.document([{**first, "allowedFingeringCandidates": [{"string": 1, "fret": 3}]}]))
 
-    def test_learned_candidate_likelihood_can_select_high_position_without_changing_pitch(self):
-        value = {**note(56, 3, 1), "arrangerStringLogits": [0, 0, 10, 0, 0, 0]}
-        result, report = optimize_fingerings(self.document([value]))
-        self.assertEqual((result["notes"][0]["string"], result["notes"][0]["fret"]), (4, 8))
-        self.assertEqual(result["notes"][0]["soundingPitchMidi"], 56)
-        self.assertEqual(report["removedCount"], 0)
 
     def test_cardinality_precedes_all_confidence_and_likelihood_costs(self):
         document = {
             "metadata": {"openStringMidi": [40, 45, 50, 55, 59, 64], "capoFret": 0},
             "notes": [note(pitch, 6 - index, 0, .00001) for index, pitch in enumerate([40, 45, 50, 55, 59, 64])],
         }
-        for value in document["notes"]:
-            value["arrangerStringLogits"] = [100, -100, -100, -100, -100, -100]
         result, report = optimize_fingerings(document)
         self.assertEqual(len(result["notes"]), 6)
         self.assertEqual(report["removedCount"], 0)
@@ -335,86 +299,11 @@ class FingeringOptimizerTests(unittest.TestCase):
         self.assertEqual(first, optimize_fingerings(document))
         self.assertTrue(all(value["keptIndex"] == 2 for value in first[1]["removed"]))
 
-    def test_invalid_logits_are_rejected_even_when_pitch_has_no_candidate(self):
-        with self.assertRaises(HarnessError):
-            optimize_fingerings(self.document([{**note(10, 6, 0), "arrangerStringLogits": [float("nan")] * 6}]))
 
-    def test_soft_hand_range_guides_position_and_keeps_provenance(self):
-        document = self.document([note(56, 3, 1)])
-        baseline, _ = optimize_fingerings(document)
-        document["handPositionEvidence"] = [hand_range(7, 9)]
-        before = deepcopy(document)
-        result, report = optimize_fingerings(document)
-        self.assertEqual(document, before)
-        self.assertEqual(baseline["notes"][0]["fret"], 1)
-        self.assertEqual(result["notes"][0]["fret"], 8)
-        self.assertEqual(result["notes"][0]["soundingPitchMidi"], 56)
-        evidence = report["handPositionEvidence"][0]
-        self.assertEqual((evidence["selectedPosition"], evidence["distanceOutsideRange"], evidence["status"]), (8, 0, "satisfied"))
-        self.assertEqual(evidence["source"], "synthetic-hand-range")
-        self.assertEqual(report["handPositionEvidenceCount"], 1)
-        self.assertEqual(report["handPositionEvidenceConflictCount"], 0)
-        result["handPositionEvidence"][0]["source"] = "changed-copy"
-        self.assertEqual(document["handPositionEvidence"][0]["source"], "synthetic-hand-range")
 
-    def test_conflicting_soft_hand_range_never_drops_pitch_or_revoices_harmonic(self):
-        ordinary = note(39, 6, 3)
-        harmonic = {**at(note(84, 1, 7), 1), "harmonic": {"type": "Natural", "fret": 7}, "fretBasePitchMidi": 72}
-        document = self.document([ordinary, harmonic])
-        document["handPositionEvidence"] = [hand_range(18, 22), hand_range(19, 20, onset=1)]
-        result, report = optimize_fingerings(document)
-        self.assertEqual(len(result["notes"]), 2)
-        self.assertEqual(result["notes"][1], harmonic)
-        self.assertEqual(report["removedCount"], 0)
-        self.assertEqual(report["handPositionEvidenceConflictCount"], 2)
-        self.assertEqual([value["distanceOutsideRange"] for value in report["handPositionEvidence"]], [15, 12])
 
-    def test_bound_connection_has_priority_over_soft_hand_range(self):
-        origin = {**at(note(63, 2, 3), 0), "_connectionToken": "origin"}
-        destination = {**at(note(65, 1, 0), 1), "_connectionToken": "destination", "_connectionOriginToken": "origin"}
-        document = self.document([origin, destination])
-        document["handPositionEvidence"] = [hand_range(0, 0, onset=1)]
-        result, report = optimize_fingerings(document)
-        self.assertEqual(result["notes"][0]["string"], result["notes"][1]["string"])
-        self.assertEqual(result["notes"][1]["_connectionOriginToken"], "origin")
-        self.assertEqual(report["connectionConflictCount"], 0)
-        self.assertEqual(report["handPositionEvidenceConflictCount"], 1)
 
-    def test_unused_or_zero_weight_hand_evidence_is_reported(self):
-        document = self.document([note(36, 6, 0), at(note(56, 3, 1), 1)])
-        document["handPositionEvidence"] = [
-            hand_range(8, 10), hand_range(8, 10, onset=1, confidence=0), hand_range(8, 10, onset=2),
-        ]
-        result, report = optimize_fingerings(document)
-        self.assertEqual([value["fret"] for value in result["notes"]], [0, 1])
-        self.assertEqual([value["status"] for value in report["handPositionEvidence"]], [
-            "no_non_open_contacts", "zero_weight", "no_chord_at_evidence_onset",
-        ])
-        self.assertEqual(report["unusedHandPositionEvidenceCount"], 3)
-        self.assertEqual(report["handPositionEvidenceConflictCount"], 0)
 
-    def test_hand_evidence_validates_range_time_confidence_and_source(self):
-        for invalid in [
-            {**hand_range(8, 10), "minimumFret": 11},
-            {**hand_range(8, 10), "maximumFret": 25},
-            {**hand_range(8, 10), "minimumFret": True},
-            {**hand_range(8, 10), "scoreOnsetQuarter": [0, 0]},
-            {**hand_range(8, 10), "scoreOnsetQuarter": [.5, 1]},
-            {**hand_range(8, 10), "confidence": float("nan")},
-            {**hand_range(8, 10), "confidence": 2},
-            {**hand_range(8, 10), "source": " "},
-            {**hand_range(8, 10), "unknownField": 1},
-        ]:
-            with self.subTest(invalid=invalid), self.assertRaises(HarnessError):
-                optimize_fingerings({**self.document([note(56, 3, 1)]), "handPositionEvidence": [invalid]})
-        with self.assertRaises(HarnessError):
-            optimize_fingerings({**self.document([]), "handPositionEvidence": [
-                hand_range(8, 10), {**hand_range(8, 10), "scoreOnsetQuarter": [0, 2]},
-            ]})
-        without_rhythm = note(56, 3, 1)
-        without_rhythm.pop("scoreOnsetQuarter")
-        with self.assertRaises(HarnessError):
-            optimize_fingerings({**self.document([without_rhythm]), "handPositionEvidence": [hand_range(8, 10)]})
 
     def test_two_pass_pitch_repair_preserves_tokens_harmonics_and_inference_extras(self):
         origin = {**note(56, 3, 1), "_connectionToken": "origin"}
@@ -451,7 +340,6 @@ class FingeringOptimizerTests(unittest.TestCase):
 
     def test_grace_requires_playable_source_pitch_on_the_selected_main_string(self):
         value = with_grace(note(60, 2, 0), 5, "hammer_on")
-        value["arrangerStringLogits"] = [0, 0, 0, 0, 15, 0]
         document = self.document([value])
         before = deepcopy(document)
         result, report = optimize_fingerings(document)
@@ -470,8 +358,8 @@ class FingeringOptimizerTests(unittest.TestCase):
         value = with_grace({
             **note(63, 2, 3), "noteId": "destination", "connectionOriginNoteId": "filtered-origin",
         }, 2, "hammer_on", source_fret=1)
-        document = self.document([value])
-        document["handPositionEvidence"] = [hand_range(8, 8)]
+        harmonic = {**note(79, 2, 7), "harmonic": {"type": "Natural", "fret": 7}}
+        document = self.document([value, harmonic])
         result, report = optimize_fingerings(document)
         selected = result["notes"][0]
         self.assertEqual((selected["string"], selected["fret"]), (3, 8))

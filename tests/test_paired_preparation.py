@@ -44,7 +44,7 @@ class PairedBatchTests(unittest.TestCase):
             row = {
                 "id": identifier, "groupId": entry["groupId"], "split": entry["split"],
                 "gp": str(gp), "audio": str(audio), "video": report["inputPaths"]["video"],
-                "reuse": {"bundle": str(bundle)}, "clips": [[1000, 1160]],
+                "reuse": {"bundle": str(bundle)}, "clips": [[1000, 1160]], "pluckingScreenSide": "right",
             }
             rows.append(row)
             self.canonical_records.append({**row, "targets": str(self.release.parent / entry["targetsPath"])})
@@ -52,7 +52,7 @@ class PairedBatchTests(unittest.TestCase):
         self.document = {
             "schemaVersion": 1, "kind": "paired-preparation-batch", "records": rows,
             "workspace": str(self.root / "workspace"), "releaseManifest": str(self.release),
-            "videoPython": sys.executable,
+            "videoPython": sys.executable, "handModel": "models\\hand_landmarker.task",
         }
         self.manifest = self.root / "batch.json"
         self.save()
@@ -68,10 +68,11 @@ class PairedBatchTests(unittest.TestCase):
     def worker(self, command, **kwargs):
         self.calls.append(command)
         request = read_json(Path(command[command.index("--request") + 1]))
+        self.assertEqual(set(request), {"schemaVersion", "kind", "id", "video", "audio", "outputDirectory", "pluckingScreenSide", "clips", "reuse", "handModel", "poseModel", "reviewMode"})
         path = Path(command[command.index("--output") + 1])
         result = {
             "schemaVersion": 1, "kind": "paired-video-preparation-result", "id": request["id"], "status": "ready",
-            "inputSha256": {key: sha256(request[key]) for key in ("video", "audio", "gp")},
+            "inputSha256": {key: sha256(request[key]) for key in ("video", "audio")},
             "artifacts": {"bundle": str(self.bundles[request["id"]])}, "actions": [],
             "stageSummary": [{"stage": "bundle", "status": "reused"}],
         }
@@ -112,29 +113,31 @@ class PairedBatchTests(unittest.TestCase):
         self.save()
         with self.assertRaisesRegex(ValueError, "configuration or source"):
             self.run_batch()
-        self.document["records"][0].pop("pluckingScreenSide")
+        self.document["records"][0]["pluckingScreenSide"] = "right"
         self.save()
         Path(self.document["records"][0]["video"]).write_text("changed video")
         with self.assertRaisesRegex(ValueError, "configuration or source"):
             self.run_batch()
 
-    def test_source_mapping_and_receipts_reach_worker_and_are_hash_bound(self):
-        mapping = self.root / "source-map.json"
-        mapping.write_text("{}")
-        self.document["sourceMapping"] = str(mapping)
-        for row in self.document["records"]:
-            receipt = self.root / (row["id"] + "-receipt.json")
-            receipt.write_text("{}")
-            row["videoReceipt"] = str(receipt)
+    def test_public_manifest_rejects_removed_source_and_geometry_surfaces(self):
+        for key in ("sourceMapping", "geometryMode", "coarseContext", "acceptOwnerConventions"):
+            with self.subTest(key=key):
+                self.document[key] = "obsolete"
+                self.save()
+                with self.assertRaises(ValueError):
+                    load_batch(self.manifest, root=self.root)
+                del self.document[key]
+        for key in ("videoReceipt", "geometryReference", "correspondenceReview"):
+            with self.subTest(key=key):
+                self.document["records"][0][key] = "obsolete"
+                self.save()
+                with self.assertRaises(ValueError):
+                    load_batch(self.manifest, root=self.root)
+                del self.document["records"][0][key]
+        del self.document["records"][0]["gp"]
         self.save()
-        self.run_batch()
-        for row in self.document["records"]:
-            request = read_json(self.output / row["id"] / "request.json")
-            self.assertEqual(request["sourceMapping"], str(mapping))
-            self.assertEqual(request["videoReceipt"], row["videoReceipt"])
-        mapping.write_text('{"changed":true}')
-        with self.assertRaisesRegex(ValueError, "configuration or source"):
-            self.run_batch()
+        with self.assertRaisesRegex(ValueError, "gp"):
+            load_batch(self.manifest, root=self.root)
 
     def test_review_pause_is_persistent_and_resumes_with_same_inputs(self):
         with patch.dict("sys.modules", {"scripts.batch_canonical": SimpleNamespace(ensure_canonical=lambda *args, **kwargs: {"status": "needs-review", "actions": [{"stage": "canonical-review", "reason": "Explicit ranges needed"}]})}):
@@ -222,16 +225,20 @@ class PairedBatchTests(unittest.TestCase):
         with patch("sys.stderr", new=StringIO()), self.assertRaises(SystemExit):
             prepare_training_data.main(["batch-train", *base, "--audio-epochs", "20", "--video-epochs", "10"])
 
-    def test_geometry_review_will_not_edit_a_reused_external_annotation(self):
-        self.run_batch()
-        result_path = self.output / "piece-0" / "result.json"
-        result = read_json(result_path)
-        result["artifacts"]["annotations"] = str(self.root / "external-annotations.json")
-        (self.root / "external-annotations.json").write_text("{}")
-        result_path.write_text(json.dumps(result))
-        with patch.dict("sys.modules", {"scripts.batch_canonical": SimpleNamespace(review_canonical=lambda *args, **kwargs: None)}):
-            with self.assertRaisesRegex(ValueError, "never edits reused"):
-                review_batch(self.manifest, self.output, "piece-0", annotate_geometry=True, root=self.root, runner=self.worker)
+    def test_roles_are_explicit_and_pose_is_not_enabled_by_default(self):
+        batch = load_batch(self.manifest, root=self.root)
+        self.assertIsNone(batch["poseModel"])
+        self.assertNotIn("geometryMode", batch)
+        del self.document["videoPython"]
+        self.save()
+        with patch.dict("os.environ", {"VIDEO_PYTHON": sys.executable}):
+            self.assertEqual(load_batch(self.manifest, root=self.root)["videoPython"], str(Path(sys.executable).absolute()))
+        self.document["videoPython"] = sys.executable
+        for side in (None, "geometry", "unknown"):
+            self.document["records"][0]["pluckingScreenSide"] = side
+            self.save()
+            with self.assertRaisesRegex(ValueError, "left or right"):
+                load_batch(self.manifest, root=self.root)
 
     def test_automatic_optional_review_queue_is_bounded_and_nonblocking(self):
         self.document["reviewBudget"] = 3
@@ -241,8 +248,8 @@ class PairedBatchTests(unittest.TestCase):
             path = Path(command[command.index("--output") + 1])
             result = read_json(path)
             result["actions"] = [
-                {"stage": "geometry-exception", "optional": True, "shotId": index,
-                 "reason": "Optional calibration", "priority": index}
+                {"stage": "shots", "optional": True, "shotId": index,
+                 "reason": "Optional shot review", "priority": index}
                 for index in range(20)
             ]
             path.write_text(json.dumps(result))
@@ -253,7 +260,7 @@ class PairedBatchTests(unittest.TestCase):
         self.assertEqual(result["optionalReviewCount"], 40)
         self.assertEqual(len(result["actions"]), 3)
         self.assertTrue(all(action["optional"] for action in result["actions"]))
-        self.assertTrue(all("--geometry-shot" in action["command"] for action in result["actions"]))
+        self.assertEqual([action["priority"] for action in result["actions"]], [19, 19, 18])
 
     def test_parallel_workers_publish_complete_deterministic_index_and_logs(self):
         self.document["workers"] = 2
@@ -284,42 +291,13 @@ class PairedBatchTests(unittest.TestCase):
         self.assertGreater(result["coverage"]["splits"]["train"]["pairedWindows"], 0)
         self.assertEqual(result["coverage"]["splits"]["train"]["usableVideoWindows"], 0)
 
-    def test_optional_geometry_review_creates_revision_without_mutating_published_inputs(self):
+    def test_status_is_read_only_before_and_after_preparation(self):
+        self.assertEqual(batch_status(self.manifest, self.output, root=self.root)["status"], "pending")
+        self.assertFalse(self.output.exists())
         self.run_batch()
-        identifier = self.document["records"][0]["id"]
-        original = self.output / identifier / "video" / "annotations.json"
-        original.parent.mkdir()
-        original.write_text(json.dumps({
-            "preparationMethod": "automatic-geometry-v1", "preparationComplete": True, "reviewComplete": False,
-            "videoSha256": "1" * 64, "shotsSha256": "2" * 64, "pointOrder": ["nut"],
-            "coordinateSpace": "normalized_full_frame", "shots": [],
-        }))
-        state = read_json(self.output / "batch-state.json")
-        state["records"][identifier]["artifacts"]["annotations"] = str(original)
-        for name in ("alignment", "shots", "hands", "geometry", "roles"):
-            artifact = original.parent / f"{name}.json"
-            artifact.write_text("{}")
-            state["records"][identifier]["artifacts"][name] = str(artifact)
-        (self.output / "batch-state.json").write_text(json.dumps(state))
-        (self.output / identifier / "result.json").write_text(json.dumps(state["records"][identifier]))
-        digest = sha256(original)
-        def annotate(command, **kwargs):
-            self.assertIn("--exceptions-only", command)
-            self.assertEqual(command[command.index("--shot-id") + 1], "1")
-            output = Path(command[command.index("--output") + 1])
-            output.write_text(json.dumps({**read_json(original), "reviewComplete": True}))
-            return SimpleNamespace(returncode=0)
-        with patch.dict("sys.modules", {"scripts.batch_canonical": SimpleNamespace(review_canonical=lambda *args, **kwargs: None)}):
-            result = review_batch(self.manifest, self.output, identifier, annotate_geometry=True, geometry_shot=2, root=self.root, runner=annotate)
-        self.assertEqual(sha256(original), digest)
-        self.assertNotEqual(result["outputDirectory"], str(self.output))
-        self.assertTrue(Path(result["nextActionsPath"]).is_file())
-        revision = read_json(Path(result["manifestPath"]))
-        row = next(row for row in revision["records"] if row["id"] == identifier)
-        self.assertEqual(row["reuse"]["annotations"], result["annotations"])
-        self.assertTrue({"alignment", "shots", "hands"} <= row["reuse"].keys())
-        self.assertFalse({"geometry", "roles", "bundle"} & row["reuse"].keys())
-        self.assertEqual(read_json(self.output / "batch-state.json")["status"], "ready")
+        before = {path: (sha256(path), path.stat().st_mtime_ns) for path in self.output.rglob("*") if path.is_file()}
+        self.assertEqual(batch_status(self.manifest, self.output, root=self.root)["status"], "ready")
+        self.assertEqual(before, {path: (sha256(path), path.stat().st_mtime_ns) for path in self.output.rglob("*") if path.is_file()})
 
     def test_accept_score_passes_explicit_authorization_to_canonical_review(self):
         from unittest.mock import Mock
