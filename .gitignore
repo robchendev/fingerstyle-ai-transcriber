@@ -1,11 +1,11 @@
-# Dataset privacy must survive a future public code repository.
-# Ignoring paths does not remove dataset metadata already tracked in history.
 /data/
+/local-private/
 /docs/SESSION_HANDOFF.md
 .venv/
 .venv-fretboard/
 .tools/
 __pycache__/
+.pytest_cache/
 checkpoints/
 runs/
 cache/
@@ -14,7 +14,11 @@ cache/
 *.flac
 *.m4a
 *.mp4
+*.mkv
+*.webm
+*.npz
 *.gp
+*.gpt
 *.gpx
 *.gp3
 *.gp4
@@ -23,6 +27,7 @@ cache/
 *.pt
 *.pth
 *.safetensors
+!/models/transcriber.pt
 .env
 .env.*
 !.env.example
