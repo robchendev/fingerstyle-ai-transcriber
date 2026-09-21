@@ -16,6 +16,23 @@ Generated Guitar Pro playback for the same passage, bars 25-36:
 
 https://github.com/user-attachments/assets/232375f6-d8c2-4dfa-8a6a-5bf320e48e82
 
+**Settings used for the recorded transcription**
+
+| Parameter | Value |
+| --- | --- |
+| Note cutoff (`--note-cutoff`) | `0.78`, keeping scores strictly above the cutoff |
+| Thumb-slap X cutoff (`--x-cutoff`) | `0.10` |
+| Other percussion cutoff | `0.80` |
+| Brush, arpeggio and pick-stroke cutoffs | `0.995` for detection, `0.98` for including individual notes |
+| Note effects, connections and grace-note cutoffs | `0.99` |
+| Harmonics | Excluded |
+| Tuning before capo, strings 6 to 1 | `B1 F#2 B2 F#3 B3 E4` |
+| Capo | Fret `1` |
+| Tempo | `122 BPM`, quarter-note beat (`1/4`) |
+| Time signature | `4/4` |
+| Plucking hand on screen | Left |
+| Rhythm policy and output | `fingerstyle`, single voice |
+
 The bundled model in [`models/`](models/) struggles with complex melodies and was trained on a limited dataset. Training on a larger, high-quality dataset may improve results; see the [training guide](docs/TRAINING.md).
 
 ## Setup
