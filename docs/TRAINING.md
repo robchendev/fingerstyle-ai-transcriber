@@ -4,6 +4,8 @@ Complete the [setup instructions](../README.md#setup), activate the root Python 
 
 Use matching `.gp` scores and already-trimmed local performance videos. Audio is extracted automatically. If you supply an `audio` file instead, it must match the performance. Videos with multiple audio tracks or timing errors require a separate audio file and alignment review.
 
+**Important: Every video must start exactly on the first beat of the song at timestamp 0.** Trim any lead-in, silence or count-in before preparing the dataset. Keep the audio and video synchronized, including any separately supplied audio.
+
 ## Prepare and review
 
 Save this example as `runs\batch.json` and replace its file paths and plucking-hand screen sides. Paths can be absolute or relative to the repository. Set aside separate groups for validation, which evaluates the model during training. Keep related arrangements and copies of the same recording in the same group and split.

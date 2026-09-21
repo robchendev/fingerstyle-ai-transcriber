@@ -37,6 +37,8 @@ The included transcription model is at [`models/transcriber.pt`](models/transcri
 
 ## Transcribe
 
+**Important: The video must start exactly on the first beat of the song at timestamp 0.** Trim any lead-in, silence or count-in before running transcription, keeping the audio and video synchronized.
+
 Supply a GP or GPT template for the page layout. Exported files clear the template's artist, arranger and lyricist credits.
 
 ```powershell
@@ -54,6 +56,8 @@ Adjust export cutoffs without rerunning the model or processing the video:
 Both commands support `--dry-run` to preview their settings. A cutoff of `0.8` does not mean 80% accuracy. Lowering a re-export cutoff cannot recover notes already discarded by the model.
 
 ## Train
+
+**Important: Every training video must start exactly on the first beat of the song at timestamp 0.** Trim the lead-in before preparing the dataset, keeping the audio and video synchronized.
 
 See [training with your own videos and scores](docs/TRAINING.md) for data preparation, review and training. To transcribe with your trained model, pass its `best-events.pt` or `latest.pt` to `--checkpoint`. The bundled model cannot resume training.
 
