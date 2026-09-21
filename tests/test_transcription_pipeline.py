@@ -187,6 +187,8 @@ class TranscriptionPipelineTests(unittest.TestCase):
 
     def test_single_video_extracts_soundtrack_with_source_timing_exports_gp_and_resumes(self):
         arguments, video = self.embedded_video_args()
+        tool_directories = {str(Path(pipeline.executable(name)).parent) for name in ("ffmpeg", "ffprobe")}
+        arguments.extend(["--ffmpeg-dir", str(Path(pipeline.executable("ffmpeg")).parent)])
         original_video = sha256(video)
 
         def failed_extract(attempt, state):
@@ -200,11 +202,15 @@ class TranscriptionPipelineTests(unittest.TestCase):
         actual_run = subprocess.run
 
         def dispatch(command, **kwargs):
+            if "align-audio" in command or "--request" in command:
+                for directory in tool_directories:
+                    self.assertIn(directory, kwargs["env"]["PATH"].split(os.pathsep))
             if len(command) > 1 and Path(command[1]).name == "batch_video.py":
                 return self.embedded_video_worker(command, **kwargs)
             return actual_run(command, **kwargs)
 
-        with patch("scripts.transcription_pipeline.subprocess.run", side_effect=dispatch):
+        path_without_tools = os.pathsep.join(value for value in os.environ.get("PATH", "").split(os.pathsep) if value not in tool_directories)
+        with patch.dict(os.environ, PATH=path_without_tools), patch("scripts.transcription_pipeline.subprocess.run", side_effect=dispatch):
             self.assertEqual(transcriber.main(arguments), 0)
         result = read_json(self.output / pipeline.SUMMARY_NAME)
         self.assertEqual(result["status"], "ready")

@@ -300,6 +300,14 @@ def _soundtrack_timeline(options):
             "videoStartSecondsForAudioZero": float(stream["firstDecodedPts"] * Fraction(*stream["timeBase"]))}
 
 
+def _video_environment(options):
+    environment = dict(os.environ, OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1", MKL_NUM_THREADS="1", NUMEXPR_NUM_THREADS="1")
+    directories = list(dict.fromkeys(str(Path(options[name]).parent) for name in ("ffmpeg", "ffprobe") if options.get(name)))
+    if directories:
+        environment["PATH"] = os.pathsep.join([*directories, environment.get("PATH", "")])
+    return environment
+
+
 def _extract_audio(attempt, state):
     import soundfile as sf
     from .transcriber import log_progress
@@ -322,7 +330,7 @@ def _extract_audio(attempt, state):
         if (info.samplerate, info.channels, info.frames) != (timeline["sampleRate"], timeline["channels"], timeline["sampleCount"]):
             raise HarnessError("Extracted audio does not match the source's decoded sample timeline.")
         log_progress("Video soundtrack: binding extracted audio to the original video clock...")
-        environment = dict(os.environ, OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1", MKL_NUM_THREADS="1", NUMEXPR_NUM_THREADS="1")
+        environment = _video_environment(options)
         # The isolated producer only publishes under its own private root and must not download tools.
         video_root = ROOT / "runs" / "video-evidence"
         video_root.mkdir(parents=True, exist_ok=True)
@@ -404,7 +412,7 @@ def _worker(state, output, review_flags=None):
         command.extend(review_flags)
     else:
         command.append("--reset-failed")
-    completed = subprocess.run(command, cwd=ROOT, check=False)
+    completed = subprocess.run(command, cwd=ROOT, env=_video_environment(state["options"]), check=False)
     if completed.returncode and not output.is_file():
         raise HarnessError(f"Video preparation failed with exit code {completed.returncode}. Inspect the worker error; no audio-only substitution was made.")
     result = read_json(regular_path(output))
