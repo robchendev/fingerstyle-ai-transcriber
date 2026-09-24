@@ -20,7 +20,7 @@ Save this example as `runs\batch.json` and replace its file paths and plucking-h
   "handModel": "runs\\video-evidence\\models\\hand_landmarker.task",
   "records": [
     {"id": "pair-a", "groupId": "group-a", "split": "train", "gp": "inputs\\pair-a.gp", "video": "inputs\\pair-a-trimmed.mp4", "pluckingScreenSide": "left", "voiceSupervisionPolicy": "native-multivoice"},
-    {"id": "pair-b", "groupId": "group-b", "split": "validation", "gp": "inputs\\pair-b.gp", "video": "inputs\\pair-b-trimmed.mp4", "pluckingScreenSide": "right", "voiceSupervisionPolicy": "flattened-or-unknown"}
+    {"id": "pair-b", "groupId": "group-b", "split": "validation", "gp": "inputs\\pair-b.gp", "video": "inputs\\pair-b-trimmed.mp4", "pluckingScreenSide": "right", "voiceSupervisionPolicy": "native-multivoice"}
   ]
 }
 ```
@@ -58,12 +58,13 @@ Validation needs usable labels for notes or percussion and at least one supporte
 
 ### Voice supervision and role-biased video
 
-New reviews should declare `--voice-supervision-policy` as
-`native-multivoice`, `intentional-single-voice`, or
-`flattened-or-unknown`. Existing releases without this provenance remain
-readable but default to `flattened-or-unknown`: voice loss is masked while
-onset, string/fret, pitch, duration and other trusted labels remain available.
-No thumb-to-voice label is inferred.
+This corpus contains original author-created GP files, not flattened training
+exports. Existing and new records therefore default to trusted
+`native-multivoice` supervision. Code voice 0 (displayed voice 1) normally
+contains upper/non-thumb material; code voice 1 (displayed voice 2) normally
+contains plucking-thumb bass material. Future imported flattened files may
+explicitly use `flattened-or-unknown`, which masks only voice loss while
+retaining other trusted labels.
 
 Video architecture 5 keeps the schema-4 D194 numeric input unchanged and adds
 separate learnable fretting/plucking feature-group scales. Fretting starts

@@ -176,8 +176,8 @@ class DatasetReleaseTests(unittest.TestCase):
             self.assertEqual(len(dataset), 1)
             item = dataset[0]
             self.assertEqual(item["metadata"]["windowId"], "piece-1:0-48000")
-            self.assertEqual(item["metadata"]["voiceSupervisionPolicy"], "flattened-or-unknown")
-            self.assertFalse(item["masks"]["voice"].any())
+            self.assertEqual(item["metadata"]["voiceSupervisionPolicy"], "native-multivoice")
+            self.assertTrue(item["masks"]["voice"].any())
             self.assertTrue(item["masks"]["note_onset"].any())
             self.assertTrue(item["masks"]["pitch"].any())
             self.assertEqual(before, {path: sha256(path) for path in root.rglob("*") if path.is_file()})

@@ -203,7 +203,7 @@ def preflight(args):
             if first is None:
                 first = item
             counts["windows"] += 1
-            voice_policy = item["metadata"].get("voiceSupervisionPolicy", "flattened-or-unknown")
+            voice_policy = item["metadata"].get("voiceSupervisionPolicy", "native-multivoice")
             counts[f"voice_policy_{voice_policy}"] += 1
             counts["frames"] += len(item["features"])
             counts["collisions_masked"] += item["metadata"]["stringFrameCollisionsMasked"]

@@ -479,7 +479,7 @@ class TrainingDataset(Dataset):
             record = {
                 "data": data, "candidate": payload["candidate"], "row": row, "negativeAllowed": negative_onset_coverage(labels),
                 "percussionAnnotationsComplete": payload["approval"].get("percussionAnnotationsComplete") is True,
-                "voiceSupervisionPolicy": payload["approval"].get("voiceSupervisionPolicy", "flattened-or-unknown"),
+                "voiceSupervisionPolicy": payload["approval"].get("voiceSupervisionPolicy", "native-multivoice"),
             }
             if model_config.architecture_version >= 2:
                 from .score_alignment import ScoreClock
