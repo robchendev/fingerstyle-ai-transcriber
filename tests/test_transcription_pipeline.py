@@ -69,7 +69,11 @@ class TranscriptionPipelineTests(unittest.TestCase):
         identity = {"manifest_sha256": "synthetic-only", "features": asdict(features), "model": asdict(model_config)}
         from scripts.transcriber_video import AudioVideoTranscriber, VideoConfig
 
-        joint = AudioVideoTranscriber(deepcopy(model), VideoConfig(hidden_size=8))
+        joint = AudioVideoTranscriber(deepcopy(model), VideoConfig(
+            hidden_size=8, structured_dim=194, input_schema_version=4,
+            architecture_version=5,
+            feature_group_version="anatomy-representation-groups-v1",
+        ))
         with patch("sys.stdout", new=StringIO()):
             result = run_training(model, *loaders, TrainingConfig(epochs=1, max_steps=1, device="cpu", learning_rate=1e-5),
                                   cls.fixture_root / "toy-checkpoint", identity)

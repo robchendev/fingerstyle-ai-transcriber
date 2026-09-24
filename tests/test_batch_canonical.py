@@ -123,7 +123,7 @@ class BatchCanonicalTests(unittest.TestCase):
         from scripts.dataset_io import publish_json
         from scripts.paired_preparation import batch_status, finalize_batch, review_batch, run_batch
         from tests.test_local_media import make_video
-        from tests.test_paired_video import bundle_fixture
+        from tests.test_paired_video import schema5_bundle_fixture
 
         for index, record in enumerate(self.batch["records"]):
             score = fresh_score(record["id"], index * 2)
@@ -133,9 +133,13 @@ class BatchCanonicalTests(unittest.TestCase):
             make_video(video, Path(record.pop("audio")), duration=19)
             record.update(video=str(video), pluckingScreenSide="left")
         manifest = self.root / "batch.json"
+        fretboard_model = self.root / "models" / "fretboard.pt"
+        fretboard_model.parent.mkdir(parents=True, exist_ok=True)
+        fretboard_model.write_bytes(b"synthetic fretboard detector")
         document = {
             **self.batch, "schemaVersion": 1, "kind": "paired-preparation-batch",
             "handModel": "models\\hand_landmarker.task", "videoPython": sys.executable,
+            "fretboardModel": str(fretboard_model),
         }
         publish_json(manifest, document)
         output = self.root / "runs" / "video-evidence" / "batches" / "fresh"
@@ -157,10 +161,10 @@ class BatchCanonicalTests(unittest.TestCase):
             self.assertEqual(receipt["stream"]["firstDecodedPts"], 1250)
             self.assertEqual(receipt["stream"]["timeBase"], [1, 1000])
             self.assertIsNone(request["poseModel"])
-            self.assertEqual(set(request), {"schemaVersion", "kind", "id", "video", "audio", "outputDirectory", "pluckingScreenSide", "reuse", "handModel", "poseModel", "reviewMode"})
+            self.assertEqual(set(request), {"schemaVersion", "kind", "id", "video", "audio", "outputDirectory", "pluckingScreenSide", "reuse", "handModel", "poseModel", "fretboardModel", "reviewMode"})
             bundle = bundles / request["id"] / "inputs.json"
             if not bundle.exists():
-                bundle, report, arrays = bundle_fixture(bundles, Path(request["audio"]), request["id"], pts=range(1650, 17250, 40))
+                bundle, report, arrays = schema5_bundle_fixture(bundles, Path(request["audio"]), request["id"], pts=range(1650, 17250, 40))
                 report["inputPaths"]["video"] = request["video"]
                 alignment = Path(report["inputPaths"]["alignment"])
                 value = read_json(alignment)
@@ -171,7 +175,13 @@ class BatchCanonicalTests(unittest.TestCase):
                 arrays["structured_available"][..., :98] = False
                 np.savez_compressed(bundle.with_name("inputs.npz"), **arrays)
                 report.update(videoSha256=sha256(request["video"]), arraysSha256=sha256(bundle.with_name("inputs.npz")))
+                fretboard = Path(report["inputPaths"]["fretboard"])
+                fretboard_report = read_json(fretboard)
+                fretboard_report["videoSha256"] = sha256(request["video"])
+                fretboard_report["shotsSha256"] = report["inputSha256"]["shots"]
+                publish_json(fretboard, fretboard_report)
                 report["inputSha256"].update(video=sha256(request["video"]), alignment=sha256(alignment))
+                report["inputSha256"]["fretboard"] = sha256(fretboard)
                 report["clock"]["offsetSamples"] = -10000
                 publish_json(bundle, report)
             publish_json(command[command.index("--output") + 1], {
@@ -199,7 +209,7 @@ class BatchCanonicalTests(unittest.TestCase):
         self.assertEqual(ready["status"], "ready")
         self.assertEqual(ready["indexPath"], repeated["indexPath"])
         self.assertFalse(ready["trainingPerformed"])
-        self.assertEqual(read_json(ready["indexPath"])["schemaVersion"], 4)
+        self.assertEqual(read_json(ready["indexPath"])["schemaVersion"], 5)
         self.assertTrue(all({"gp", "video", "audio", "audioOrigin"} == set(row) for row in ready["identity"]["sources"].values()))
         for values in ready["coverage"]["splits"].values():
             self.assertEqual(values["visualCoverage"]["framesWithGuitarGeometry"], 0)
@@ -216,7 +226,7 @@ class BatchCanonicalTests(unittest.TestCase):
 
         transcriber("config", "--manifest", frozen["manifestPath"], "--video-index", ready["indexPath"], "--output", config_path)
         config = read_json(config_path)
-        self.assertEqual(config["video"]["model"]["structured_dim"], 194)
+        self.assertEqual(config["video"]["model"]["structured_dim"], 233)
         self.assertNotIn("freeze_audio", config["video"]["model"])
         config["data"].update(manifest=frozen["manifestPath"], batch_size=1, num_threads=1)
         config["features"].update(sample_rate=8000, n_fft=512, hop_length=160, n_mels=16, f_max=3000)

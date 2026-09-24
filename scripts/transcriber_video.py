@@ -100,8 +100,9 @@ ROLE_FEATURE_GROUP_INDICES = _feature_group_indices(6)
 class _RoleFeatureGates(nn.Module):
     def __init__(self, initial_scales, architecture_version):
         super().__init__()
+        expected_count = len(ROLE_FEATURE_GROUPS) if architecture_version == 6 else 8
         if (
-            len(initial_scales) != len(ROLE_FEATURE_GROUPS)
+            len(initial_scales) != expected_count
             or any(not isinstance(value, (int, float)) or value <= 0 for value in initial_scales)
         ):
             raise ValueError("Role feature gate scales must be positive and cover every feature group.")

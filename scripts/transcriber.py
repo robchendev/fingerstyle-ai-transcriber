@@ -149,12 +149,25 @@ def run_identity(dataset, config, features, model, training, device):
     return result
 
 
-def video_model_config(values):
+def video_model_config(values, *, allow_legacy=False):
     from .transcriber_video import VideoConfig
     from .fretboard_features import SCHEMA_VERSION, STRUCTURED_DIM
 
-    if not isinstance(values, dict) or values.keys() - {field.name for field in fields(VideoConfig)}:
+    if not isinstance(values, dict):
+        raise HarnessError("Video model configuration must be an object.")
+    values = dict(values)
+    if values.keys() - {field.name for field in fields(VideoConfig)}:
         raise HarnessError("Unknown video model configuration fields. Only numeric landmark/motion/geometry inputs are supported, not RGB checkpoints.")
+    if allow_legacy and values.get("architecture_version") in (4, 5):
+        values.setdefault(
+            "feature_group_version",
+            None if values["architecture_version"] == 4 else "anatomy-representation-groups-v1",
+        )
+        values.setdefault("experiment_mode", "geometry")
+        try:
+            return VideoConfig(**values)
+        except (TypeError, ValueError) as error:
+            raise HarnessError(f"Invalid legacy inference video configuration: {error}") from error
     if values.get("architecture_version") != 6 or values.get("input_schema_version") != 5:
         raise HarnessError("Paired models require explicit joint video architecture_version 6 and input_schema_version 5; historical, frozen or unversioned paired configurations cannot be resumed or reinterpreted.")
     if values.get("structured_dim") != STRUCTURED_DIM:
@@ -476,6 +489,7 @@ def checkpoint_model(path, device_name, *, allow_inference=True):
         video_values = dict(identity["video"]["config"])
         if video_values.get("architecture_version") == 4:
             video_values.setdefault("feature_group_version", None)
+        video_values.setdefault("experiment_mode", "geometry")
         model = AudioVideoTranscriber(model, VideoConfig(**video_values))
     model.load_state_dict(checkpoint["model_state"], strict=True)
     device = resolve_device(device_name)

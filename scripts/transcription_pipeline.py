@@ -484,7 +484,7 @@ def _checkpoint(path, *, require_video):
     if require_video and "video" not in identity:
         raise HarnessError("--video requires a paired-trained joint checkpoint. Historical audio-only checkpoints cannot consume video.")
     if "video" in identity:
-        video_model_config(identity["video"]["config"])
+        video_model_config(identity["video"]["config"], allow_legacy=True)
     if checkpoint.get("format") != INFERENCE_FORMAT:
         if checkpoint["global_step"] <= 0:
             raise HarnessError("Transcription requires a trained checkpoint, not random initialization.")

@@ -398,17 +398,28 @@ def _validate_loader_signature(signature):
 def _joint_video_config(identity):
     from .transcriber_video import VideoConfig
     from .fretboard_features import SCHEMA_VERSION as VIDEO_SCHEMA_VERSION, STRUCTURED_DIM
+    from .video_features import SCHEMA_VERSION as LEGACY_VIDEO_SCHEMA_VERSION, STRUCTURED_DIM as LEGACY_STRUCTURED_DIM
 
     video = identity.get("video")
     if not isinstance(video, dict) or not isinstance(video.get("config"), dict):
         raise ValueError("Invalid joint checkpoint video configuration")
     values = video["config"]
-    if "image_size" in values or values.get("input_schema_version") != VIDEO_SCHEMA_VERSION:
-        raise ValueError("Historical or unversioned paired checkpoints are unsupported; expected numeric video input schema 4. Repackage cached observations into new bundles; do not reinterpret old checkpoints.")
-    if "freeze_audio" in values or values.get("architecture_version") != 6:
-        raise ValueError("Frozen, historical or unversioned paired checkpoints are unsupported; expected joint video architecture_version 6")
-    if values.get("structured_dim") != STRUCTURED_DIM:
-        raise ValueError("Historical paired checkpoints are unsupported; expected four-view 233D fretboard-aware inputs")
+    architecture = values.get("architecture_version")
+    contract = (
+        (VIDEO_SCHEMA_VERSION, STRUCTURED_DIM, "anatomy-fretboard-groups-v2")
+        if architecture == 6
+        else (LEGACY_VIDEO_SCHEMA_VERSION, LEGACY_STRUCTURED_DIM, "anatomy-representation-groups-v1")
+        if architecture == 5
+        else None
+    )
+    if "image_size" in values or "freeze_audio" in values or contract is None:
+        raise ValueError("Historical, frozen, RGB, or unversioned paired checkpoints are unsupported")
+    if (
+        values.get("input_schema_version") != contract[0]
+        or values.get("structured_dim") != contract[1]
+        or values.get("feature_group_version") != contract[2]
+    ):
+        raise ValueError("Mismatched paired checkpoints are unsupported; architecture and numeric input contract disagree")
     _keys(values, asdict(VideoConfig()), "joint video model configuration")
     initialization = identity.get("initialization")
     if initialization is not None and initialization != {
@@ -645,6 +656,8 @@ def _validate_inference_checkpoint(payload):
             values["feature_group_version"] = None
         if key == "video_config" and values.get("architecture_version") == 5 and "feature_group_version" not in values:
             values["feature_group_version"] = "anatomy-representation-groups-v1"
+        if key == "video_config" and "experiment_mode" not in values:
+            values["experiment_mode"] = "geometry"
         _keys(values, {field.name for field in fields(cls)}, key)
         try:
             configs[key] = cls(**values)
