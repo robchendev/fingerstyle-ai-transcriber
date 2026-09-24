@@ -56,6 +56,41 @@ Set the device, thread count, batch size and number of epochs in the generated c
 
 Validation needs usable labels for notes or percussion and at least one supported technique, such as a bend, hammer-on, slide or grace note. Training cannot select its best model from notes-only validation data, even if `preflight` passes.
 
+## Label a fretboard detector
+
+The local annotation UI samples source frames without resizing them. Its six
+ordered points are the outer sixth- and first-string positions at the nut,
+twelfth fret and bridge. A reviewed frame may mark any point unavailable when
+it is outside the shot; do not estimate hidden bridge or nut positions.
+
+Create a gitignored dataset from explicit videos or a directory tree:
+
+```powershell
+.\scripts\video-evidence\.venv\Scripts\python.exe -m scripts.fretboard_annotation init --video-directory runs\video-evidence\sources --frames-per-video 5 --output data\fretboard-keypoints
+```
+
+Start the localhost-only browser UI. It autosaves each edit and resumes the
+same dataset:
+
+```powershell
+.\scripts\video-evidence\.venv\Scripts\python.exe -m scripts.fretboard_annotation serve --dataset data\fretboard-keypoints
+```
+
+Use the mouse wheel to zoom, middle/right drag to pan, keys `1` through `6` to
+select a point, `Q`/`W`/`E` for available/occluded/unavailable status, and
+Enter to complete and advance. `Complete` means the frame was fully reviewed,
+not that all six landmarks are visible.
+
+Export completed annotations to YOLO pose labels and `data.yaml`:
+
+```powershell
+.\scripts\video-evidence\.venv\Scripts\python.exe -m scripts.fretboard_annotation export --dataset data\fretboard-keypoints
+```
+
+Images retain their native resolution and labels use normalized coordinates.
+The eventual training `imgsz` is a separate model-training choice; native 4K
+sources may be trained at 4K or downscaled without relabeling.
+
 Alternatively, `python -m scripts.prepare_training_data batch-train --manifest runs\batch.json --output-directory runs\video-evidence\batches\dataset-v1 --epochs 20 --device cpu --cpu-threads 4` prepares data and trains the audio/video model, pausing when review is needed. Rerunning the same command resumes training or reuses a completed result.
 
 For audio-only training, use `python -m scripts.prepare_training_data` with `init`, `add --id ID --group GROUP --gp FILE --audio FILE`, `prepare --accept-conventions`, and `review`. Create the dataset with `release --version dataset-v1 --validation-group GROUP --reviewer reviewer --authorize-release`. Then run `python -m scripts.transcriber config --manifest data\releases\dataset-v1\manifest.json --output runs\audio-config.json` without `--video-index`, and use the same preflight/train commands with that configuration.
