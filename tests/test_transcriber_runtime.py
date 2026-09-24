@@ -197,6 +197,37 @@ def toy_model(seed=43):
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_plucking_thumb_voice_metric_uses_reliable_motion_and_string_proximity(self):
+        counts = {
+            name: {"count": 0, "correct": 0}
+            for name in ("plucking_thumb_voice", "plucking_thumb_voice:0", "plucking_thumb_voice:1")
+        }
+        structured = torch.zeros(1, 1, 4, 233)
+        available = torch.zeros_like(structured, dtype=torch.bool)
+        structured[0, 0, 1, 195] = 0
+        structured[0, 0, 1, 219] = .3
+        structured[0, 0, 1, 229] = .8
+        available[0, 0, 1, [194, 195, 219, 220, 229, 230]] = True
+        outputs = {"voice_logits": torch.zeros(1, 1, 6, 4)}
+        outputs["voice_logits"][0, 0, 0, 1] = 2
+        targets = torch.zeros(1, 1, 6, dtype=torch.long)
+        targets[0, 0, 0] = 1
+        masks = torch.zeros(1, 1, 6, dtype=torch.bool)
+        masks[0, 0, 0] = True
+        batch = {
+            "targets": {"voice": targets}, "masks": {"voice": masks},
+            "video": {
+                "structured": structured,
+                "structured_available": available,
+                "frame_indices": torch.zeros(1, 1, dtype=torch.long),
+            },
+        }
+        runtime._plucking_thumb_voice_counts(outputs, batch, counts)
+        self.assertEqual(counts["plucking_thumb_voice"]["count"], 1)
+        self.assertEqual(counts["plucking_thumb_voice"]["correct"], 1)
+        self.assertEqual(counts["plucking_thumb_voice:0"]["count"], 0)
+        self.assertEqual(counts["plucking_thumb_voice:1"]["count"], 1)
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory(
             prefix=".synthetic-runtime-tests-", dir=Path(__file__).resolve().parents[1],

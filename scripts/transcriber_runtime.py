@@ -1112,6 +1112,41 @@ def _emit(progress, message):
         progress(message)
 
 
+def _plucking_thumb_voice_counts(outputs, batch, counts):
+    video = batch.get("video")
+    if video is None or video["structured"].shape[-1] < 233 or "voice" not in batch["masks"]:
+        return
+    indices = video["frame_indices"]
+    mapped = indices >= 0
+    safe = indices.clamp_min(0)
+    structured = video["structured"][:, :, 1]
+    available = video["structured_available"][:, :, 1]
+    gather_values = safe[:, :, None].expand(-1, -1, structured.shape[-1])
+    values = structured.gather(1, gather_values)
+    masks = available.gather(1, gather_values)
+    thumb_string = values[:, :, 195]
+    thumb_motion = values[:, :, 219:221]
+    reliable = (
+        mapped
+        & masks[:, :, 194:196].all(-1)
+        & masks[:, :, 219:221].all(-1)
+        & masks[:, :, 229:231].all(-1)
+        & (values[:, :, 229] >= .5)
+        & (values[:, :, 230] <= .5)
+        & (thumb_motion.norm(dim=-1) >= .25)
+    )
+    predictions = outputs["voice_logits"].argmax(-1)
+    targets = batch["targets"]["voice"]
+    voice_masks = batch["masks"]["voice"]
+    for string in range(6):
+        selected = reliable & voice_masks[:, :, string] & ((thumb_string - string).abs() <= .75)
+        for name, target_voice in (("plucking_thumb_voice", None), ("plucking_thumb_voice:0", 0), ("plucking_thumb_voice:1", 1)):
+            subset = selected if target_voice is None else selected & (targets[:, :, string] == target_voice)
+            count = int(subset.sum().item())
+            counts[name]["count"] += count
+            counts[name]["correct"] += int(((predictions[:, :, string] == targets[:, :, string]) & subset).sum().item())
+
+
 def _progress_due(completed, total, now, last_log):
     return completed == 1 or completed == total or completed % 10 == 0 or now - last_log >= 5
 
@@ -1134,6 +1169,7 @@ def evaluate_model(model, loader, device, *, sparsity_weight=0.02, progress=None
         + tuple(f"connection:{name}" for name in CONNECTION_TYPES)
         + tuple(f"note_technique:{name}" for name in V4_NOTE_TECHNIQUE_TYPES)
         + ("grace", "grace_fret", "grace_mode", "grace_transition")
+        + ("plucking_thumb_voice", "plucking_thumb_voice:0", "plucking_thumb_voice:1")
         + tuple(f"calibration:{name}:{threshold}" for name in _CALIBRATION_TASKS for threshold in _CALIBRATION_THRESHOLDS)
     }
     batches = frames = windows = 0
@@ -1152,6 +1188,7 @@ def evaluate_model(model, loader, device, *, sparsity_weight=0.02, progress=None
                     total["sum"] += value["sum"]
                     total["count"] += value["count"]
                 _metric_counts(outputs, batch, counts)
+                _plucking_thumb_voice_counts(outputs, batch, counts)
                 batches += 1
                 frames += int(batch["valid_frames"].sum().item())
                 windows += batch["features"].shape[0]
@@ -1170,9 +1207,23 @@ def evaluate_model(model, loader, device, *, sparsity_weight=0.02, progress=None
     loss = _objective(totals, weights, sparsity_weight)
     loss_text = f"{loss:.6f}" if loss is not None else "unavailable (no supervised labels)"
     _emit(progress, f"{phase}: finished | loss {loss_text} | {windows} windows | elapsed {format_duration(time.perf_counter() - started)}")
+    metrics = _metrics(counts)
+    metrics["plucking_thumb_voice_accuracy"] = {
+        name: {
+            "available": bool(counts[key]["count"]),
+            "count": counts[key]["count"],
+            "correct": counts[key]["correct"],
+            "accuracy": _divide(counts[key]["correct"], counts[key]["count"]),
+        }
+        for name, key in (
+            ("all", "plucking_thumb_voice"),
+            ("codeVoice0DisplayedVoice1", "plucking_thumb_voice:0"),
+            ("codeVoice1DisplayedVoice2", "plucking_thumb_voice:1"),
+        )
+    }
     return _json_copy({
         "loss": loss, "available": loss is not None, "batches": batches, "valid_frames": frames, "windows": windows,
-        "loss_statistics": totals, **_metrics(counts),
+        "loss_statistics": totals, **metrics,
     })
 
 
