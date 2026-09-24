@@ -3,12 +3,16 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
+import numpy as np
+
 from scripts.fretboard_annotation import (
     HTML,
     KEYPOINTS,
     export_yolo,
     normalize_annotation,
     normalize_preferences,
+    _candidate_times,
+    select_diverse_candidates,
     validate_geometry,
 )
 
@@ -96,6 +100,47 @@ class FretboardAnnotationTests(unittest.TestCase):
         ):
             with self.assertRaises(ValueError):
                 normalize_preferences(changed)
+
+    def test_diversity_selection_groups_sources_and_avoids_duplicates(self):
+        candidates = []
+        for video, offset in (("a", 0.), ("b", .4)):
+            for index in range(4):
+                feature = np.zeros(8, np.float32)
+                feature[index + (0 if video == "a" else 4)] = 1
+                candidates.append({
+                    "id": f"{video}-{index}", "videoSha256": video,
+                    "seconds": float(index), "feature": feature,
+                    "quality": 1 - offset / 2,
+                })
+        selected = select_diverse_candidates(
+            candidates, 6, minimum_per_video=1, maximum_per_video=3,
+        )
+        self.assertEqual(len(selected), 6)
+        self.assertEqual({row["videoSha256"] for row in selected}, {"a", "b"})
+        self.assertEqual(
+            {video: sum(row["videoSha256"] == video for row in selected) for video in ("a", "b")},
+            {"a": 3, "b": 3},
+        )
+        self.assertEqual(len({row["id"] for row in selected}), len(selected))
+
+    def test_candidate_times_use_matching_shot_midpoints(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "shots.json").write_text(json.dumps({
+                "videoSha256": "a" * 64,
+                "timeBase": [1, 1000],
+                "shots": [
+                    {"startPts": 0, "endPtsExclusive": 1000},
+                    {"startPts": 1000, "endPtsExclusive": 3000},
+                ],
+            }))
+            self.assertEqual(
+                _candidate_times("a" * 64, 10., 4, root),
+                [.5, 2.],
+            )
+            fallback = _candidate_times("b" * 64, 10., 2, root)
+            self.assertEqual(len(fallback), 2)
+            self.assertTrue(all(0 < value < 10 for value in fallback))
 
     def test_six_point_contract_normalizes_complete_geometry(self):
         value = normalize_annotation(annotation())

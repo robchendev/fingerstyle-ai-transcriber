@@ -14,6 +14,7 @@ import threading
 import webbrowser
 
 import cv2
+import numpy as np
 
 
 KEYPOINTS = (
@@ -57,6 +58,207 @@ def _videos(paths, directory):
     if not values or any(not path.is_file() for path in values):
         raise ValueError("Supply at least one existing video.")
     return values
+
+
+def _frame_feature(frame):
+    small = cv2.resize(frame, (160, 90), interpolation=cv2.INTER_AREA)
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+    histogram = cv2.calcHist([hsv], [0, 1], None, [8, 4], [0, 180, 0, 256]).ravel()
+    histogram /= max(float(histogram.sum()), 1.)
+    appearance = cv2.resize(gray, (16, 9), interpolation=cv2.INTER_AREA).astype(np.float32).ravel() / 255
+    feature = np.concatenate((histogram.astype(np.float32), appearance))
+    feature /= max(float(np.linalg.norm(feature)), 1e-8)
+    return feature, float(cv2.Laplacian(gray, cv2.CV_32F).var()), float(gray.mean())
+
+
+def select_diverse_candidates(candidates, target, *, minimum_per_video=1, maximum_per_video=12):
+    if type(target) is not int or target < 1:
+        raise ValueError("target must be a positive integer.")
+    if type(minimum_per_video) is not int or type(maximum_per_video) is not int or not 1 <= minimum_per_video <= maximum_per_video:
+        raise ValueError("Invalid per-video selection bounds.")
+    if not candidates:
+        raise ValueError("No usable frame candidates were found.")
+    by_video = {}
+    for candidate in candidates:
+        feature = np.asarray(candidate["feature"], dtype=np.float32)
+        if feature.ndim != 1 or not np.isfinite(feature).all():
+            raise ValueError("Candidate features must be finite vectors.")
+        by_video.setdefault(candidate["videoSha256"], []).append(candidate)
+    target = min(target, len(candidates))
+    selected = []
+    counts = {key: 0 for key in by_video}
+    for digest, rows in sorted(by_video.items()):
+        ordered = sorted(rows, key=lambda row: (-row["quality"], row["seconds"]))
+        for row in ordered[:minimum_per_video]:
+            selected.append({**row, "selectionReason": "per-video-representative"})
+            counts[digest] += 1
+            if len(selected) == target:
+                return selected
+    selected_ids = {row["id"] for row in selected}
+    while len(selected) < target:
+        best = None
+        for candidate in candidates:
+            digest = candidate["videoSha256"]
+            if candidate["id"] in selected_ids or counts[digest] >= maximum_per_video:
+                continue
+            distance = min(
+                1 - float(np.dot(candidate["feature"], chosen["feature"]))
+                for chosen in selected
+            )
+            score = distance + .05 * candidate["quality"]
+            key = score, candidate["quality"], candidate["id"]
+            if best is None or key > best[0]:
+                best = key, candidate
+        if best is None:
+            break
+        row = {**best[1], "selectionReason": "visual-diversity"}
+        selected.append(row)
+        selected_ids.add(row["id"])
+        counts[row["videoSha256"]] += 1
+    return selected
+
+
+def _candidate_times(video_digest, duration, count, shots_directory):
+    if shots_directory is not None:
+        for path in sorted(Path(shots_directory).rglob("shots.json")):
+            try:
+                document = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if document.get("videoSha256") != video_digest:
+                continue
+            rows = document.get("shots")
+            time_base = document.get("timeBase")
+            if (
+                isinstance(rows, list) and rows
+                and isinstance(time_base, list) and len(time_base) == 2
+                and all(type(value) is int and value > 0 for value in time_base)
+            ):
+                scale = time_base[0] / time_base[1]
+                values = [
+                    (row["startPts"] + row["endPtsExclusive"]) * scale / 2
+                    for row in rows
+                    if isinstance(row, dict)
+                    and type(row.get("startPts")) is int
+                    and type(row.get("endPtsExclusive")) is int
+                    and row["startPts"] < row["endPtsExclusive"]
+                ]
+                if values:
+                    if len(values) <= count:
+                        return values
+                    indices = np.linspace(0, len(values) - 1, count).round().astype(int)
+                    return [values[index] for index in indices]
+    return [
+        duration * (.01 + .98 * (ordinal + .5) / count)
+        for ordinal in range(count)
+    ]
+
+
+def select_dataset(output, videos, *, target_frames=1000, candidates_per_video=24,
+                   minimum_per_video=1, maximum_per_video=12, jpeg_quality=95,
+                   shots_directory=None):
+    output = Path(output).resolve()
+    if output.exists():
+        raise ValueError(f"Refusing to overwrite annotation dataset: {output}")
+    if type(candidates_per_video) is not int or candidates_per_video < 2:
+        raise ValueError("candidates_per_video must be an integer >= 2.")
+    candidates = []
+    for video in videos:
+        digest = _sha256(video)
+        capture = cv2.VideoCapture(str(video))
+        if not capture.isOpened():
+            raise ValueError(f"Could not open video: {video}")
+        try:
+            fps = float(capture.get(cv2.CAP_PROP_FPS))
+            frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+            if not math.isfinite(fps) or fps <= 0 or frame_count <= 0:
+                raise ValueError(f"Video has no reliable duration: {video}")
+            duration = frame_count / fps
+            times = _candidate_times(digest, duration, candidates_per_video, shots_directory)
+            for ordinal, seconds in enumerate(times):
+                capture.set(cv2.CAP_PROP_POS_MSEC, seconds * 1000)
+                ok, frame = capture.read()
+                if not ok:
+                    continue
+                feature, sharpness, brightness = _frame_feature(frame)
+                if sharpness < 8 or not 8 <= brightness <= 247:
+                    continue
+                quality = min(1., sharpness / 250) * min(1., brightness / 50, (255 - brightness) / 50)
+                candidates.append({
+                    "id": f"{digest[:12]}-{ordinal:04d}",
+                    "video": video,
+                    "videoSha256": digest,
+                    "seconds": seconds,
+                    "width": int(frame.shape[1]),
+                    "height": int(frame.shape[0]),
+                    "feature": feature,
+                    "quality": quality,
+                })
+        finally:
+            capture.release()
+    selected = select_diverse_candidates(
+        candidates, target_frames,
+        minimum_per_video=minimum_per_video,
+        maximum_per_video=maximum_per_video,
+    )
+    output.mkdir(parents=True)
+    try:
+        records = []
+        captures = {}
+        try:
+            for row in selected:
+                video = row["video"]
+                capture = captures.setdefault(video, cv2.VideoCapture(str(video)))
+                capture.set(cv2.CAP_PROP_POS_MSEC, row["seconds"] * 1000)
+                ok, frame = capture.read()
+                if not ok:
+                    raise ValueError(f"Could not decode selected frame: {video} at {row['seconds']:.3f}s.")
+                split = _split(row["videoSha256"])
+                relative = Path("images") / split / f"{row['id']}.jpg"
+                destination = output / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                if not cv2.imwrite(str(destination), frame, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality]):
+                    raise OSError(f"Could not save selected frame: {destination}")
+                records.append({
+                    "id": row["id"], "split": split, "image": relative.as_posix(),
+                    "width": row["width"], "height": row["height"],
+                    "sourceVideo": str(video), "sourceVideoSha256": row["videoSha256"],
+                    "sourceSeconds": row["seconds"], "selectionReason": row["selectionReason"],
+                    "selectionQuality": row["quality"],
+                })
+        finally:
+            for capture in captures.values():
+                capture.release()
+        manifest = {
+            "schemaVersion": SCHEMA_VERSION,
+            "kind": "fretboard-keypoint-annotation-dataset",
+            "keypoints": list(KEYPOINTS),
+            "coordinateSpace": "normalized_full_frame",
+            "nativeResolutionPreserved": True,
+            "selection": {
+                "method": "global-farthest-cosine-v1",
+                "targetFrames": target_frames,
+                "candidatesPerVideo": candidates_per_video,
+                "minimumPerVideo": minimum_per_video,
+                "maximumPerVideo": maximum_per_video,
+                "shotReports": shots_directory is not None,
+            },
+            "records": records,
+        }
+        _publish(output / "manifest.json", manifest)
+        _publish(output / "annotations.json", {
+            "schemaVersion": SCHEMA_VERSION, "kind": "fretboard-keypoint-annotations",
+            "keypoints": list(KEYPOINTS), "items": {},
+        })
+        _publish(output / "preferences.json", {
+            "schemaVersion": SCHEMA_VERSION, "kind": "fretboard-annotation-preferences",
+            "overlayOpacity": 1., "captureArrowKeys": True, "dotRadius": 6.,
+        })
+        return manifest
+    except Exception:
+        shutil.rmtree(output, ignore_errors=True)
+        raise
 
 
 def initialize_dataset(output, videos, *, frames_per_video=5, jpeg_quality=95):
@@ -472,6 +674,16 @@ def parser():
     initialize.add_argument("--video-directory")
     initialize.add_argument("--frames-per-video", type=int, default=5)
     initialize.add_argument("--jpeg-quality", type=int, default=95)
+    selection = commands.add_parser("select")
+    selection.add_argument("--output", required=True)
+    selection.add_argument("--video", action="append", default=[])
+    selection.add_argument("--video-directory")
+    selection.add_argument("--target-frames", type=int, default=1000)
+    selection.add_argument("--candidates-per-video", type=int, default=24)
+    selection.add_argument("--minimum-per-video", type=int, default=1)
+    selection.add_argument("--maximum-per-video", type=int, default=12)
+    selection.add_argument("--jpeg-quality", type=int, default=95)
+    selection.add_argument("--shots-directory")
     ui = commands.add_parser("serve")
     ui.add_argument("--dataset", required=True)
     ui.add_argument("--port", type=int, default=8765)
@@ -489,6 +701,17 @@ def main(argv=None):
             _videos(args.video, args.video_directory),
             frames_per_video=args.frames_per_video,
             jpeg_quality=args.jpeg_quality,
+        )
+        print(json.dumps({"frames": len(manifest["records"]), "output": str(Path(args.output).resolve())}))
+    elif args.command == "select":
+        manifest = select_dataset(
+            args.output, _videos(args.video, args.video_directory),
+            target_frames=args.target_frames,
+            candidates_per_video=args.candidates_per_video,
+            minimum_per_video=args.minimum_per_video,
+            maximum_per_video=args.maximum_per_video,
+            jpeg_quality=args.jpeg_quality,
+            shots_directory=args.shots_directory,
         )
         print(json.dumps({"frames": len(manifest["records"]), "output": str(Path(args.output).resolve())}))
     elif args.command == "serve":
