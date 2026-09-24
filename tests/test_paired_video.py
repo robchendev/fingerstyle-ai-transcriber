@@ -20,6 +20,10 @@ from scripts.transcriber_audio import FeatureConfig, HarnessError
 from scripts.transcriber_data import PAIRED_TECHNIQUE_TARGET_POLICY, TrainingDataset, collate_windows
 from scripts.transcriber_model import ModelConfig
 from scripts.video_features import VELOCITY_SLICES, VIEW_ORDER
+from scripts.fretboard_features import (
+    FEATURE_LAYOUT as FRETBOARD_FEATURE_LAYOUT,
+    INPUT_REPRESENTATION as FRETBOARD_INPUT_REPRESENTATION,
+)
 from tests.test_dataset_release import synthetic_release
 
 
@@ -71,6 +75,57 @@ def bundle_fixture(root, audio_path, identifier="piece-0", pts=(1000, 1040, 1080
     path = directory / "inputs.json"
     path.write_text(json.dumps(report))
     return path, report, arrays
+
+
+def schema5_bundle_fixture(root, audio_path, identifier="piece-0", pts=(1000, 1040, 1080, 1120)):
+    path, report, arrays = bundle_fixture(root, audio_path, identifier, pts)
+    directory = path.parent
+    fretboard_arrays = directory / "fretboard.npz"
+    count = len(arrays["pts"])
+    np.savez_compressed(
+        fretboard_arrays,
+        pts=arrays["pts"], shot_id=np.zeros(count, np.int32),
+        keypoints=np.tile(np.array([
+            [[.2, .3], [.2, .5]], [[.5, .3], [.5, .5]], [[.8, .3], [.8, .5]],
+        ], np.float32), (count, 1, 1, 1)),
+        available=np.ones((count, 3, 2), bool),
+        confidence=np.full(count, .9, np.float32),
+        source=np.full(count, 2, np.int8),
+        age_seconds=np.zeros(count, np.float32),
+        flow_error=np.zeros(count, np.float32),
+        detector_anchor=np.zeros(count, bool),
+    )
+    fretboard_report = directory / "fretboard.json"
+    fretboard_report.write_text(json.dumps({
+        "kind": "six-point-fretboard-observations", "schemaVersion": 1,
+        "videoSha256": report["videoSha256"], "shotsSha256": report["inputSha256"]["shots"],
+        "timeBase": report["timeBase"], "frameCount": count, "arrays": "fretboard.npz",
+        "sourceEncoding": {"unavailable": 0, "detector": 1, "optical_flow": 2},
+        "arraysSha256": sha256(fretboard_arrays),
+    }))
+    report["schemaVersion"] = 5
+    report["inputRepresentation"] = FRETBOARD_INPUT_REPRESENTATION
+    report["featureDimension"] = 233
+    report["featureLayout"] = deepcopy(FRETBOARD_FEATURE_LAYOUT)
+    report["inputPaths"].update(
+        fretboard=str(fretboard_report), fretboardArrays=str(fretboard_arrays),
+    )
+    report["inputSha256"].update(
+        fretboard=sha256(fretboard_report), fretboardArrays=sha256(fretboard_arrays),
+    )
+    extended = {
+        **arrays,
+        "structured": np.zeros((*arrays["structured"].shape[:-1], 233), np.float32),
+        "structured_available": np.zeros((*arrays["structured_available"].shape[:-1], 233), bool),
+    }
+    extended["structured"][..., :194] = arrays["structured"]
+    extended["structured_available"][..., :194] = arrays["structured_available"]
+    extended["structured"][:, :2, 229] = .9
+    extended["structured_available"][:, :2, 229:233] = True
+    np.savez_compressed(path.with_name("inputs.npz"), **extended)
+    report["arraysSha256"] = sha256(path.with_name("inputs.npz"))
+    path.write_text(json.dumps(report))
+    return path, report, extended
 
 
 
@@ -173,6 +228,45 @@ class PairedVideoTests(unittest.TestCase):
         with self.assertRaisesRegex(HarnessError, "Unknown"):
             index.window("not-in-release", [1.])
         self.assertEqual(index.window("piece-0", [4.])["frame_indices"].tolist(), [-1])
+
+    def test_schema_four_and_five_load_distinctly_and_preserve_index_dimension(self):
+        legacy = self.load()
+        v5_path, report, arrays = schema5_bundle_fixture(
+            self.root, self.audio, "piece-v5", pts=(1000, 1040, 1080, 1120),
+        )
+        report["id"] = "piece-0"
+        v5_path.write_text(json.dumps(report))
+        v5 = load_inference_video(v5_path, sha256(self.audio))
+        self.assertEqual((legacy.schema_version, legacy.feature_dimension), (4, 194))
+        self.assertEqual((v5.schema_version, v5.feature_dimension), (5, 233))
+        self.assertEqual(legacy.window([1.])["structured"].shape[-1], 194)
+        self.assertEqual(v5.window([1.])["structured"].shape[-1], 233)
+        np.testing.assert_array_equal(v5.arrays["structured"][..., :194], arrays["structured"][..., :194])
+
+        v5_index, _ = build_index(self.manifest, [v5_path], self.root / "v5-index.json", root=self.root)
+        index = PairedVideoIndex(v5_index, sha256(self.manifest), self.records, root=self.root)
+        self.assertEqual(index.window("piece-1", [0., .02])["structured"].shape, (1, 4, 233))
+        observed = index.window("piece-0", [1., 1.04])
+        missing = index.window("piece-1", [0., .02])
+        items = [
+            {"features": torch.zeros(2, 2), "conditioning": torch.zeros(2, 12), "targets": {}, "masks": {}, "metadata": {}, "video": video}
+            for video in (observed, missing)
+        ]
+        self.assertEqual(collate_windows(items)["video"]["structured"].shape[-1], 233)
+
+    def test_index_and_collation_reject_mixed_schema_dimensions(self):
+        second_audio = self.root / "release" / "audio" / "piece-1.flac"
+        second, _, _ = schema5_bundle_fixture(self.root, second_audio, "piece-1")
+        with self.assertRaisesRegex(HarnessError, "only one schema"):
+            build_index(self.manifest, [self.bundle, second], self.root / "mixed-index.json", root=self.root)
+        legacy = empty_video(2)
+        extended = empty_video(2, 233)
+        items = [
+            {"features": torch.zeros(2, 2), "conditioning": torch.zeros(2, 12), "targets": {}, "masks": {}, "metadata": {}, "video": video}
+            for video in (legacy, extended)
+        ]
+        with self.assertRaisesRegex(HarnessError, "mix paired-video schemas"):
+            collate_windows(items)
 
     def test_full_release_split_group_audio_and_manifest_identity_are_required(self):
         path = self.index()

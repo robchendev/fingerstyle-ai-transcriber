@@ -87,6 +87,9 @@ def collate_windows(items):
         videos = [item["video"] for item in items]
         for item in items:
             validate_video_tensors(item["video"], len(item["features"]))
+        dimensions = {video["structured"].shape[-1] for video in videos}
+        if len(dimensions) != 1:
+            raise HarnessError("Cannot mix paired-video schemas or feature dimensions in a batch.")
         longest_video = max(len(video["structured"]) for video in videos)
         batch["video"] = {}
         for key in videos[0]:

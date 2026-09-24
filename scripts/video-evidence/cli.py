@@ -7,7 +7,7 @@ from audio_sync import align_soundtrack
 from core import EvidenceError
 from hand_tracking import track_hands
 from hand_roles import RoleConfig, assign_hand_roles
-from paired_inputs import prepare_paired_inputs
+from paired_inputs import prepare_paired_inputs, prepare_paired_inputs_v5
 from models import provision_hand_landmarker, provision_pose_landmarker
 from shot_inspector import ShotConfig, inspect_shots, select_shots
 
@@ -54,6 +54,7 @@ def main(argv=None):
                 roles.add_argument(f"--{argument}", required=True)
             roles.add_argument("--clip", nargs=2, type=int, action="append", required=True, metavar=("START_PTS", "END_PTS"))
             roles.add_argument("--pair-id")
+            roles.add_argument("--fretboard", help="Source-bound fretboard.json; selects schema 5 / D233 output.")
 
     align = commands.add_parser("align-audio")
     align.add_argument("--video", required=True)
@@ -88,10 +89,17 @@ def main(argv=None):
     elif args.command == "prepare-paired-inputs":
         clips = [{"label": f"clip-{index + 1}", "startPts": start, "endPtsExclusive": end}
                  for index, (start, end) in enumerate(args.clip)]
-        path, report = prepare_paired_inputs(
-            args.video, args.shots, args.hands, args.geometry, args.annotations, args.roles,
-            args.audio, args.alignment, args.output_directory, clips, pair_id=args.pair_id,
-        )
+        if args.fretboard:
+            path, report = prepare_paired_inputs_v5(
+                args.video, args.shots, args.hands, args.geometry, args.annotations, args.roles,
+                args.fretboard, args.audio, args.alignment, args.output_directory, clips,
+                pair_id=args.pair_id,
+            )
+        else:
+            path, report = prepare_paired_inputs(
+                args.video, args.shots, args.hands, args.geometry, args.annotations, args.roles,
+                args.audio, args.alignment, args.output_directory, clips, pair_id=args.pair_id,
+            )
         print(json.dumps({"inputs": str(path), "frameCount": report["frameCount"]}))
     else:
         path, report = align_soundtrack(args.video, args.trimmed_audio, args.output)

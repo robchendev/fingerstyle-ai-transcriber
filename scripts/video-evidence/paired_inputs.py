@@ -3,6 +3,7 @@
 from dataclasses import replace
 from fractions import Fraction
 import itertools
+import json
 from pathlib import Path
 import sys
 
@@ -19,6 +20,14 @@ _ROOT = str(Path(__file__).resolve().parents[2])
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 from scripts.video_features import FEATURE_LAYOUT, INPUT_REPRESENTATION, MINIMUM_PALM_PIXELS, SCHEMA_VERSION, STRUCTURED_DIM, VIEW_ORDER
+from scripts.fretboard_features import (
+    FEATURE_LAYOUT as FRETBOARD_FEATURE_LAYOUT,
+    INPUT_REPRESENTATION as FRETBOARD_INPUT_REPRESENTATION,
+    SCHEMA_VERSION as FRETBOARD_SCHEMA_VERSION,
+    STRUCTURED_DIM as FRETBOARD_STRUCTURED_DIM,
+    FINGERTIP_LANDMARKS,
+)
+from scripts.fretboard_geometry import FretboardGeometry, FretboardGeometryError
 
 MAXIMUM_GAP_SECONDS = .09
 
@@ -121,7 +130,82 @@ class _PalmTracker:
         return result
 
 
-def structured_observations(inputs, roles, clips):
+def _fretboard_observations(inputs, fretboard_path):
+    report_path = _source_path(fretboard_path)
+    arrays_path = _source_path(report_path.with_name("fretboard.npz"))
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise EvidenceError(f"Invalid fretboard report: {error}") from error
+    if (
+        not isinstance(report, dict)
+        or report.get("schemaVersion") != 1
+        or report.get("kind") != "six-point-fretboard-observations"
+        or report.get("videoSha256") != inputs["hashes"]["video"]
+        or report.get("shotsSha256") != inputs["hashes"]["shots"]
+        or report.get("timeBase") != inputs["documents"]["shots"]["timeBase"]
+        or report.get("arrays") != "fretboard.npz"
+        or report.get("arraysSha256") != sha256(arrays_path)
+        or report.get("sourceEncoding") != {"unavailable": 0, "detector": 1, "optical_flow": 2}
+    ):
+        raise EvidenceError("Fretboard observations do not match the source video, shots, arrays, or schema.")
+    count = len(inputs["hand"]["pts"])
+    if report.get("frameCount") != count or report.get("shotCount") != len(inputs["documents"]["shots"]["shots"]):
+        raise EvidenceError("Fretboard observation counts differ from the source observations.")
+    shapes = {
+        "pts": (np.dtype("int64"), (count,)),
+        "shot_id": (np.dtype("int32"), (count,)),
+        "keypoints": (np.dtype("float32"), (count, 3, 2, 2)),
+        "available": (np.dtype("bool"), (count, 3, 2)),
+        "confidence": (np.dtype("float32"), (count,)),
+        "source": (np.dtype("int8"), (count,)),
+        "age_seconds": (np.dtype("float32"), (count,)),
+        "flow_error": (np.dtype("float32"), (count,)),
+        "detector_anchor": (np.dtype("bool"), (count,)),
+    }
+    try:
+        with np.load(arrays_path, allow_pickle=False) as source:
+            if set(source.files) != set(shapes):
+                raise EvidenceError("Fretboard arrays must contain exactly the tracked observation contract.")
+            arrays = {name: source[name].copy() for name in shapes}
+    except (OSError, ValueError, KeyError) as error:
+        raise EvidenceError(f"Malformed fretboard observation arrays: {error}") from error
+    for name, (dtype, shape) in shapes.items():
+        value = arrays[name]
+        if value.dtype != dtype or value.shape != shape:
+            raise EvidenceError(f"Invalid fretboard {name} dtype or shape.")
+    if not np.array_equal(arrays["pts"], inputs["hand"]["pts"]) or not np.array_equal(arrays["shot_id"], inputs["hand"]["shot_id"]):
+        raise EvidenceError("Fretboard and hand PTS/shot arrays must match exactly; no interpolation is permitted.")
+    if (
+        np.isinf(arrays["keypoints"]).any()
+        or not np.isfinite(arrays["keypoints"][arrays["available"]]).all()
+        or not np.isfinite(arrays["confidence"]).all()
+        or not np.isfinite(arrays["age_seconds"]).all()
+        or not np.isfinite(arrays["flow_error"]).all()
+        or (arrays["confidence"] < 0).any()
+        or (arrays["confidence"] > 1).any()
+        or (arrays["age_seconds"] < 0).any()
+        or (arrays["flow_error"] < 0).any()
+        or not np.isin(arrays["source"], [0, 1, 2]).all()
+        or np.any(arrays["detector_anchor"] != (arrays["source"] == 1))
+        or np.any((arrays["source"] == 0) & arrays["available"].any(axis=(1, 2)))
+    ):
+        raise EvidenceError("Invalid fretboard availability, quality, source, or detector-anchor values.")
+    return report, arrays, report_path, arrays_path
+
+
+def _fretboard_geometry(arrays, index, size):
+    try:
+        return FretboardGeometry.from_keypoints(
+            arrays["keypoints"][index].astype(np.float64) * size,
+            arrays["available"][index],
+            tuple(int(value) for value in size),
+        )
+    except FretboardGeometryError:
+        return None
+
+
+def structured_observations(inputs, roles, clips, fretboard=None):
     hand, geometry, shots = inputs["hand"], inputs["geometry"], inputs["documents"]["shots"]
     # Audio trims can end between video frames; the producer also enforces the exact audio-clock bounds.
     selected, clip_ids = validate_clips(clips, hand["pts"], shots, allow_partial_end=True)
@@ -129,10 +213,11 @@ def structured_observations(inputs, roles, clips):
     count = len(indices)
     size = np.asarray([shots["width"], shots["height"]], np.float64)
     time_base = Fraction(*shots["timeBase"])
+    dimension = FRETBOARD_STRUCTURED_DIM if fretboard is not None else STRUCTURED_DIM
     output = {
         "pts": hand["pts"][indices].copy(),
-        "structured": np.zeros((count, len(VIEW_ORDER), STRUCTURED_DIM), np.float32),
-        "structured_available": np.zeros((count, len(VIEW_ORDER), STRUCTURED_DIM), bool),
+        "structured": np.zeros((count, len(VIEW_ORDER), dimension), np.float32),
+        "structured_available": np.zeros((count, len(VIEW_ORDER), dimension), bool),
         "segment_id": np.full((count, len(VIEW_ORDER)), -1, np.int64),
     }
     previous = [None] * len(VIEW_ORDER)
@@ -149,6 +234,7 @@ def structured_observations(inputs, roles, clips):
         frame, anchor_valid = _coordinate_frame(
             geometry["coordinates"][i], geometry["confidence"][i], geometry["state"][i], size,
         )
+        fretboard_geometry = _fretboard_geometry(fretboard, i, size) if fretboard is not None else None
         earlier = int(indices[local - 1]) if local else -1
         boundary = earlier != i - 1 or earlier < 0
         if not boundary:
@@ -218,6 +304,36 @@ def structured_observations(inputs, roles, clips):
                     if norm >= MINIMUM_PALM_PIXELS:
                         values[184:186] = direction / norm
                         masks[184:186] = True
+            fretboard_positions = None
+            fretboard_source = None
+            if fretboard_geometry is not None:
+                fretboard_source = (int(fretboard["shot_id"][i]), int(fretboard["source"][i]))
+                values[229:233] = (
+                    fretboard["confidence"][i], fretboard["age_seconds"][i],
+                    fretboard["flow_error"][i], fretboard["detector_anchor"][i],
+                )
+                masks[229:233] = True
+                fretboard_positions = np.zeros((len(FINGERTIP_LANDMARKS), 2), np.float32)
+                fretboard_position_mask = np.zeros((len(FINGERTIP_LANDMARKS), 2), bool)
+                for tip_index, point in enumerate(FINGERTIP_LANDMARKS):
+                    if not valid[point]:
+                        continue
+                    try:
+                        coordinate = fretboard_geometry.coordinate(points[point].astype(np.float64) * size)
+                    except FretboardGeometryError:
+                        continue
+                    offset = 194 + tip_index * 2
+                    values[offset:offset + 2] = coordinate.scale_position, coordinate.string_position
+                    masks[offset:offset + 2] = True
+                    fretboard_positions[tip_index] = coordinate.scale_position, coordinate.string_position
+                    fretboard_position_mask[tip_index] = True
+                    if coordinate.fret_position is not None:
+                        values[204 + tip_index] = coordinate.fret_position
+                        masks[204 + tip_index] = True
+                    values[209 + tip_index] = coordinate.nearest_string_distance
+                    masks[209 + tip_index] = True
+                    values[214 + tip_index] = coordinate.inside_string_span
+                    masks[214 + tip_index] = True
             key = (
                 int(clip_ids[i]), int(hand["shot_id"][i]), int(roles["track_id"][i, slot]) if code else -1,
                 int(hand["detection_source"][i]), identities.get(slot), frame is not None if code else False, tuple(valid),
@@ -242,10 +358,24 @@ def structured_observations(inputs, roles, clips):
                 if palm is not None and prior[3] is not None:
                     values[182:184] = (palm["pixels"][0] - prior[3]["pixels"][0]) / prior[3]["scale"] / elapsed
                     masks[182:184] = True
+                if (
+                    fretboard_positions is not None
+                    and prior[4] is not None
+                    and prior[5] == fretboard_source
+                    and not bool(fretboard["detector_anchor"][i])
+                ):
+                    velocity_mask = fretboard_position_mask & prior[4][1]
+                    velocities = (fretboard_positions - prior[4][0]) / elapsed
+                    values[219:229].reshape(-1, 2)[velocity_mask] = velocities[velocity_mask]
+                    masks[219:229].reshape(-1, 2)[velocity_mask] = True
             else:
                 output["segment_id"][local, role] = next_segment
                 next_segment += 1
-            previous[role] = i, local, key, palm
+            previous[role] = (
+                i, local, key, palm,
+                None if fretboard_positions is None else (fretboard_positions, fretboard_position_mask),
+                fretboard_source,
+            )
     usable = output["structured_available"].any(-1)
     output["segment_id"][~usable] = -1
     next_segment = 0
@@ -261,9 +391,9 @@ def structured_observations(inputs, roles, clips):
     return output, indices
 
 
-def prepare_paired_inputs(video_path, shots_path, hands_path, geometry_path, annotations_path,
-                          roles_path, audio_path, alignment_path, output_directory, clips, *,
-                          pair_id=None):
+def _prepare_paired_inputs(video_path, shots_path, hands_path, geometry_path, annotations_path,
+                           roles_path, audio_path, alignment_path, output_directory, clips, *,
+                           pair_id=None, fretboard_path=None):
     if pair_id is not None and (not isinstance(pair_id, str) or not pair_id.strip()):
         raise EvidenceError("Pair ID must be a nonempty string.")
     for path in (video_path, shots_path, hands_path, geometry_path, annotations_path, roles_path, audio_path, alignment_path):
@@ -274,11 +404,20 @@ def prepare_paired_inputs(video_path, shots_path, hands_path, geometry_path, ann
              "trimmedAudio": Path(audio_path).absolute(), "alignment": Path(alignment_path).absolute()}
     clock, duration, alignment, audio_hashes = load_audio_clock(inputs["hashes"]["video"], audio_path, alignment_path)
     hashes = {**inputs["hashes"], **audio_hashes, "roles": sha256(roles_path), "roleArrays": role_report["arraysSha256"]}
+    fretboard = None
+    if fretboard_path is not None:
+        fretboard_report, fretboard, report_path, array_path = _fretboard_observations(inputs, fretboard_path)
+        paths.update(fretboard=report_path, fretboardArrays=array_path)
+        hashes.update(fretboard=sha256(report_path), fretboardArrays=fretboard_report["arraysSha256"])
     for path in paths.values():
         _source_path(path)
     if len(set(paths.values())) != len(paths):
         raise EvidenceError("Paired-input source paths must not alias one another.")
-    arrays, indices = structured_observations(inputs, roles, clips)
+    arrays, indices = (
+        structured_observations(inputs, roles, clips, fretboard=fretboard)
+        if fretboard is not None
+        else structured_observations(inputs, roles, clips)
+    )
     time_base = Fraction(*inputs["documents"]["shots"]["timeBase"])
     for clip in clips:
         if clock.map_pts(clip["startPts"], time_base) < 0 or Fraction(clock.map_pts(clip["endPtsExclusive"], time_base), clock.sample_rate) > duration:
@@ -291,20 +430,29 @@ def prepare_paired_inputs(video_path, shots_path, hands_path, geometry_path, ann
         if any(sha256(_source_path(path)) != hashes[name] for name, path in paths.items()):
             raise EvidenceError("A bound source changed during paired-input preparation.")
         np.savez_compressed(output / "inputs.npz", **arrays)
+        schema_version = FRETBOARD_SCHEMA_VERSION if fretboard is not None else SCHEMA_VERSION
+        representation = FRETBOARD_INPUT_REPRESENTATION if fretboard is not None else INPUT_REPRESENTATION
+        dimension = FRETBOARD_STRUCTURED_DIM if fretboard is not None else STRUCTURED_DIM
+        layout = FRETBOARD_FEATURE_LAYOUT if fretboard is not None else FEATURE_LAYOUT
         report = {
-            "kind": "paired-video-inputs", "schemaVersion": SCHEMA_VERSION, "visibility": "private",
-            "inputRepresentation": INPUT_REPRESENTATION,
+            "kind": "paired-video-inputs", "schemaVersion": schema_version, "visibility": "private",
+            "inputRepresentation": representation,
             **({"id": pair_id} if pair_id is not None else {}),
             "audioSha256": hashes["trimmedAudio"], "videoSha256": hashes["video"],
             "timeBase": inputs["documents"]["shots"]["timeBase"],
-            "featureDimension": STRUCTURED_DIM,
+            "featureDimension": dimension,
             "arraysPath": "inputs.npz", "arraysSha256": sha256(output / "inputs.npz"),
             "inputSha256": hashes, "inputPaths": {name: str(path) for name, path in paths.items()},
-            "frameCount": len(indices), "viewOrder": VIEW_ORDER, "featureLayout": FEATURE_LAYOUT,
+            "frameCount": len(indices), "viewOrder": VIEW_ORDER, "featureLayout": layout,
             "coordinatePolicy": "Source-pixel aspect correction; neckBody origin=(0,0), nut=(1,0); perpendicular fretboard-width cross axis.",
             "handCoordinatePolicy": "Observed wrist-centered source-pixel XY; median wrist-to-valid-MCP(5,9,13,17) distance, at least three MCPs and eight source pixels. Wrist velocity uses prior scale and includes camera motion, not guitar contact.",
             "handIdentityPolicy": "Adjacent source-pixel palm matching; ambiguous identity, missing hand, clip, shot, cut, detector change or >90ms gap resets motion. Unknown playing roles remain anonymous; anatomical handedness is not used.",
             "coarseCoordinatePolicy": "Reserved schema slots 186:194 remain zero and unavailable.",
+            **({
+                "fretboardCoordinatePolicy": "Six-point projective scale and continuous string coordinates; unavailable or invalid geometry is zero and masked.",
+                "fretboardMotionPolicy": "Backward velocity requires the same hand, role, shot, geometry source, and available predecessor within 90ms; detector anchors reset motion.",
+                "fretboardEvidencePolicy": "Geometry and board-region evidence only; no contact or pressure is inferred.",
+            } if fretboard is not None else {}),
             "coverage": {
                 "framesWithGeometry": int(arrays["structured_available"][..., :98].any(axis=(1, 2)).sum()),
                 "framesWithIndependentHand": int(arrays["structured_available"][..., 98:140].any(axis=(1, 2)).sum()),
@@ -324,3 +472,22 @@ def prepare_paired_inputs(video_path, shots_path, hands_path, geometry_path, ann
     finally:
         if not complete:
             _cleanup(output)
+
+
+def prepare_paired_inputs(video_path, shots_path, hands_path, geometry_path, annotations_path,
+                          roles_path, audio_path, alignment_path, output_directory, clips, *,
+                          pair_id=None):
+    return _prepare_paired_inputs(
+        video_path, shots_path, hands_path, geometry_path, annotations_path,
+        roles_path, audio_path, alignment_path, output_directory, clips, pair_id=pair_id,
+    )
+
+
+def prepare_paired_inputs_v5(video_path, shots_path, hands_path, geometry_path, annotations_path,
+                             roles_path, fretboard_path, audio_path, alignment_path,
+                             output_directory, clips, *, pair_id=None):
+    return _prepare_paired_inputs(
+        video_path, shots_path, hands_path, geometry_path, annotations_path,
+        roles_path, audio_path, alignment_path, output_directory, clips,
+        pair_id=pair_id, fretboard_path=fretboard_path,
+    )

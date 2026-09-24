@@ -14,7 +14,12 @@ import numpy as np
 from core import EvidenceError, sha256
 from geometry import STATE_CODES
 from hand_roles import RoleConfig, assign_hand_roles, load_role_observations
-from paired_inputs import FEATURE_LAYOUT, INPUT_REPRESENTATION, prepare_paired_inputs, structured_observations
+from paired_inputs import (
+    FEATURE_LAYOUT, INPUT_REPRESENTATION, prepare_paired_inputs,
+    prepare_paired_inputs_v5, structured_observations,
+)
+from scripts.fretboard_features import FEATURE_LAYOUT as FRETBOARD_FEATURE_LAYOUT
+from scripts.fretboard_geometry import FretboardGeometry
 from scripts.video_features import VELOCITY_SLICES
 from tests.video import test_hand_roles as fixtures
 
@@ -70,6 +75,54 @@ class PairedInputTests(unittest.TestCase):
         return prepare_paired_inputs(
             f.video, f.paths["shots"], f.paths["hands"], f.paths["geometry"], f.paths["annotations"],
             self.roles, self.audio, self.alignment, f.root / "paired", self.clips,
+            pair_id="synthetic", **options,
+        )
+
+    def fretboard(self, *, invalid_row=None, detector_row=0):
+        f = self.fixture
+        count = len(f.hand["pts"])
+        keypoints = np.tile(np.array([
+            [[.2, .3], [.2, .5]],
+            [[.5, .3], [.5, .5]],
+            [[.8, .3], [.8, .5]],
+        ], np.float32), (count, 1, 1, 1))
+        available = np.ones((count, 3, 2), bool)
+        if invalid_row is not None:
+            available[invalid_row, 1:] = False
+            keypoints[invalid_row, 1:] = np.nan
+        source = np.full(count, 2, np.int8)
+        source[detector_row] = 1
+        detector_anchor = source == 1
+        arrays = {
+            "pts": f.hand["pts"].copy(), "shot_id": f.hand["shot_id"].copy(),
+            "keypoints": keypoints, "available": available,
+            "confidence": np.linspace(.9, .83, count, dtype=np.float32),
+            "source": source,
+            "age_seconds": np.arange(count, dtype=np.float32) * .04,
+            "flow_error": np.arange(count, dtype=np.float32) * .01,
+            "detector_anchor": detector_anchor,
+        }
+        directory = f.root / f"fretboard-{invalid_row}-{detector_row}"
+        directory.mkdir()
+        array_path = directory / "fretboard.npz"
+        np.savez_compressed(array_path, **arrays)
+        report = {
+            "schemaVersion": 1, "kind": "six-point-fretboard-observations",
+            "videoSha256": sha256(f.video), "shotsSha256": sha256(f.paths["shots"]),
+            "timeBase": f.shots["timeBase"], "frameCount": count,
+            "shotCount": len(f.shots["shots"]),
+            "sourceEncoding": {"unavailable": 0, "detector": 1, "optical_flow": 2},
+            "arrays": "fretboard.npz", "arraysSha256": sha256(array_path),
+        }
+        report_path = directory / "fretboard.json"
+        report_path.write_text(json.dumps(report))
+        return report_path, arrays
+
+    def build_v5(self, fretboard_path, **options):
+        f = self.fixture
+        return prepare_paired_inputs_v5(
+            f.video, f.paths["shots"], f.paths["hands"], f.paths["geometry"], f.paths["annotations"],
+            self.roles, fretboard_path, self.audio, self.alignment, f.root / "paired-v5", self.clips,
             pair_id="synthetic", **options,
         )
 
@@ -129,6 +182,81 @@ class PairedInputTests(unittest.TestCase):
         with np.load(path.with_name("inputs.npz")) as arrays:
             np.testing.assert_array_equal(arrays["pts"], [40, 80, 120, 160, 200, 240])
         self.assertEqual(report["frameCount"], 6)
+
+    def test_schema_five_appends_projected_fingertips_quality_and_velocity_without_changing_d194(self):
+        fretboard_path, fretboard = self.fretboard()
+        inputs, roles = self.observations()
+        legacy, indices = structured_observations(inputs, roles, self.clips)
+        with np.load(fretboard_path.with_name("fretboard.npz")) as source:
+            observations = {name: source[name] for name in source.files}
+        extended, extended_indices = structured_observations(inputs, roles, self.clips, fretboard=observations)
+        np.testing.assert_array_equal(extended_indices, indices)
+        np.testing.assert_array_equal(extended["structured"][..., :194], legacy["structured"])
+        np.testing.assert_array_equal(extended["structured_available"][..., :194], legacy["structured_available"])
+        np.testing.assert_array_equal(extended["segment_id"], legacy["segment_id"])
+        self.assertEqual(extended["structured"].shape, (6, 4, 233))
+
+        geometry = FretboardGeometry.from_keypoints(
+            fretboard["keypoints"][1] * fixtures.SIZE, fretboard["available"][1], fixtures.SIZE,
+        )
+        point = inputs["hand"]["image_landmarks"][1, 0, 4, :2] * fixtures.SIZE
+        coordinate = geometry.coordinate(point)
+        np.testing.assert_allclose(
+            extended["structured"][0, 0, 194:196],
+            [coordinate.scale_position, coordinate.string_position], atol=1e-6,
+        )
+        self.assertTrue(extended["structured_available"][0, 0, 194:219].all())
+        np.testing.assert_allclose(
+            extended["structured"][0, 0, 229:233],
+            [fretboard["confidence"][1], .04, .01, 0.], atol=1e-7,
+        )
+        self.assertTrue(extended["structured_available"][0, 0, 229:233].all())
+        expected_scale_velocity = .002 / .6 / .04
+        np.testing.assert_allclose(extended["structured"][1:3, 0, 219:229:2], expected_scale_velocity, atol=1e-5)
+        np.testing.assert_allclose(extended["structured"][1:3, 0, 220:229:2], 0., atol=1e-5)
+        self.assertTrue(extended["structured_available"][1:3, 0, 219:229].all())
+        self.assertFalse(extended["structured_available"][0, :, 219:229].any())
+
+        path, report = self.build_v5(fretboard_path)
+        self.assertEqual((report["schemaVersion"], report["featureDimension"]), (5, 233))
+        self.assertEqual(report["featureLayout"], FRETBOARD_FEATURE_LAYOUT)
+        self.assertEqual(set(report["inputPaths"]) - set(inputs["paths"]), {
+            "roles", "roleArrays", "trimmedAudio", "alignment", "fretboard", "fretboardArrays",
+        })
+        self.assertEqual(report["inputSha256"]["fretboard"], sha256(fretboard_path))
+        self.assertEqual(report["inputSha256"]["fretboardArrays"], sha256(fretboard_path.with_name("fretboard.npz")))
+        self.assertIn("no contact or pressure", report["fretboardEvidencePolicy"])
+        with np.load(path.with_name("inputs.npz")) as arrays:
+            np.testing.assert_array_equal(arrays["structured"][..., :194], legacy["structured"])
+            np.testing.assert_array_equal(arrays["structured_available"][..., :194], legacy["structured_available"])
+
+    def test_schema_five_masks_invalid_geometry_and_resets_velocity_on_source_change(self):
+        fretboard_path, _ = self.fretboard(invalid_row=2, detector_row=3)
+        path, _ = self.build_v5(fretboard_path)
+        with np.load(path.with_name("inputs.npz")) as arrays:
+            masks, values = arrays["structured_available"], arrays["structured"]
+            self.assertFalse(masks[1, :, 194:].any())
+            self.assertTrue((values[1, :, 194:] == 0).all())
+            self.assertFalse(masks[2, :, 219:229].any())
+            self.assertFalse(masks[3, :, 219:229].any())
+            self.assertTrue(masks[4, :2, 219:229].all())
+
+        inputs, roles = self.observations()
+        inputs["hand"]["image_landmarks"][1, 0, 4, 0] = .85
+        with np.load(fretboard_path.with_name("fretboard.npz")) as source:
+            fretboard = {name: source[name] for name in source.files}
+        extended, _ = structured_observations(inputs, roles, self.clips, fretboard=fretboard)
+        self.assertTrue(extended["structured_available"][0, 0, 194:196].all())
+        self.assertFalse(extended["structured_available"][0, 0, 204])
+        self.assertEqual(extended["structured"][0, 0, 204], 0.)
+
+    def test_schema_five_rejects_unbound_or_misaligned_fretboard_sources(self):
+        fretboard_path, _ = self.fretboard()
+        document = json.loads(fretboard_path.read_text())
+        document["videoSha256"] = "0" * 64
+        fretboard_path.write_text(json.dumps(document))
+        with self.assertRaisesRegex(EvidenceError, "do not match"):
+            self.build_v5(fretboard_path)
 
     def test_independent_body_masks_and_reset_boundaries(self):
         for change in ("geometry", "point", "track", "detector", "gap"):
