@@ -1,0 +1,2 @@
+-r requirements-training.txt
+ultralytics==8.3.102
