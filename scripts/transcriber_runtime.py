@@ -391,8 +391,8 @@ def _joint_video_config(identity):
     values = video["config"]
     if "image_size" in values or values.get("input_schema_version") != VIDEO_SCHEMA_VERSION:
         raise ValueError("Historical or unversioned paired checkpoints are unsupported; expected numeric video input schema 4. Repackage cached observations into new bundles; do not reinterpret old checkpoints.")
-    if "freeze_audio" in values or values.get("architecture_version") != 4:
-        raise ValueError("Frozen, historical or unversioned paired checkpoints are unsupported; expected joint video architecture_version 4")
+    if "freeze_audio" in values or values.get("architecture_version") != 5:
+        raise ValueError("Frozen, historical or unversioned paired checkpoints are unsupported; expected joint video architecture_version 5")
     if values.get("structured_dim") != STRUCTURED_DIM:
         raise ValueError("Historical paired checkpoints are unsupported; expected four-view 194D guitar-hand-coarse inputs")
     _keys(values, asdict(VideoConfig()), "joint video model configuration")
@@ -620,9 +620,9 @@ def _validate_inference_checkpoint(payload):
         values = payload[key]
         if key == "video_config" and values is None:
             continue
+        if key == "video_config" and values.get("architecture_version") == 4 and "feature_group_version" not in values:
+            values["feature_group_version"] = None
         _keys(values, {field.name for field in fields(cls)}, key)
-        if any(type(value) not in (int, float) for value in values.values()):
-            raise ValueError(f"{key} requires numeric configuration values")
         try:
             configs[key] = cls(**values)
         except (TypeError, ValueError) as error:

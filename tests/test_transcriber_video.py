@@ -15,7 +15,10 @@ from torch.utils.data import DataLoader, Dataset
 from scripts import transcriber_runtime as runtime
 from scripts.transcriber_events import evaluate_events
 from scripts.transcriber_model import FingerstyleTranscriber, ModelConfig, masked_loss
-from scripts.transcriber_video import AudioVideoTranscriber, VideoConfig
+from scripts.transcriber_video import (
+    ROLE_FEATURE_GROUPS, ROLE_FEATURE_GROUP_INDICES,
+    AudioVideoTranscriber, VideoConfig,
+)
 from scripts.video_features import STRUCTURED_DIM, VELOCITY_SLICES, VIEW_ORDER
 from tests.test_transcriber_events import WindowFixture
 from tests.test_transcriber_model import synthetic_targets
@@ -137,7 +140,8 @@ class VideoTests(unittest.TestCase):
         config = VideoConfig()
         self.assertEqual(asdict(config), {
             "hidden_size": 64, "temporal_layers": 1, "structured_dim": 194,
-            "input_schema_version": 4, "architecture_version": 4, "modality_dropout": .2,
+            "input_schema_version": 4, "architecture_version": 5, "modality_dropout": .2,
+            "feature_group_version": "anatomy-representation-groups-v1",
         })
         self.assertEqual(VideoConfig(**json.loads(json.dumps(asdict(config)))), config)
         with self.assertRaises(FrozenInstanceError):
@@ -146,7 +150,8 @@ class VideoTests(unittest.TestCase):
             {"hidden_size": 0}, {"temporal_layers": 0},
             {"structured_dim": 98}, {"structured_dim": 186}, {"structured_dim": 193}, {"structured_dim": 195},
             {"input_schema_version": 1}, {"input_schema_version": 2}, {"input_schema_version": 3},
-            {"architecture_version": 1}, {"architecture_version": 2}, {"architecture_version": 3},
+            {"architecture_version": 1}, {"architecture_version": 2}, {"architecture_version": 3}, {"architecture_version": 4},
+            {"feature_group_version": "unknown"},
             {"modality_dropout": -.1}, {"modality_dropout": 1.1},
             {"modality_dropout": float("nan")}, {"modality_dropout": float("inf")},
         ):
@@ -183,6 +188,53 @@ class VideoTests(unittest.TestCase):
         incompatible["position_branch.image_encoder.0.weight"] = torch.zeros(16, 3, 3, 3)
         with self.assertRaisesRegex(RuntimeError, "Unexpected key"):
             self.model.load_state_dict(incompatible, strict=True)
+
+    def test_role_feature_groups_partition_d194_and_use_role_specific_nonzero_biases(self):
+        flattened = [index for group in ROLE_FEATURE_GROUP_INDICES for index in group]
+        self.assertEqual(len(ROLE_FEATURE_GROUPS), 8)
+        self.assertEqual(sorted(flattened), list(range(194)))
+        self.assertEqual(len(flattened), len(set(flattened)))
+        fretting = self.model.position_branch.feature_gates.log_scales.exp()
+        plucking = self.model.technique_branch.feature_gates.log_scales.exp()
+        anonymous = self.model.anonymous_branch.feature_gates.log_scales.exp()
+        fingertip_position = ROLE_FEATURE_GROUPS.index("fingertip_position")
+        thumb_motion = ROLE_FEATURE_GROUPS.index("thumb_motion")
+        fingertip_motion = ROLE_FEATURE_GROUPS.index("fingertip_motion")
+        self.assertGreater(fretting[fingertip_position], fretting[thumb_motion])
+        self.assertGreater(plucking[thumb_motion], 1)
+        self.assertGreater(plucking[fingertip_motion], 1)
+        torch.testing.assert_close(anonymous, torch.ones_like(anonymous))
+        for branch in (
+            self.model.position_branch, self.model.technique_branch,
+            self.model.anonymous_branch,
+        ):
+            self.assertTrue(branch.feature_gates.log_scales.requires_grad)
+
+    def test_role_gates_learn_without_turning_masked_values_into_evidence(self):
+        model = small_model(version=4, modality_dropout=0, audio_dropout=0).train()
+        video = copy.deepcopy(self.video)
+        video["structured"].requires_grad_(True)
+        outputs = model(self.features, self.conditioning, video=video)
+        outputs["fret_logits"].square().mean().backward()
+        for branch in (model.position_branch, model.technique_branch, model.anonymous_branch):
+            self.assertGreater(branch.feature_gates.log_scales.grad.abs().sum().item(), 0)
+        masked = without_evidence(copy.deepcopy(self.video))
+        masked["structured"].fill_(1e20)
+        self.assert_outputs_equal(
+            model(self.features, self.conditioning),
+            model(self.features, self.conditioning, video=masked),
+        )
+
+    def test_no_visual_evidence_exactly_uses_audio_core_outputs(self):
+        model = small_model(version=4).eval()
+        with torch.no_grad():
+            hidden, valid = model.audio.encode(self.features, self.conditioning)
+            expected = model.audio.decode_hidden(hidden, valid)
+        for video in (None, without_evidence(copy.deepcopy(self.video))):
+            self.assert_outputs_equal(
+                expected,
+                model(self.features, self.conditioning, video=video),
+            )
 
     def test_all_architectures_fuse_before_all_original_heads_once(self):
         for version in (1, 2, 3, 4):
@@ -663,7 +715,7 @@ class VideoTests(unittest.TestCase):
         loss, _ = masked_loss(dropped, batch["targets"], batch["masks"], batch["valid_frames"])
         loss.backward()
         self.assertGreater(model.audio.conv1.weight.grad.abs().sum().item(), 0)
-        self.assertGreater(model.fusion[0].weight.grad.abs().sum().item(), 0)
+        self.assertEqual(model.fusion[0].weight.grad.abs().sum().item(), 0)
         for branch in (model.position_branch, model.technique_branch, model.anonymous_branch):
             self.assertTrue(all(
                 parameter.grad is None or torch.count_nonzero(parameter.grad).item() == 0
@@ -720,7 +772,7 @@ class VideoTests(unittest.TestCase):
                 outputs = self.forward(video, model=model)
             outputs["note_onset_logits"].square().mean().backward()
             self.assertGreater(model.audio.conv1.weight.grad.abs().sum().item(), 0)
-            self.assertGreater(model.fusion[0].weight.grad.abs().sum().item(), 0)
+            self.assertEqual(model.fusion[0].weight.grad.abs().sum().item(), 0)
 
     def test_video_dtype_shape_finite_index_and_mask_validation_is_strict(self):
         malformed = []

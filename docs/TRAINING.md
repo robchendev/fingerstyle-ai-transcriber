@@ -19,8 +19,8 @@ Save this example as `runs\batch.json` and replace its file paths and plucking-h
   "acceptConventions": true,
   "handModel": "runs\\video-evidence\\models\\hand_landmarker.task",
   "records": [
-    {"id": "pair-a", "groupId": "group-a", "split": "train", "gp": "inputs\\pair-a.gp", "video": "inputs\\pair-a-trimmed.mp4", "pluckingScreenSide": "left"},
-    {"id": "pair-b", "groupId": "group-b", "split": "validation", "gp": "inputs\\pair-b.gp", "video": "inputs\\pair-b-trimmed.mp4", "pluckingScreenSide": "right"}
+    {"id": "pair-a", "groupId": "group-a", "split": "train", "gp": "inputs\\pair-a.gp", "video": "inputs\\pair-a-trimmed.mp4", "pluckingScreenSide": "left", "voiceSupervisionPolicy": "native-multivoice"},
+    {"id": "pair-b", "groupId": "group-b", "split": "validation", "gp": "inputs\\pair-b.gp", "video": "inputs\\pair-b-trimmed.mp4", "pluckingScreenSide": "right", "voiceSupervisionPolicy": "flattened-or-unknown"}
   ]
 }
 ```
@@ -55,6 +55,27 @@ python -m scripts.transcriber train --config runs\joint-config.json --run-dir ru
 Set the device, thread count, batch size and number of epochs in the generated configuration before training. `preflight` checks the setup. Use `--max-hours` to set a time limit.
 
 Validation needs usable labels for notes or percussion and at least one supported technique, such as a bend, hammer-on, slide or grace note. Training cannot select its best model from notes-only validation data, even if `preflight` passes.
+
+### Voice supervision and role-biased video
+
+New reviews should declare `--voice-supervision-policy` as
+`native-multivoice`, `intentional-single-voice`, or
+`flattened-or-unknown`. Existing releases without this provenance remain
+readable but default to `flattened-or-unknown`: voice loss is masked while
+onset, string/fret, pitch, duration and other trusted labels remain available.
+No thumb-to-voice label is inferred.
+
+Video architecture 5 keeps the schema-4 D194 numeric input unchanged and adds
+separate learnable fretting/plucking feature-group scales. Fretting starts
+biased toward non-thumb fingertip positions; plucking starts biased toward
+thumb and fingertip motion. Anonymous hands remain neutral. These are
+initialization priors, not fixed weights or confidence estimates. Frames with
+no usable video use the acoustic model output exactly and do not update visual
+fusion parameters.
+
+String/fret proximity, landmark reliability and any thumb-to-voice decoder
+preference require separately versioned inputs or independently validated
+evidence and are not part of architecture 5.
 
 ## Label a fretboard detector
 

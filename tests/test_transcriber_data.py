@@ -150,9 +150,16 @@ class TargetEncodingTests(unittest.TestCase):
             "supervisionMask": {"onset": True, "pitch": True, "fingering": True, "notatedDuration": True}, **changes,
         }
 
-    def encode(self, notes, source_notes, gestures=(), source_gestures=()):
+    def encode(self, notes, source_notes, gestures=(), source_gestures=(),
+               voice_supervision_policy="native-multivoice"):
         with patch.dict("sys.modules", {"scripts.transcriber_model": VOCABULARY}):
-            return encode_targets({"targets": {"notes": notes, "gestures": list(gestures)}}, {"targets": {"notes": source_notes, "gestures": list(source_gestures)}}, np.arange(100) * .02, MODEL, negative_onsets_allowed=[False, True, True, True, True, True])
+            return encode_targets(
+                {"targets": {"notes": notes, "gestures": list(gestures)}},
+                {"targets": {"notes": source_notes, "gestures": list(source_gestures)}},
+                np.arange(100) * .02, MODEL,
+                negative_onsets_allowed=[False, True, True, True, True, True],
+                voice_supervision_policy=voice_supervision_policy,
+            )
 
     def test_voice_harmonic_and_positive_percussion_can_coexist(self):
         gesture = {"sourceGestureId": "g", "technique": "wrist_thump", "onsetWindowSeconds": .8, "supervisionMask": {"gesture": True, "onset": True}}
@@ -167,6 +174,21 @@ class TargetEncodingTests(unittest.TestCase):
         self.assertTrue(masks["note_onset"][40, 0])
         self.assertTrue(masks["note_onset"][60, 1])
         self.assertEqual(collisions, 0)
+
+    def test_flattened_voice_policy_masks_only_voice_supervision(self):
+        targets, masks, _ = self.encode(
+            [self.projected()], [self.source_note()],
+            voice_supervision_policy="flattened-or-unknown",
+        )
+        self.assertEqual(targets["voice"][40, 0], 0)
+        self.assertFalse(masks["voice"][40, 0])
+        for name in ("note_onset", "fret", "pitch", "duration_log"):
+            self.assertTrue(masks[name][40, 0], name)
+        with self.assertRaisesRegex(Exception, "voice supervision policy"):
+            self.encode(
+                [self.projected()], [self.source_note()],
+                voice_supervision_policy="invented",
+            )
 
     def test_collision_masks_categories_but_preserves_attack_presence(self):
         notes = [self.projected("a"), self.projected("b", fret=7)]

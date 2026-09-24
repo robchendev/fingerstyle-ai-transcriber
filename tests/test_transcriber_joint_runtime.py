@@ -112,13 +112,13 @@ class JointRuntimeTests(unittest.TestCase):
         self.assertEqual(full["history"][-1]["optimizer_skipped_batches"], 0)
         self.assertEqual(len(full["optimizer_state"]["param_groups"][0]["params"]), len(list(model.parameters())))
 
-    def test_all_modality_dropped_batches_still_update_acoustic_and_fusion(self):
+    def test_all_modality_dropped_batches_update_audio_without_visual_correction(self):
         initial = deepcopy(self.model(dropout=1.).state_dict())
         result, model, _ = self.train("dropped", 2, dropout=1.)
         self.assertEqual((result["optimizer_updates"], result["optimizer_skipped_batches"]), (2, 0))
         state = model.state_dict()
         self.assertTrue(any(not torch.equal(initial[name], value) for name, value in state.items() if name.startswith("audio.")))
-        self.assertTrue(any(not torch.equal(initial[name], value) for name, value in state.items() if name.startswith("fusion.")))
+        self.assertTrue(all(torch.equal(initial[name], value) for name, value in state.items() if name.startswith(("position_branch.", "technique_branch.", "anonymous_branch.", "fusion."))))
 
     def test_joint_checkpoint_rejects_frozen_semantics_and_incomplete_optimizer(self):
         _, _, checkpoint = self.train("schema", 1)
@@ -128,7 +128,7 @@ class JointRuntimeTests(unittest.TestCase):
             if kind == "missing-version":
                 del config["architecture_version"]
             elif kind == "old-version":
-                config["architecture_version"] = 2
+                config["architecture_version"] = 4
             elif kind == "old-schema":
                 config["input_schema_version"] = 2
             elif kind == "old-schema3":

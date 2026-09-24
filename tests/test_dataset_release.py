@@ -23,7 +23,7 @@ from scripts.transcriber_model import ModelConfig
 from tests.test_score_alignment import clock_fixture
 
 
-def synthetic_release(root, *, plateau=False, percussion_complete=None, unresolved_percussion=None, validation_groups=("piece-1",), frozen_scalar=False):
+def synthetic_release(root, *, plateau=False, percussion_complete=None, unresolved_percussion=None, validation_groups=("piece-1",), frozen_scalar=False, voice_policy="native-multivoice"):
     entries, records = [], []
     for index, split in enumerate(("train",) + ("validation",) * len(validation_groups)):
         identifier = f"piece-{index}"
@@ -56,6 +56,7 @@ def synthetic_release(root, *, plateau=False, percussion_complete=None, unresolv
             "groupId": identifier, "split": split,
             "sourceGpSha256": hashlib.sha256(identifier.encode()).hexdigest(), "audioSha256": sha256(audio),
             "candidateSha256": candidate_digest(candidate), "approvedClipRanges": [[0., 6.]],
+            **({"voiceSupervisionPolicy": voice_policy} if voice_policy is not None and not frozen_scalar else {}),
         }
         if plateau:
             approval["uncertaintyAcknowledged"] = True
@@ -173,7 +174,12 @@ class DatasetReleaseTests(unittest.TestCase):
             features = FeatureConfig(sample_rate=8000, n_fft=512, hop_length=160, n_mels=16, f_max=3000)
             dataset = TrainingDataset(manifest_path, "validation", features, ModelConfig(n_mels=16), root=root)
             self.assertEqual(len(dataset), 1)
-            self.assertEqual(dataset[0]["metadata"]["windowId"], "piece-1:0-48000")
+            item = dataset[0]
+            self.assertEqual(item["metadata"]["windowId"], "piece-1:0-48000")
+            self.assertEqual(item["metadata"]["voiceSupervisionPolicy"], "flattened-or-unknown")
+            self.assertFalse(item["masks"]["voice"].any())
+            self.assertTrue(item["masks"]["note_onset"].any())
+            self.assertTrue(item["masks"]["pitch"].any())
             self.assertEqual(before, {path: sha256(path) for path in root.rglob("*") if path.is_file()})
 
     def test_manifest_and_authorization_reject_dual_fields_and_mismatched_group_lists(self):

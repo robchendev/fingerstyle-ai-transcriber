@@ -21,6 +21,9 @@ from .transcriber_audio import HarnessError, audio_features, conditioning_featur
 
 
 PAIRED_TECHNIQUE_TARGET_POLICY = "native-positive-only-rasgueado-v1"
+VOICE_SUPERVISION_POLICIES = (
+    "native-multivoice", "intentional-single-voice", "flattened-or-unknown",
+)
 
 
 def _window_frame_times(window, sample_rate, feature_config):
@@ -119,11 +122,14 @@ def training_conditioning(record, clip_times):
     return conditioning_features(instrument["openStringMidi"], instrument["capoFret"], tempos, meters, positions)
 
 
-def encode_targets(window, canonical, frame_times, model_config, *, negative_onsets_allowed):
+def encode_targets(window, canonical, frame_times, model_config, *, negative_onsets_allowed,
+                   voice_supervision_policy="native-multivoice"):
     from .transcriber_model import HARMONIC_FRETS, HARMONIC_TYPES, PERCUSSION_TYPES
     from .technique_supervision import TECHNIQUE_DIRECTIONS, TECHNIQUE_TYPES
     from .connection_supervision import BEND_FIELDS, GRACE_MODES, RELATION_TYPES, vocabularies
 
+    if voice_supervision_policy not in VOICE_SUPERVISION_POLICIES:
+        raise HarnessError("Unsupported voice supervision policy.")
     count = len(frame_times)
     targets = {name: torch.zeros((count, 6), dtype=torch.long if name in {"fret", "pitch", "voice", "harmonic_kind", "harmonic_node"} else torch.float32) for name in ("note_onset", "fret", "pitch", "voice", "duration_log", "harmonic", "harmonic_kind", "harmonic_node")}
     targets["percussion"] = torch.zeros((count, len(PERCUSSION_TYPES)))
@@ -184,6 +190,8 @@ def encode_targets(window, canonical, frame_times, model_config, *, negative_ons
             raise HarnessError("Window note masks differ from canonical supervision.")
         for field, source_field, limit in (("fret", "fret", model_config.max_fret + 1), ("pitch", "soundingPitchMidi", 128), ("voice", "voiceIndex", model_config.max_voices)):
             permitted = note["supervisionMask"]["fingering" if field == "fret" else "pitch" if field == "pitch" else "onset"]
+            if field == "voice":
+                permitted &= voice_supervision_policy != "flattened-or-unknown"
             value = note[source_field]
             if permitted:
                 if type(value) is not int or not 0 <= value < limit:
@@ -405,7 +413,11 @@ class TrainingDataset(Dataset):
             local_window["targets"]["connections"] = connections_in_window(
                 record["connections"], window["startSample"], window["stopSampleExclusive"], record["row"]["sampleRate"],
             )
-        targets, masks, collisions = encode_targets(local_window, record["data"].labels, times, self.model_config, negative_onsets_allowed=record["negativeAllowed"])
+        targets, masks, collisions = encode_targets(
+            local_window, record["data"].labels, times, self.model_config,
+            negative_onsets_allowed=record["negativeAllowed"],
+            voice_supervision_policy=record["voiceSupervisionPolicy"],
+        )
         intervals = self.video_training_intervals(record)
         if intervals is not None:
             prepared = torch.from_numpy(_inside_intervals(clip_times, intervals))
@@ -413,7 +425,10 @@ class TrainingDataset(Dataset):
                 mask &= prepared.reshape(-1, *([1] * (mask.ndim - 1)))
         item = {
             "features": features, "conditioning": conditioning, "targets": targets, "masks": masks,
-            "metadata": {"windowId": window["windowId"], "stringFrameCollisionsMasked": collisions},
+            "metadata": {
+                "windowId": window["windowId"], "stringFrameCollisionsMasked": collisions,
+                "voiceSupervisionPolicy": record["voiceSupervisionPolicy"],
+            },
         }
         if self.video_index is not None:
             item["video"] = self.video_window(record, clip_times)
@@ -464,6 +479,7 @@ class TrainingDataset(Dataset):
             record = {
                 "data": data, "candidate": payload["candidate"], "row": row, "negativeAllowed": negative_onset_coverage(labels),
                 "percussionAnnotationsComplete": payload["approval"].get("percussionAnnotationsComplete") is True,
+                "voiceSupervisionPolicy": payload["approval"].get("voiceSupervisionPolicy", "flattened-or-unknown"),
             }
             if model_config.architecture_version >= 2:
                 from .score_alignment import ScoreClock

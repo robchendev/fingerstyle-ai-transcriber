@@ -556,7 +556,13 @@ def review_pair(workspace, pair, args):
     if args.clear_exclusions:
         excluded = []
     ranges = effective_ranges(approved, excluded, candidate["denseMapping"])
-    changed = any((anchors != review["anchors"], candidate != review["candidate"], approved != review["requestedClipRanges"], excluded != review["excludedClipRanges"], args.split is not None and args.split != review["approval"].get("split")))
+    changed = any((
+        anchors != review["anchors"], candidate != review["candidate"],
+        approved != review["requestedClipRanges"], excluded != review["excludedClipRanges"],
+        args.split is not None and args.split != review["approval"].get("split"),
+        getattr(args, "voice_supervision_policy", None) is not None
+        and args.voice_supervision_policy != review["approval"].get("voiceSupervisionPolicy"),
+    ))
     approval = {} if changed else dict(review["approval"])
     if args.split is not None:
         approval["split"] = args.split
@@ -565,6 +571,8 @@ def review_pair(workspace, pair, args):
             approval[field] = True
     if args.confirm_percussion_completeness:
         approval["percussionAnnotationsComplete"] = True
+    if getattr(args, "voice_supervision_policy", None) is not None:
+        approval["voiceSupervisionPolicy"] = args.voice_supervision_policy
     if args.acknowledge_uncertainty:
         approval["uncertaintyAcknowledged"] = True
     if approval.get("approveExperimentalRangesAndSplit") and not ranges:
@@ -577,7 +585,7 @@ def review_pair(workspace, pair, args):
         preparationSha256=candidate_digest(state), candidateSha256=candidate_digest(candidate),
         anchors=anchors, candidate=candidate, requestedClipRanges=approved, excludedClipRanges=excluded, approval=approval,
     )
-    editing = bool(args.anchor or args.clear_anchors or args.approve_range is not None or args.clear_ranges or args.exclude_range is not None or args.clear_exclusions or args.split or args.acknowledge_uncertainty or args.confirm_percussion_completeness or any(getattr(args, option) for option in CONFIRMATIONS))
+    editing = bool(args.anchor or args.clear_anchors or args.approve_range is not None or args.clear_ranges or args.exclude_range is not None or args.clear_exclusions or args.split or args.acknowledge_uncertainty or args.confirm_percussion_completeness or getattr(args, "voice_supervision_policy", None) is not None or any(getattr(args, option) for option in CONFIRMATIONS))
     if editing:
         if not args.reviewer or not args.reviewer.strip():
             raise ValueError("Recording a decision requires --reviewer with your reviewer identity.")
@@ -780,6 +788,8 @@ def parser():
     for option in CONFIRMATIONS:
         review.add_argument("--" + option.replace("_", "-"), action="store_true")
     review.add_argument("--confirm-percussion-completeness", action="store_true", help="Confirm exhaustive intended O/X/ghost(X) percussion annotations for this source; negatives remain censored where notation/timing is unresolved. Does not grant other approvals.")
+    review.add_argument("--voice-supervision-policy", choices=("native-multivoice", "intentional-single-voice", "flattened-or-unknown"),
+                        help="Whether source GP voice indices are trusted. Unknown/flattened masks only voice loss.")
     review.add_argument("--acknowledge-uncertainty", action="store_true")
     review.add_argument("--cue", action="append", help="Generate plain/cued WAV for an ordinal, first-attack or end.")
     review.add_argument("--listen", action="store_true", help="Open requested cue WAVs in the Windows default player.")

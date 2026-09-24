@@ -15,6 +15,9 @@ from .score_alignment import ScoreClock
 
 
 RELEASE_KIND = "local-training-dataset"
+VOICE_SUPERVISION_POLICIES = (
+    "native-multivoice", "intentional-single-voice", "flattened-or-unknown",
+)
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,79}")
 _CONFIRMATIONS = ("authorizedUse", "recordingAndTargetPitchConfirmed", "notationReviewed", "approveExperimentalRangesAndSplit", "groupingConfirmed")
@@ -46,6 +49,7 @@ def release_scope(records):
         "approvedClipRanges": payload["approval"]["approvedClipRanges"],
         "windowsSha256": candidate_digest(payload["windows"]),
         **({"percussionAnnotationsComplete": payload["approval"]["percussionAnnotationsComplete"]} if "percussionAnnotationsComplete" in payload["approval"] else {}),
+        **({"voiceSupervisionPolicy": payload["approval"]["voiceSupervisionPolicy"]} if "voiceSupervisionPolicy" in payload["approval"] else {}),
     } for entry, payload in records]
 
 
@@ -136,6 +140,8 @@ def _validate_payload(entry, payload):
         raise ValueError("Release requires explicit source, notation, range, use and grouping approval.")
     if "percussionAnnotationsComplete" in approval and type(approval["percussionAnnotationsComplete"]) is not bool:
         raise ValueError("Percussion completeness approval must be an explicit boolean.")
+    if "voiceSupervisionPolicy" in approval and approval["voiceSupervisionPolicy"] not in VOICE_SUPERVISION_POLICIES:
+        raise ValueError("Voice supervision policy is unsupported.")
     if approval.get("percussionAnnotationsComplete") is True and (not isinstance(approval.get("reviewer"), str) or not approval["reviewer"].strip()):
         raise ValueError("Percussion completeness requires a source-bound reviewer.")
     if approval.get("groupId") != entry["groupId"] or approval.get("split") != entry["split"]:

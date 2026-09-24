@@ -74,7 +74,7 @@ def load_batch(path, *, root=ROOT):
     records, identifiers, groups = [], set(), {}
     for record in raw["records"]:
         fields = {"id", "groupId", "split", "gp", "video", "pluckingScreenSide"}
-        extras = {"audio", "title", "clips", "reuse"}
+        extras = {"audio", "title", "clips", "reuse", "voiceSupervisionPolicy"}
         if not isinstance(record, dict) or not fields <= record.keys() or record.keys() - fields - extras:
             raise ValueError("Each batch record requires id, groupId, split, gp, trimmed local video and pluckingScreenSide; audio is optional.")
         identifier = safe_id(record["id"])
@@ -97,6 +97,10 @@ def load_batch(path, *, root=ROOT):
         if side not in ("left", "right"):
             raise ValueError("pluckingScreenSide must explicitly be left or right.")
         row["pluckingScreenSide"] = side
+        if row.get("voiceSupervisionPolicy") not in (
+            None, "native-multivoice", "intentional-single-voice", "flattened-or-unknown",
+        ):
+            raise ValueError("voiceSupervisionPolicy is unsupported.")
         if "clips" in row:
             previous = None
             if not isinstance(row["clips"], list) or not row["clips"]:

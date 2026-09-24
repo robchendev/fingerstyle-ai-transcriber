@@ -155,8 +155,8 @@ def video_model_config(values):
 
     if not isinstance(values, dict) or values.keys() - {field.name for field in fields(VideoConfig)}:
         raise HarnessError("Unknown video model configuration fields. Only numeric landmark/motion/geometry inputs are supported, not RGB checkpoints.")
-    if values.get("architecture_version") != 4 or values.get("input_schema_version") != SCHEMA_VERSION:
-        raise HarnessError("Paired models require explicit joint video architecture_version 4 and input_schema_version 4; historical, frozen or unversioned paired configurations cannot be resumed or reinterpreted.")
+    if values.get("architecture_version") != 5 or values.get("input_schema_version") != SCHEMA_VERSION:
+        raise HarnessError("Paired models require explicit joint video architecture_version 5 and input_schema_version 4; historical, frozen or unversioned paired configurations cannot be resumed or reinterpreted.")
     if values.get("structured_dim") != STRUCTURED_DIM:
         raise HarnessError(f"Paired models require structured_dim {STRUCTURED_DIM} with four guitar-hand-coarse views; historical configurations cannot be reinterpreted.")
     return VideoConfig(**values)
@@ -203,6 +203,8 @@ def preflight(args):
             if first is None:
                 first = item
             counts["windows"] += 1
+            voice_policy = item["metadata"].get("voiceSupervisionPolicy", "flattened-or-unknown")
+            counts[f"voice_policy_{voice_policy}"] += 1
             counts["frames"] += len(item["features"])
             counts["collisions_masked"] += item["metadata"]["stringFrameCollisionsMasked"]
             if "video" in item:
@@ -243,6 +245,10 @@ def preflight(args):
                 last_log = now
         log_progress(f"Preflight {split}: feature/target scan completed.")
         row = dict(counts)
+        row["voiceSupervisionPolicy"] = {
+            policy: counts[f"voice_policy_{policy}"]
+            for policy in ("native-multivoice", "intentional-single-voice", "flattened-or-unknown")
+        }
         if "video" in config:
             row["videoCoverage"] = dataset.video_coverage
             if dataset.video_coverage["audioFramesWithUsableVideo"] == 0:
@@ -465,7 +471,12 @@ def checkpoint_model(path, device_name, *, allow_inference=True):
             raise HarnessError("Joint inference/evaluation requires actual optimizer updates, not only skipped batches.")
     model = FingerstyleTranscriber(ModelConfig(**identity["model"]))
     if "video" in identity:
-        model = _wrap_video_model(model, {"video": {"model": identity["video"]["config"]}})
+        from .transcriber_video import AudioVideoTranscriber, VideoConfig
+
+        video_values = dict(identity["video"]["config"])
+        if video_values.get("architecture_version") == 4:
+            video_values.setdefault("feature_group_version", None)
+        model = AudioVideoTranscriber(model, VideoConfig(**video_values))
     model.load_state_dict(checkpoint["model_state"], strict=True)
     device = resolve_device(device_name)
     return model.to(device).eval(), checkpoint, device

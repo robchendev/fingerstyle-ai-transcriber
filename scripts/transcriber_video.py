@@ -15,6 +15,17 @@ from .transcriber_model import FingerstyleTranscriber, _integer, _real, _tensor
 from .video_features import OBSERVATION_SLICES, SCHEMA_VERSION, STRUCTURED_DIM, VELOCITY_SLICES, VIEW_ORDER
 
 
+ROLE_FEATURE_GROUP_VERSION = "anatomy-representation-groups-v1"
+ROLE_FEATURE_GROUPS = (
+    "thumb_position", "fingertip_position", "other_position",
+    "thumb_motion", "fingertip_motion", "other_motion",
+    "instrument_context", "orientation",
+)
+_THUMB = frozenset((1, 2, 3, 4))
+_FINGERTIPS = frozenset((8, 12, 16, 20))
+_FRETTING_INITIAL_SCALES = (.75, 1.25, 1., .75, .9, .75, 1., .9)
+_PLUCKING_INITIAL_SCALES = (1., 1., .9, 1.25, 1.25, 1., 1., 1.)
+_NEUTRAL_INITIAL_SCALES = (1.,) * len(ROLE_FEATURE_GROUPS)
 _VIDEO_FIELDS = frozenset({
     "technique_available", "segment_id", "structured", "structured_available", "frame_indices",
 })
@@ -26,16 +37,58 @@ class VideoConfig:
     temporal_layers: int = 1
     structured_dim: int = STRUCTURED_DIM
     input_schema_version: int = SCHEMA_VERSION
-    architecture_version: int = 4
+    architecture_version: int = 5
     modality_dropout: float = 0.2
+    feature_group_version: str | None = ROLE_FEATURE_GROUP_VERSION
 
     def __post_init__(self):
         _integer("hidden_size", self.hidden_size, 1)
         _integer("temporal_layers", self.temporal_layers, 1)
         _integer("structured_dim", self.structured_dim, STRUCTURED_DIM, STRUCTURED_DIM)
         _integer("input_schema_version", self.input_schema_version, SCHEMA_VERSION, SCHEMA_VERSION)
-        _integer("architecture_version", self.architecture_version, 4, 4)
+        _integer("architecture_version", self.architecture_version, 4, 5)
         _real("modality_dropout", self.modality_dropout, 0, 1)
+        expected_groups = ROLE_FEATURE_GROUP_VERSION if self.architecture_version == 5 else None
+        if self.feature_group_version != expected_groups:
+            raise ValueError(f"feature_group_version must be {ROLE_FEATURE_GROUP_VERSION}")
+
+
+def _feature_group_indices():
+    groups = [[] for _ in ROLE_FEATURE_GROUPS]
+    for position_start, motion_start in ((0, 42), (98, 140)):
+        for point in range(21):
+            category = 0 if point in _THUMB else 1 if point in _FINGERTIPS else 2
+            groups[category].extend((position_start + 2 * point, position_start + 2 * point + 1))
+            groups[category + 3].extend((motion_start + 2 * point, motion_start + 2 * point + 1))
+    groups[5].extend((182, 183))
+    groups[6].extend((*range(84, 98), *range(186, 194)))
+    groups[7].extend((184, 185))
+    flattened = [index for group in groups for index in group]
+    if sorted(flattened) != list(range(STRUCTURED_DIM)) or len(flattened) != len(set(flattened)):
+        raise RuntimeError("Role feature groups must partition the D194 contract exactly once.")
+    return tuple(tuple(group) for group in groups)
+
+
+ROLE_FEATURE_GROUP_INDICES = _feature_group_indices()
+
+
+class _RoleFeatureGates(nn.Module):
+    def __init__(self, initial_scales):
+        super().__init__()
+        if (
+            len(initial_scales) != len(ROLE_FEATURE_GROUPS)
+            or any(not isinstance(value, (int, float)) or value <= 0 for value in initial_scales)
+        ):
+            raise ValueError("Role feature gate scales must be positive and cover every feature group.")
+        values = torch.tensor(initial_scales, dtype=torch.float32)
+        self.log_scales = nn.Parameter(values.log())
+        feature_groups = torch.empty(STRUCTURED_DIM, dtype=torch.long)
+        for group, indices in enumerate(ROLE_FEATURE_GROUP_INDICES):
+            feature_groups[list(indices)] = group
+        self.register_buffer("feature_groups", feature_groups, persistent=False)
+
+    def forward(self, values):
+        return values * self.log_scales.exp()[self.feature_groups].to(values.dtype)
 
 
 def _segmented_temporal(values, active, segment_ids, recurrent):
@@ -85,9 +138,14 @@ def _technique_structure_mask(structured_available, segment_ids):
 
 
 class _StructuredBranch(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, initial_scales):
         super().__init__()
         hidden = config.hidden_size
+        self.feature_gates = (
+            _RoleFeatureGates(initial_scales)
+            if config.architecture_version == 5
+            else nn.Identity()
+        )
         self.structure_encoder = nn.Sequential(
             nn.Linear(2 * config.structured_dim, hidden),
             nn.GELU(),
@@ -105,6 +163,7 @@ class _StructuredBranch(nn.Module):
             structured_available = _technique_structure_mask(structured_available, segment_ids)
         active = structured_available.any(dim=-1)
         structured = structured.masked_fill(~structured_available, 0)
+        structured = self.feature_gates(structured)
         encoded_structure = self.structure_encoder(torch.cat((
             structured, structured_available.to(structured.dtype),
         ), dim=-1)).masked_fill(~active[:, :, None], 0)
@@ -128,9 +187,9 @@ class AudioVideoTranscriber(nn.Module):
         self.config = audio.config
         self.video_config = video_config
         self.head_shapes = dict(audio.head_shapes)
-        self.position_branch = _StructuredBranch(video_config)
-        self.technique_branch = _StructuredBranch(video_config)
-        self.anonymous_branch = _StructuredBranch(video_config)
+        self.position_branch = _StructuredBranch(video_config, _FRETTING_INITIAL_SCALES)
+        self.technique_branch = _StructuredBranch(video_config, _PLUCKING_INITIAL_SCALES)
+        self.anonymous_branch = _StructuredBranch(video_config, _NEUTRAL_INITIAL_SCALES)
         audio_dimensions = 2 * self.config.hidden_size
         self.fusion = nn.Sequential(
             nn.Linear(audio_dimensions + 6 * video_config.hidden_size + 3, audio_dimensions),
@@ -195,8 +254,9 @@ class AudioVideoTranscriber(nn.Module):
         visual = visual.masked_fill(~present[:, :, :, None], 0)
         anonymous_count = present[:, :, 2:].sum(dim=-1, keepdim=True).to(audio_hidden.dtype)
         anonymous = visual[:, :, 2:].sum(dim=2) / anonymous_count.clamp_min(1)
-        fused = audio_hidden + self.fusion(torch.cat((
+        correction = self.fusion(torch.cat((
             audio_hidden, visual[:, :, :2].flatten(2), anonymous,
             present[:, :, :2].to(audio_hidden.dtype), anonymous_count,
-        ), dim=-1))
+        ), dim=-1)).masked_fill(~present.any(dim=2, keepdim=True), 0)
+        fused = audio_hidden + correction
         return self.audio.decode_hidden(fused, valid)

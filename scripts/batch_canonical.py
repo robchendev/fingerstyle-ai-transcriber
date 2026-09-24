@@ -119,6 +119,7 @@ def _review_args(*, reviewer=None, record=None, ranges=None, anchors=(), exclude
         split=record["split"] if accept else None, cue=[], listen=False,
         acknowledge_uncertainty=acknowledge_uncertainty,
         confirm_percussion_completeness=percussion_complete,
+        voice_supervision_policy=record.get("voiceSupervisionPolicy") if accept else None,
         **{option: accept for option in preparation.CONFIRMATIONS},
     )
 

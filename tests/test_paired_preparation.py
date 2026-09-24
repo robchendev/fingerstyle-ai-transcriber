@@ -346,7 +346,11 @@ class PairedBatchTests(unittest.TestCase):
             self.assertNotIn("--resume", calls[0])
             config = read_json(Path(calls[0][calls[0].index("--config") + 1]))
             self.assertNotIn("freeze_audio", config["video"]["model"])
-            self.assertEqual(config["video"]["model"]["architecture_version"], 4)
+            self.assertEqual(config["video"]["model"]["architecture_version"], 5)
+            self.assertEqual(
+                config["video"]["model"]["feature_group_version"],
+                "anatomy-representation-groups-v1",
+            )
             self.assertEqual(config["video"]["model"]["structured_dim"], 194)
             self.assertEqual(config["data"]["num_threads"], 12)
             self.assertNotIn("--max-hours", calls[0])
