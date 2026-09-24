@@ -68,7 +68,7 @@ class PairedBatchTests(unittest.TestCase):
     def worker(self, command, **kwargs):
         self.calls.append(command)
         request = read_json(Path(command[command.index("--request") + 1]))
-        self.assertEqual(set(request), {"schemaVersion", "kind", "id", "video", "audio", "outputDirectory", "pluckingScreenSide", "clips", "reuse", "handModel", "poseModel", "reviewMode"})
+        self.assertEqual(set(request), {"schemaVersion", "kind", "id", "video", "audio", "outputDirectory", "pluckingScreenSide", "clips", "reuse", "handModel", "poseModel", "fretboardModel", "reviewMode"})
         path = Path(command[command.index("--output") + 1])
         result = {
             "schemaVersion": 1, "kind": "paired-video-preparation-result", "id": request["id"], "status": "ready",

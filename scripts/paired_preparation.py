@@ -20,7 +20,7 @@ from .training_windows import projected_targets
 
 
 MANIFEST_KIND = "paired-preparation-batch"
-REUSE_STAGES = {"alignment", "shots", "hands", "roles", "bundle"}
+REUSE_STAGES = {"alignment", "shots", "hands", "roles", "fretboard", "bundle"}
 
 
 def _path(value, root, label, *, existing=False):
@@ -37,7 +37,7 @@ def load_batch(path, *, root=ROOT):
     path = regular_path(path)
     raw = read_json(path)
     required = {"schemaVersion", "kind", "records"}
-    optional = {"workspace", "releaseManifest", "releaseVersion", "acceptConventions", "ffmpegDirectory", "videoPython", "handModel", "poseModel", "reviewMode", "reviewBudget", "workers"}
+    optional = {"workspace", "releaseManifest", "releaseVersion", "acceptConventions", "ffmpegDirectory", "videoPython", "handModel", "poseModel", "fretboardModel", "reviewMode", "reviewBudget", "workers"}
     if isinstance(raw, dict) and "imageSize" in raw:
         raise ValueError("RGB crop inputs are no longer supported. Remove imageSize and prepare new structure-only bundles.")
     if not isinstance(raw, dict) or not required <= raw.keys() or raw.keys() - required - optional or type(raw["schemaVersion"]) is not int or raw["schemaVersion"] != 1 or raw["kind"] != MANIFEST_KIND:
@@ -51,9 +51,9 @@ def load_batch(path, *, root=ROOT):
     result["reviewBudget"] = raw.get("reviewBudget", 12)
     if type(result["reviewBudget"]) is not int or result["reviewBudget"] < 0:
         raise ValueError("reviewBudget must be a nonnegative integer number of optional shot reviews.")
-    result["workers"] = raw.get("workers", 1)
-    if type(result["workers"]) is not int or not 1 <= result["workers"] <= 8:
-        raise ValueError("workers must be an integer from 1 to 8.")
+    result["workers"] = raw.get("workers", 16)
+    if type(result["workers"]) is not int or not 1 <= result["workers"] <= 16:
+        raise ValueError("workers must be an integer from 1 to 16.")
     result["workspace"] = str(workspace_path(_path(raw.get("workspace", "data"), root, "workspace")))
     if not Path(result["workspace"]).is_relative_to(Path(root).resolve()):
         raise ValueError("Paired batch workspace must be inside the project private root so the existing paired loader can bind its release.")
@@ -68,6 +68,8 @@ def load_batch(path, *, root=ROOT):
     result["handModel"] = str(_path(raw.get("handModel"), root, "hand model"))
     pose = raw.get("poseModel")
     result["poseModel"] = str(_path(pose, root, "pose model")) if pose is not None else None
+    fretboard = raw.get("fretboardModel")
+    result["fretboardModel"] = str(_path(fretboard, root, "fretboard model")) if fretboard is not None else None
     result["ffmpegDirectory"] = str(_path(raw["ffmpegDirectory"], root, "FFmpeg directory")) if raw.get("ffmpegDirectory") else None
     if not isinstance(raw["records"], list) or not raw["records"]:
         raise ValueError("Batch records must be a nonempty list.")
@@ -233,6 +235,7 @@ def _request(batch, source, canonical, directory):
         "reviewMode": batch["reviewMode"],
         "pluckingScreenSide": source["pluckingScreenSide"], "reuse": source["reuse"],
         "handModel": batch["handModel"], "poseModel": batch["poseModel"],
+        "fretboardModel": batch["fretboardModel"],
     }
     if "clips" in source:
         result["clips"] = source["clips"]

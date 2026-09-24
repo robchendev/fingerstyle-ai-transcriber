@@ -30,18 +30,22 @@ from hand_roles import (RoleConfig, _read_arrays, assign_hand_roles, load_role_i
                         load_role_observations)
 from hand_tracking import track_hands
 from paired_inputs import (FEATURE_LAYOUT, INPUT_REPRESENTATION, SCHEMA_VERSION as PAIRED_SCHEMA_VERSION,
-                           STRUCTURED_DIM, VIEW_ORDER, prepare_paired_inputs)
+                           STRUCTURED_DIM, VIEW_ORDER, FRETBOARD_FEATURE_LAYOUT,
+                           FRETBOARD_INPUT_REPRESENTATION, FRETBOARD_SCHEMA_VERSION,
+                           FRETBOARD_STRUCTURED_DIM, prepare_paired_inputs, prepare_paired_inputs_v5)
+from fretboard_tracking import track_fretboard
 from shot_inspector import (_write_thumbnail, frame_timeline_sha256, inspect_shots,
                             prepare_automatic_shots, validate_frame_timeline)
 
 
-STAGES = ("alignment", "shots", "hands", "annotations", "geometry", "roles", "bundle")
+STAGES = ("alignment", "shots", "hands", "annotations", "geometry", "roles", "fretboard", "bundle")
 SHOT_STAGES = ("inspection", "automatic-inspection")
 KINDS = {
     "alignment": "video-to-trimmed-audio-alignment",
     "shots": "video-shot-inspection", "hands": "fingerstyle-hand-observations",
     "annotations": "guitar-geometry-annotations", "geometry": "guitar-geometry-observations",
-    "roles": "guitar-relative-hand-roles", "bundle": "paired-video-inputs",
+    "roles": "guitar-relative-hand-roles", "fretboard": "six-point-fretboard-observations",
+    "bundle": "paired-video-inputs",
 }
 SOURCE_TIME_POLICY = (
     "Original video bytes, integer source PTS and time base are retained. "
@@ -114,7 +118,7 @@ def _request(path):
     path = _path(path, file=True)
     document = _json(path)
     allowed = {"schemaVersion", "kind", "id", "video", "audio", "outputDirectory",
-               "pluckingScreenSide", "clips", "reuse", "handModel", "poseModel", "reviewMode"}
+               "pluckingScreenSide", "clips", "reuse", "handModel", "poseModel", "fretboardModel", "reviewMode"}
     if set(document) - allowed:
         raise EvidenceError(f"Unknown video request fields: {sorted(set(document) - allowed)}")
     if type(document.get("schemaVersion")) is not int or document["schemaVersion"] != 1 or document.get("kind") != "paired-video-preparation-request":
@@ -150,12 +154,13 @@ def _request(path):
     result["reuse"] = {name: str(_path(value, file=True, private=True)) for name, value in reuse.items()}
     result.setdefault("handModel", str(PRIVATE_OUTPUT_ROOT / "models" / "hand_landmarker.task"))
     result.setdefault("poseModel", None)
-    for name in ("handModel", "poseModel"):
+    result.setdefault("fretboardModel", None)
+    for name in ("handModel", "poseModel", "fretboardModel"):
         if result[name] is not None:
             result[name] = str(_path(result[name]))
     inputs = [Path(result[name]) for name in ("video", "audio")]
     other = [Path(p) for p in result["reuse"].values()]
-    other.extend(Path(result[n]) for n in ("handModel", "poseModel") if result[n])
+    other.extend(Path(result[n]) for n in ("handModel", "poseModel", "fretboardModel") if result[n])
     if len(set(inputs + other)) != len(inputs + other) or any(p.is_relative_to(output) for p in inputs + other + [path]):
         raise EvidenceError("Input paths must be distinct and outside the worker output directory.")
     return path, result
@@ -166,9 +171,9 @@ def _artifacts(path, stage):
         stage = "shots"
     path = _path(path, file=True, private=True)
     values = {str(path): sha256(path)}
-    if stage in ("hands", "geometry", "roles", "bundle"):
+    if stage in ("hands", "geometry", "roles", "fretboard", "bundle"):
         document = _json(path)
-        expected = "inputs.npz" if stage == "bundle" else f"{stage}.npz"
+        expected = "inputs.npz" if stage == "bundle" else "fretboard.npz" if stage == "fretboard" else f"{stage}.npz"
         key = "arraysPath" if stage == "bundle" else "arrays"
         if document.get(key) != expected:
             raise EvidenceError(f"{stage} must reference canonical local {expected}.")
@@ -242,13 +247,14 @@ def _validate_observation_archive(stage, path, count):
 
 def _validate_report(stage, path, request, sources, paths):
     document = _json(_path(path, file=True, private=True))
-    if stage == "bundle" and (document.get("schemaVersion") != PAIRED_SCHEMA_VERSION or "imageSize" in document):
+    expected_bundle_version = FRETBOARD_SCHEMA_VERSION if request.get("fretboardModel") else PAIRED_SCHEMA_VERSION
+    if stage == "bundle" and (document.get("schemaVersion") != expected_bundle_version or "imageSize" in document):
         raise EvidenceError("Older numeric/RGB bundles cannot be reused; rebuild the current geometry-and-hand inputs from cached observations in a NEW output directory.")
-    version = PAIRED_SCHEMA_VERSION if stage == "bundle" else 1
+    version = expected_bundle_version if stage == "bundle" else 1
     if document.get("kind") != KINDS[stage] or type(document.get("schemaVersion")) is not int or document["schemaVersion"] != version:
         raise EvidenceError(f"Invalid {stage} report schema.")
     _artifacts(path, stage)
-    if stage in ("alignment", "shots", "hands", "annotations", "geometry"):
+    if stage in ("alignment", "shots", "hands", "annotations", "geometry", "fretboard"):
         if document.get("videoSha256") != sources["video"]:
             raise EvidenceError(f"{stage} report does not match video hash.")
     if stage == "alignment":
@@ -281,7 +287,7 @@ def _validate_report(stage, path, request, sources, paths):
                 or document["firstPts"] != rows[0]["startPts"] or document["lastPts"] < document["firstPts"]
                 or document["lastPts"] >= rows[-1]["endPtsExclusive"] or min(document["width"], document["height"]) <= 0):
             raise EvidenceError("Shot endpoints and source dimensions are malformed.")
-    if stage in ("hands", "annotations", "geometry"):
+    if stage in ("hands", "annotations", "geometry", "fretboard"):
         if "shots" not in paths or document.get("shotsSha256") != sha256(paths["shots"]):
             raise EvidenceError(f"{stage} requires its exact source shot report.")
         shots = _json(paths["shots"])
@@ -291,7 +297,7 @@ def _validate_report(stage, path, request, sources, paths):
                 raise EvidenceError("Completed annotations contain incomplete shot geometry.")
             if any(row["geometry"] is not None or row.get("additionalKeyframes") for row in document["shots"]):
                 raise EvidenceError("Geometry preparation is disabled; reused annotations must contain only unavailable coordinates.")
-        else:
+        elif stage in ("hands", "geometry"):
             if any(document.get(key) != shots.get(key) for key in ("timeBase", "frameCount", "shotCount")):
                 raise EvidenceError(f"{stage} coverage differs from shots.")
             arrays = _validate_observation_archive(stage, path, shots["frameCount"])
@@ -311,6 +317,9 @@ def _validate_report(stage, path, request, sources, paths):
                     raise EvidenceError("Geometry point/state encoding is unsupported.")
                 if arrays["confidence"].any() or arrays["source"].any() or np.isfinite(arrays["coordinates"]).any():
                     raise EvidenceError("Geometry preparation is disabled; reused coordinates must remain unavailable.")
+        else:
+            if document.get("shotsSha256") != sha256(paths["shots"]) or document.get("modelSha256") != sha256(request["fretboardModel"]):
+                raise EvidenceError("Fretboard observations require the exact shots and detector model.")
     if stage in ("roles", "bundle"):
         required = {"shots", "hands", "geometry", "annotations"}
         if not required <= paths.keys():
@@ -327,11 +336,24 @@ def _validate_report(stage, path, request, sources, paths):
             _, _, _, audio_hashes = load_audio_clock(sources["video"], request["audio"], paths["alignment"])
             expected = {**inputs["hashes"], **audio_hashes, "roles": sha256(paths["roles"]),
                         "roleArrays": roles["arraysSha256"]}
+            if request.get("fretboardModel"):
+                if "fretboard" not in paths:
+                    raise EvidenceError("Schema-5 bundle reuse requires fretboard observations.")
+                fretboard_report = _json(paths["fretboard"])
+                expected.update(
+                    fretboard=sha256(paths["fretboard"]),
+                    fretboardArrays=fretboard_report["arraysSha256"],
+                )
             if document.get("inputSha256") != expected or document.get("id") != request["id"]:
                 raise EvidenceError("Reused bundle differs from source dependencies or id.")
-            if (document.get("inputRepresentation") != INPUT_REPRESENTATION
-                    or document.get("featureDimension") != STRUCTURED_DIM
-                    or document.get("featureLayout") != FEATURE_LAYOUT or document.get("viewOrder") != VIEW_ORDER):
+            representation, dimension, layout = (
+                (FRETBOARD_INPUT_REPRESENTATION, FRETBOARD_STRUCTURED_DIM, FRETBOARD_FEATURE_LAYOUT)
+                if request.get("fretboardModel")
+                else (INPUT_REPRESENTATION, STRUCTURED_DIM, FEATURE_LAYOUT)
+            )
+            if (document.get("inputRepresentation") != representation
+                    or document.get("featureDimension") != dimension
+                    or document.get("featureLayout") != layout or document.get("viewOrder") != VIEW_ORDER):
                 raise EvidenceError("Bundle must contain the supported numeric guitar-and-hand representation.")
             with np.load(Path(path).with_name("inputs.npz"), allow_pickle=False) as arrays:
                 if set(arrays.files) != {"structured", "structured_available", "pts", "audio_seconds", "technique_available", "segment_id"}:
@@ -339,6 +361,11 @@ def _validate_report(stage, path, request, sources, paths):
                 for start, stop in ((0, 98), (186, 194)):
                     if arrays["structured_available"][..., start:stop].any() or arrays["structured"][..., start:stop].any():
                         raise EvidenceError("Geometry and coarse input slots must remain zero and unavailable.")
+                if request.get("fretboardModel"):
+                    if document.get("schemaVersion") != 5 or arrays["structured"].shape[-1] != 233:
+                        raise EvidenceError("Fretboard preparation requires schema-5 D233 paired inputs.")
+                elif document.get("schemaVersion") != PAIRED_SCHEMA_VERSION:
+                    raise EvidenceError("Legacy hand-only preparation requires schema-4 paired inputs.")
             for name, value in document.get("inputPaths", {}).items():
                 if name not in expected or sha256(_path(value, file=True)) != expected[name]:
                     raise EvidenceError("Bundle inputPaths do not match its bound sources.")
@@ -390,7 +417,7 @@ class _Worker:
         files.update({request[n]: self.sources[n] for n in self.sources})
         for stage, path in request["reuse"].items():
             files.update(_artifacts(path, stage))
-        for name in ("handModel", "poseModel"):
+        for name in ("handModel", "poseModel", "fretboardModel"):
             if request[name] and Path(request[name]).is_file():
                 files[request[name]] = sha256(request[name])
         identity = {"request": request, "files": files, "runtime": _runtime()}
@@ -853,10 +880,27 @@ def _run(worker):
         config=RoleConfig(plucking_screen_side=r["pluckingScreenSide"]))[0],
         dependencies=("shots", "hands", "geometry", "annotations"), reuse=reuse.get("roles"))
     _validate_report("roles", roles, r, worker.sources, p)
-    bundle = worker.stage("bundle", lambda d: prepare_paired_inputs(
-        r["video"], shots, hands_path, geometry, annotations, roles, r["audio"], alignment, d, clips,
-        pair_id=r["id"])[0],
-        dependencies=("shots", "hands", "geometry", "annotations", "roles", "alignment"),
+    fretboard = None
+    if r["fretboardModel"]:
+        fretboard = worker.stage(
+            "fretboard",
+            lambda d: track_fretboard(r["video"], shots, r["fretboardModel"], d)[0],
+            dependencies=("shots",), reuse=reuse.get("fretboard"),
+        )
+        _validate_report("fretboard", fretboard, r, worker.sources, p)
+    if fretboard is not None:
+        bundle_operation = lambda d: prepare_paired_inputs_v5(
+            r["video"], shots, hands_path, geometry, annotations, roles, fretboard,
+            r["audio"], alignment, d, clips, pair_id=r["id"],
+        )[0]
+    else:
+        bundle_operation = lambda d: prepare_paired_inputs(
+            r["video"], shots, hands_path, geometry, annotations, roles,
+            r["audio"], alignment, d, clips, pair_id=r["id"],
+        )[0]
+    bundle_dependencies = ("shots", "hands", "geometry", "annotations", "roles", "alignment") + (("fretboard",) if fretboard is not None else ())
+    bundle = worker.stage("bundle", bundle_operation,
+        dependencies=bundle_dependencies,
         reuse=reuse.get("bundle"))
     bundle_document = _validate_report("bundle", bundle, r, worker.sources, p)
     if bundle_document["clips"] != request_clips(clips):
@@ -950,7 +994,7 @@ def _result_path(path, result, request_path):
     output = Path(request.get("outputDirectory", ""))
     if path.is_relative_to(output) or path in {Path(v) for v in result.get("artifacts", {}).values()}:
         raise EvidenceError("Result must be outside stage output directories and input artifacts.")
-    protected = [request.get(n) for n in ("video", "audio", "handModel", "poseModel")]
+    protected = [request.get(n) for n in ("video", "audio", "handModel", "poseModel", "fretboardModel")]
     protected.extend(request.get("reuse", {}).values())
     if path in {Path(p) for p in protected if p}:
         raise EvidenceError("Result cannot overwrite any source.")

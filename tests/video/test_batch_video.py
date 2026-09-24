@@ -111,7 +111,7 @@ class BatchVideoTests(unittest.TestCase):
         self.assertIn("synthetic: bundle: completed (processed).", messages)
         self.assertTrue(all(call.kwargs.get("flush") for call in output.call_args_list if call.args and str(call.args[0]).startswith("synthetic:")))
         self.assertEqual(result["status"], "ready")
-        self.assertEqual(set(result["artifacts"]), set(batch.STAGES))
+        self.assertEqual(set(result["artifacts"]), set(batch.STAGES) - {"fretboard"})
         shots = self.read(result["artifacts"]["shots"])
         self.assertEqual((shots["firstPts"], shots["lastPts"], shots["frameCount"]), (400, 2760, 60))
         self.assertEqual(shots["shots"][-1]["endPtsExclusive"], 2800)
@@ -165,6 +165,52 @@ class BatchVideoTests(unittest.TestCase):
             self.assertTrue(arrays["structured_available"][:, :2, 98:140].any())
             self.assertFalse(arrays["structured_available"][..., :98].any())
             self.assertFalse(arrays["structured_available"][..., 186:].any())
+
+    def test_fretboard_model_adds_resumable_stage_and_schema_five_bundle(self):
+        fretboard_model = self.root / "fretboard.pt"
+        fretboard_model.write_bytes(b"synthetic six-point detector")
+        self.config.update(reviewMode="automatic", fretboardModel=str(fretboard_model))
+        self.write_request()
+
+        def track(_video, shots_path, model_path, output):
+            shots = self.read(shots_path)
+            pts = np.asarray(shots["framePts"], np.int64)
+            shot_ids = np.zeros(len(pts), np.int32)
+            for row in shots["shots"]:
+                shot_ids[(pts >= row["startPts"]) & (pts < row["endPtsExclusive"])] = row["shotId"]
+            output.mkdir()
+            arrays = output / "fretboard.npz"
+            np.savez_compressed(
+                arrays, pts=pts, shot_id=shot_ids,
+                keypoints=np.full((len(pts), 3, 2, 2), np.nan, np.float32),
+                available=np.zeros((len(pts), 3, 2), bool),
+                confidence=np.zeros(len(pts), np.float32),
+                source=np.zeros(len(pts), np.int8),
+                age_seconds=np.zeros(len(pts), np.float32),
+                flow_error=np.zeros(len(pts), np.float32),
+                detector_anchor=np.zeros(len(pts), bool),
+            )
+            report = {
+                "schemaVersion": 1, "kind": "six-point-fretboard-observations",
+                "videoSha256": sha256(self.video), "shotsSha256": sha256(shots_path),
+                "modelSha256": sha256(model_path), "timeBase": shots["timeBase"],
+                "frameCount": len(pts), "shotCount": len(shots["shots"]),
+                "sourceEncoding": {"unavailable": 0, "detector": 1, "optical_flow": 2},
+                "arrays": "fretboard.npz", "arraysSha256": sha256(arrays),
+            }
+            path = output / "fretboard.json"
+            path.write_text(json.dumps(report))
+            return path, report
+
+        with patch.object(batch, "track_fretboard", side_effect=track):
+            result = batch.run_request(self.request)
+        self.assertEqual(result["status"], "ready")
+        self.assertIn("fretboard", result["artifacts"])
+        bundle = self.read(result["artifacts"]["bundle"])
+        self.assertEqual(bundle["schemaVersion"], 5)
+        self.assertEqual(bundle["featureDimension"], 233)
+        with np.load(Path(result["artifacts"]["bundle"]).with_name("inputs.npz")) as arrays:
+            self.assertEqual(arrays["structured"].shape[-1], 233)
 
     def test_reuse_full_chain_and_multiple_clips_never_redetect(self):
         result = self.ready()
