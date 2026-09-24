@@ -78,6 +78,12 @@ String/fret proximity, landmark reliability and any thumb-to-voice decoder
 preference require separately versioned inputs or independently validated
 evidence and are not part of architecture 5.
 
+New fretboard-aware training uses video architecture 6 with schema-5 D233
+inputs. D194 remains the unchanged prefix. Appended channels contain masked
+fingertip scale/string/fret evidence, geometry-relative velocity and geometry
+quality. New joint training starts from random initialization. Historical
+architecture-4/5 checkpoints remain inference-only.
+
 ## Label a fretboard detector
 
 The local annotation UI samples source frames without resizing them. Its six

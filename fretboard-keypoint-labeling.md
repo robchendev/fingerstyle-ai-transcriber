@@ -30,13 +30,11 @@ six points to be available.
 From the repository root:
 
 ```powershell
-.\scripts\video-evidence\.venv\Scripts\python.exe -m scripts.fretboard_annotation init --video-directory runs\video-evidence\sources --frames-per-video 5 --output data\fretboard-keypoints
+.\scripts\video-evidence\.venv\Scripts\python.exe -m scripts.fretboard_annotation select --video-directory runs\video-evidence\sources --shots-directory runs\video-evidence\inspection --target-frames 1000 --candidates-per-video 24 --minimum-per-video 1 --maximum-per-video 12 --output data\fretboard-keypoints 2>&1 | Tee-Object -FilePath runs\fretboard-selection.log
 ```
 
-Frames retain their native source resolution. Five frames for each of roughly
-210 videos produces about 1,050 candidate images. A diversity-selection stage
-will replace uniform sampling before the production labeling pass; use the
-current command only for testing the UI.
+Frames retain native resolution. Selection uses available shot reports,
+rejects unusable frames, and deduplicates visual views across the corpus.
 
 ## Test the UI now on Windows
 
@@ -60,11 +58,9 @@ Controls:
 - Mouse wheel: zoom
 - Middle- or right-button drag: pan
 - `1` through `6`: select a keypoint
-- `V`: place visible points
-- `O`: place occluded points
-- `X`: clear the selected point
-- `[` and `]`: previous and next frame
-- **Complete**: mark the frame fully reviewed
+- `Q`, `W`, `E`: available, occluded, unavailable
+- Left/right arrows: previous and next frame
+- Enter: complete and advance
 
 ## Stop and resume
 
@@ -93,9 +89,7 @@ required for annotation because sampled images are included.
 Create an annotation environment from the repository root:
 
 ```bash
-python3.12 -m venv .venv-annotation
-source .venv-annotation/bin/activate
-python -m pip install opencv-python
+python3.12 -m venv .venv-annotation && source .venv-annotation/bin/activate && python -m pip install opencv-python
 ```
 
 Start or resume the UI:
@@ -132,8 +126,7 @@ A production target may reach approximately 800-1,150 diverse images:
 - 100-150 independently reviewed validation frames
 
 Six-point labeling is expected to take roughly 12-24 total hours, spread
-across resumable sessions. Repeated angles should be removed by the planned
-diversity selector before starting the production pass.
+across resumable sessions. The selector removes repeated views before labeling.
 
 Do not label the full target before testing whether the labels work. Stop after
 the first 300-400 diverse frames and train a pilot detector. Add more labels
@@ -172,18 +165,29 @@ using `imgsz=3840`; it will normally require a CUDA GPU and a small batch.
 Start with the nano pose architecture and batch size one, then increase the
 batch only if GPU memory permits.
 
-The repository does not yet expose a finalized training wrapper or pin an
-Ultralytics training dependency. Until that is implemented and validated, do
-not treat an ad-hoc training command as the reproducible production workflow.
-The intended settings are:
+Install pinned training dependencies:
 
-- Task: pose
-- Keypoint shape: `[6, 3]`
-- Input size: `3840`
-- Initial checkpoint: YOLO nano pose, or its architecture trained from scratch
-- Batch size: begin at `1`
-- Grouped train/validation/test splits from `data.yaml`
-- Best checkpoint selected from held-out keypoint quality, not training loss
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-fretboard.txt
+```
+
+Validate the request without training:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.fretboard_training --dataset data\fretboard-keypoints --output runs\fretboard-detector --device 0 --dry-run
+```
+
+Run 4K training yourself with live output and a saved log:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.fretboard_training --dataset data\fretboard-keypoints --output runs\fretboard-detector --image-size 3840 --batch-size 1 --epochs 200 --patience 30 --device 0 2>&1 | Tee-Object -FilePath runs\fretboard-detector-training.log
+```
+
+Resume from Ultralytics `last.pt`:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.fretboard_training --dataset data\fretboard-keypoints --output runs\fretboard-detector --image-size 3840 --batch-size 1 --epochs 200 --patience 30 --device 0 --resume runs\fretboard-detector\weights\last.pt 2>&1 | Tee-Object -FilePath runs\fretboard-detector-resume.log
+```
 
 ### 4. Evaluate on held-out videos
 
@@ -215,8 +219,8 @@ After the pilot:
 5. Retrain and compare against the unchanged held-out set.
 
 Repeat until additional labels no longer improve held-out video behavior.
-Model-assisted pre-label import and diversity selection are still to be
-implemented; manual annotations remain usable without them.
+Model-assisted pre-label import is not implemented. Diversity selection is
+available through the `select` command.
 
 ### 6. Adopt the trained checkpoint
 
@@ -245,8 +249,25 @@ The production geometry pass will:
 - Mask unavailable or invalid geometry
 - Cache each completed video for safe resume
 
-The six-point detector is not yet wired into the final paired-input producer.
-Complete and validate that integration before processing all 8.5 hours.
+Add these top-level fields to the batch manifest:
+
+```json
+{"videoPython":"scripts\\video-evidence\\.venv\\Scripts\\python.exe","fretboardModel":"runs\\fretboard-detector\\weights\\best.pt","workers":16}
+```
+
+Install detector inference dependencies into the video environment:
+
+```powershell
+.\scripts\video-evidence\.venv\Scripts\python.exe -m pip install -r requirements-fretboard.txt
+```
+
+Run corpus preparation yourself with live output and a saved log:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.prepare_training_data batch --manifest runs\batch.json --output-directory runs\video-evidence\batches\dataset-v1 2>&1 | Tee-Object -FilePath runs\fretboard-corpus-preparation.log
+```
+
+Repeat the same command to resume completed stages.
 
 ### 8. Retrain and compare the transcriber
 
@@ -261,3 +282,31 @@ After geometry bundles are complete:
 
 Fretboard geometry is useful only if it improves held-out transcription; do
 not assume higher visual coverage automatically improves tablature accuracy.
+
+Generate and preflight the new configuration:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.transcriber config --manifest data\releases\dataset-v1\manifest.json --video-index runs\video-evidence\batches\dataset-v1\paired-index.json --output runs\joint-v5-config.json
+```
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.transcriber preflight --config runs\joint-v5-config.json --forward --output runs\joint-v5-preflight.json 2>&1 | Tee-Object -FilePath runs\joint-v5-preflight.log
+```
+
+Run training yourself. The default is a 100-epoch ceiling with decoded-event
+early stopping and learning-rate reduction:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.transcriber train --config runs\joint-v5-config.json --run-dir runs\joint-v5-training 2>&1 | Tee-Object -FilePath runs\joint-v5-training.log
+```
+
+Resume from the exact latest checkpoint:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.transcriber train --config runs\joint-v5-config.json --run-dir runs\joint-v5-training --resume runs\joint-v5-training\latest.pt 2>&1 | Tee-Object -FilePath runs\joint-v5-resume.log
+```
+
+For ablations, copy the configuration to separate files and set
+`video.model.experiment_mode` to `original-hands`, `role-gates`, or `geometry`.
+Use a separate audio-only configuration without `video`. Never reuse a run
+directory across modes.
