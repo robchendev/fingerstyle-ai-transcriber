@@ -12,19 +12,22 @@ from torch import Tensor, nn
 from torch.nn.utils.rnn import pack_sequence, pad_packed_sequence
 
 from .transcriber_model import FingerstyleTranscriber, _integer, _real, _tensor
-from .video_features import OBSERVATION_SLICES, SCHEMA_VERSION, STRUCTURED_DIM, VELOCITY_SLICES, VIEW_ORDER
+from .video_features import SCHEMA_VERSION as LEGACY_SCHEMA_VERSION, STRUCTURED_DIM as LEGACY_STRUCTURED_DIM, VELOCITY_SLICES, VIEW_ORDER
+from .fretboard_features import SCHEMA_VERSION, STRUCTURED_DIM
 
 
-ROLE_FEATURE_GROUP_VERSION = "anatomy-representation-groups-v1"
+LEGACY_ROLE_FEATURE_GROUP_VERSION = "anatomy-representation-groups-v1"
+ROLE_FEATURE_GROUP_VERSION = "anatomy-fretboard-groups-v2"
 ROLE_FEATURE_GROUPS = (
     "thumb_position", "fingertip_position", "other_position",
     "thumb_motion", "fingertip_motion", "other_motion",
     "instrument_context", "orientation",
+    "fretboard_position", "fretboard_motion", "geometry_quality",
 )
 _THUMB = frozenset((1, 2, 3, 4))
 _FINGERTIPS = frozenset((8, 12, 16, 20))
-_FRETTING_INITIAL_SCALES = (.75, 1.25, 1., .75, .9, .75, 1., .9)
-_PLUCKING_INITIAL_SCALES = (1., 1., .9, 1.25, 1.25, 1., 1., 1.)
+_FRETTING_INITIAL_SCALES = (.75, 1.25, 1., .75, .9, .75, 1., .9, 1.25, .9, 1.)
+_PLUCKING_INITIAL_SCALES = (1., 1., .9, 1.25, 1.25, 1., 1., 1., 1., 1.25, 1.)
 _NEUTRAL_INITIAL_SCALES = (1.,) * len(ROLE_FEATURE_GROUPS)
 _VIDEO_FIELDS = frozenset({
     "technique_available", "segment_id", "structured", "structured_available", "frame_indices",
@@ -37,24 +40,35 @@ class VideoConfig:
     temporal_layers: int = 1
     structured_dim: int = STRUCTURED_DIM
     input_schema_version: int = SCHEMA_VERSION
-    architecture_version: int = 5
+    architecture_version: int = 6
     modality_dropout: float = 0.2
     feature_group_version: str | None = ROLE_FEATURE_GROUP_VERSION
 
     def __post_init__(self):
         _integer("hidden_size", self.hidden_size, 1)
         _integer("temporal_layers", self.temporal_layers, 1)
-        _integer("structured_dim", self.structured_dim, STRUCTURED_DIM, STRUCTURED_DIM)
-        _integer("input_schema_version", self.input_schema_version, SCHEMA_VERSION, SCHEMA_VERSION)
-        _integer("architecture_version", self.architecture_version, 4, 5)
+        _integer("structured_dim", self.structured_dim, LEGACY_STRUCTURED_DIM, STRUCTURED_DIM)
+        _integer("input_schema_version", self.input_schema_version, LEGACY_SCHEMA_VERSION, SCHEMA_VERSION)
+        _integer("architecture_version", self.architecture_version, 4, 6)
         _real("modality_dropout", self.modality_dropout, 0, 1)
-        expected_groups = ROLE_FEATURE_GROUP_VERSION if self.architecture_version == 5 else None
+        expected_groups = (
+            ROLE_FEATURE_GROUP_VERSION if self.architecture_version == 6
+            else LEGACY_ROLE_FEATURE_GROUP_VERSION if self.architecture_version == 5
+            else None
+        )
         if self.feature_group_version != expected_groups:
-            raise ValueError(f"feature_group_version must be {ROLE_FEATURE_GROUP_VERSION}")
+            raise ValueError(f"feature_group_version differs from architecture version {self.architecture_version}")
+        expected_contract = (
+            (SCHEMA_VERSION, STRUCTURED_DIM) if self.architecture_version == 6
+            else (LEGACY_SCHEMA_VERSION, LEGACY_STRUCTURED_DIM)
+        )
+        if (self.input_schema_version, self.structured_dim) != expected_contract:
+            raise ValueError("Video architecture, input schema, and structured dimension disagree.")
 
 
-def _feature_group_indices():
-    groups = [[] for _ in ROLE_FEATURE_GROUPS]
+def _feature_group_indices(architecture_version):
+    count = len(ROLE_FEATURE_GROUPS) if architecture_version == 6 else 8
+    groups = [[] for _ in range(count)]
     for position_start, motion_start in ((0, 42), (98, 140)):
         for point in range(21):
             category = 0 if point in _THUMB else 1 if point in _FINGERTIPS else 2
@@ -63,17 +77,23 @@ def _feature_group_indices():
     groups[5].extend((182, 183))
     groups[6].extend((*range(84, 98), *range(186, 194)))
     groups[7].extend((184, 185))
+    dimension = LEGACY_STRUCTURED_DIM
+    if architecture_version == 6:
+        groups[8].extend(range(194, 219))
+        groups[9].extend(range(219, 229))
+        groups[10].extend(range(229, 233))
+        dimension = STRUCTURED_DIM
     flattened = [index for group in groups for index in group]
-    if sorted(flattened) != list(range(STRUCTURED_DIM)) or len(flattened) != len(set(flattened)):
-        raise RuntimeError("Role feature groups must partition the D194 contract exactly once.")
+    if sorted(flattened) != list(range(dimension)) or len(flattened) != len(set(flattened)):
+        raise RuntimeError("Role feature groups must partition the input contract exactly once.")
     return tuple(tuple(group) for group in groups)
 
 
-ROLE_FEATURE_GROUP_INDICES = _feature_group_indices()
+ROLE_FEATURE_GROUP_INDICES = _feature_group_indices(6)
 
 
 class _RoleFeatureGates(nn.Module):
-    def __init__(self, initial_scales):
+    def __init__(self, initial_scales, architecture_version):
         super().__init__()
         if (
             len(initial_scales) != len(ROLE_FEATURE_GROUPS)
@@ -82,8 +102,9 @@ class _RoleFeatureGates(nn.Module):
             raise ValueError("Role feature gate scales must be positive and cover every feature group.")
         values = torch.tensor(initial_scales, dtype=torch.float32)
         self.log_scales = nn.Parameter(values.log())
-        feature_groups = torch.empty(STRUCTURED_DIM, dtype=torch.long)
-        for group, indices in enumerate(ROLE_FEATURE_GROUP_INDICES):
+        indices_by_group = _feature_group_indices(architecture_version)
+        feature_groups = torch.empty(sum(map(len, indices_by_group)), dtype=torch.long)
+        for group, indices in enumerate(indices_by_group):
             feature_groups[list(indices)] = group
         self.register_buffer("feature_groups", feature_groups, persistent=False)
 
@@ -118,9 +139,13 @@ def _segmented_temporal(values, active, segment_ids, recurrent):
 
 def _technique_structure_mask(structured_available, segment_ids):
     active = structured_available.any(dim=-1)
-    observed = torch.zeros_like(active)
-    for start, stop in OBSERVATION_SLICES:
-        observed |= structured_available[:, :, start:stop].any(dim=-1)
+    observations = structured_available.clone()
+    slices = list(VELOCITY_SLICES)
+    if structured_available.shape[-1] == STRUCTURED_DIM:
+        slices.append((219, 229))
+    for start, stop in slices:
+        observations[:, :, start:stop] = False
+    observed = observations.any(dim=-1)
     starts = torch.ones_like(active)
     starts[:, 1:] = ~active[:, :-1] | (segment_ids[:, 1:] != segment_ids[:, :-1])
     positions = torch.arange(active.shape[1], device=active.device).expand(active.shape[0], -1)
@@ -132,7 +157,7 @@ def _technique_structure_mask(structured_available, segment_ids):
     continuation = torch.zeros_like(active)
     continuation[:, 1:] = active[:, 1:] & active[:, :-1] & (segment_ids[:, 1:] == segment_ids[:, :-1])
     result = structured_available.clone()
-    for start, stop in VELOCITY_SLICES:
+    for start, stop in slices:
         result[:, :, start:stop] &= continuation[:, :, None]
     return result
 
@@ -142,8 +167,11 @@ class _StructuredBranch(nn.Module):
         super().__init__()
         hidden = config.hidden_size
         self.feature_gates = (
-            _RoleFeatureGates(initial_scales)
-            if config.architecture_version == 5
+            _RoleFeatureGates(
+                initial_scales if config.architecture_version == 6 else initial_scales[:8],
+                config.architecture_version,
+            )
+            if config.architecture_version >= 5
             else nn.Identity()
         )
         self.structure_encoder = nn.Sequential(
@@ -216,7 +244,7 @@ class AudioVideoTranscriber(nn.Module):
         }
         for name, (shape, dtype) in shapes.items():
             _tensor(f"video.{name}", video[name], shape, dtype=dtype, device=device, finite=True)
-        if video["structured_available"][:, :, 2:, 186:].any().item():
+        if video["structured_available"][:, :, 2:, 186:194].any().item():
             raise ValueError("Coarse instrument context requires known playing roles, not anonymous views")
         available = video["structured_available"].any(dim=-1)
         segments = video["segment_id"]

@@ -383,7 +383,7 @@ def _validate_loader_signature(signature):
 
 def _joint_video_config(identity):
     from .transcriber_video import VideoConfig
-    from .video_features import SCHEMA_VERSION as VIDEO_SCHEMA_VERSION, STRUCTURED_DIM
+    from .fretboard_features import SCHEMA_VERSION as VIDEO_SCHEMA_VERSION, STRUCTURED_DIM
 
     video = identity.get("video")
     if not isinstance(video, dict) or not isinstance(video.get("config"), dict):
@@ -391,10 +391,10 @@ def _joint_video_config(identity):
     values = video["config"]
     if "image_size" in values or values.get("input_schema_version") != VIDEO_SCHEMA_VERSION:
         raise ValueError("Historical or unversioned paired checkpoints are unsupported; expected numeric video input schema 4. Repackage cached observations into new bundles; do not reinterpret old checkpoints.")
-    if "freeze_audio" in values or values.get("architecture_version") != 5:
-        raise ValueError("Frozen, historical or unversioned paired checkpoints are unsupported; expected joint video architecture_version 5")
+    if "freeze_audio" in values or values.get("architecture_version") != 6:
+        raise ValueError("Frozen, historical or unversioned paired checkpoints are unsupported; expected joint video architecture_version 6")
     if values.get("structured_dim") != STRUCTURED_DIM:
-        raise ValueError("Historical paired checkpoints are unsupported; expected four-view 194D guitar-hand-coarse inputs")
+        raise ValueError("Historical paired checkpoints are unsupported; expected four-view 233D fretboard-aware inputs")
     _keys(values, asdict(VideoConfig()), "joint video model configuration")
     initialization = identity.get("initialization")
     if initialization is not None and initialization != {
@@ -622,6 +622,8 @@ def _validate_inference_checkpoint(payload):
             continue
         if key == "video_config" and values.get("architecture_version") == 4 and "feature_group_version" not in values:
             values["feature_group_version"] = None
+        if key == "video_config" and values.get("architecture_version") == 5 and "feature_group_version" not in values:
+            values["feature_group_version"] = "anatomy-representation-groups-v1"
         _keys(values, {field.name for field in fields(cls)}, key)
         try:
             configs[key] = cls(**values)

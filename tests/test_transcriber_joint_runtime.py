@@ -13,7 +13,8 @@ from scripts import transcriber_runtime as runtime
 from scripts.transcriber_data import collate_windows
 from scripts.transcriber_model import FingerstyleTranscriber, ModelConfig
 from scripts.transcriber_video import AudioVideoTranscriber, VideoConfig
-from scripts.video_features import STRUCTURED_DIM, VELOCITY_SLICES
+from scripts.fretboard_features import STRUCTURED_DIM
+from scripts.video_features import VELOCITY_SLICES
 from tests.test_transcriber_model import synthetic_targets
 
 
@@ -60,7 +61,8 @@ class JointRuntimeTests(unittest.TestCase):
                 },
             })
             video = items[-1]["video"]
-            video["structured_available"][:, 2:, 186:] = False
+            video["structured_available"][:, 2:, 186:194] = False
+            video["structured_available"][:, :, 194:] = False
             for start, stop in VELOCITY_SLICES:
                 video["structured_available"][0, :, start:stop] = False
             video["structured"][:, :, 84:88] = torch.tensor([1., 0., 0., 0.])

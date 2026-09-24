@@ -14,7 +14,7 @@ from scripts import transcriber
 from scripts.dataset_io import ROOT, publish_json, read_json
 from scripts.transcriber_audio import HarnessError
 from scripts.transcriber_model import FingerstyleTranscriber, ModelConfig
-from scripts.video_features import SCHEMA_VERSION, STRUCTURED_DIM
+from scripts.fretboard_features import SCHEMA_VERSION, STRUCTURED_DIM
 
 
 class PairedCommandTests(unittest.TestCase):
@@ -117,13 +117,13 @@ class PairedCommandTests(unittest.TestCase):
     def test_configuration_starts_joint_v4_without_reading_an_audio_checkpoint(self):
         from scripts.paired_video import build_index
         from tests.test_dataset_release import synthetic_release
-        from tests.test_paired_video import bundle_fixture
+        from tests.test_paired_video import bundle_fixture, schema5_bundle_fixture
 
         with TemporaryDirectory(dir=ROOT / "runs") as directory:
             root = Path(directory)
             path = root / "config.json"
             manifest = synthetic_release(root / "custom-release")
-            bundle, _, _ = bundle_fixture(root, manifest.parent / "audio" / "piece-0.flac")
+            bundle, _, _ = schema5_bundle_fixture(root, manifest.parent / "audio" / "piece-0.flac")
             index, index_document = build_index(manifest, [bundle], root / "paired-index.json", root=ROOT)
             base = transcriber.default_config()
             with patch("scripts.transcriber_runtime.load_checkpoint", side_effect=AssertionError("Fresh joint configuration must not read weights")), patch("sys.stdout", new=StringIO()) as output:
@@ -137,7 +137,7 @@ class PairedCommandTests(unittest.TestCase):
             self.assertEqual(value["training"], base["training"])
             self.assertEqual(value["video"]["index"], str(index))
             self.assertEqual(value["data"]["manifest"], str(manifest.relative_to(ROOT)))
-            self.assertEqual(value["video"]["model"]["architecture_version"], 5)
+            self.assertEqual(value["video"]["model"]["architecture_version"], 6)
             self.assertEqual(value["video"]["model"]["input_schema_version"], SCHEMA_VERSION)
             self.assertEqual(value["video"]["model"]["structured_dim"], STRUCTURED_DIM)
             self.assertEqual(value["video"]["model"]["modality_dropout"], .2)
@@ -329,7 +329,7 @@ class PairedCommandTests(unittest.TestCase):
             paired, base = read_json(root / "paired.json"), read_json(root / "audio-only.json")
             self.assertEqual(len(calls), 1)
             self.assertTrue(paired["pairedVideo"]["provided"])
-            self.assertEqual(paired["pairedVideo"]["architectureVersion"], 5)
+            self.assertEqual(paired["pairedVideo"]["architectureVersion"], 6)
             self.assertEqual(paired["pairedVideo"]["inputSchemaVersion"], SCHEMA_VERSION)
             self.assertEqual(paired["pairedVideo"]["featureDimension"], STRUCTURED_DIM)
             self.assertTrue(base["pairedVideo"]["audioOnlyFallback"])

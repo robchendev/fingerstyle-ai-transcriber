@@ -151,14 +151,14 @@ def run_identity(dataset, config, features, model, training, device):
 
 def video_model_config(values):
     from .transcriber_video import VideoConfig
-    from .video_features import SCHEMA_VERSION, STRUCTURED_DIM
+    from .fretboard_features import SCHEMA_VERSION, STRUCTURED_DIM
 
     if not isinstance(values, dict) or values.keys() - {field.name for field in fields(VideoConfig)}:
         raise HarnessError("Unknown video model configuration fields. Only numeric landmark/motion/geometry inputs are supported, not RGB checkpoints.")
-    if values.get("architecture_version") != 5 or values.get("input_schema_version") != SCHEMA_VERSION:
-        raise HarnessError("Paired models require explicit joint video architecture_version 5 and input_schema_version 4; historical, frozen or unversioned paired configurations cannot be resumed or reinterpreted.")
+    if values.get("architecture_version") != 6 or values.get("input_schema_version") != 5:
+        raise HarnessError("Paired models require explicit joint video architecture_version 6 and input_schema_version 5; historical, frozen or unversioned paired configurations cannot be resumed or reinterpreted.")
     if values.get("structured_dim") != STRUCTURED_DIM:
-        raise HarnessError(f"Paired models require structured_dim {STRUCTURED_DIM} with four guitar-hand-coarse views; historical configurations cannot be reinterpreted.")
+        raise HarnessError(f"Paired models require structured_dim {STRUCTURED_DIM} with four fretboard-aware views; historical configurations cannot be reinterpreted.")
     return VideoConfig(**values)
 
 

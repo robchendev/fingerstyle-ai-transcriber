@@ -19,7 +19,8 @@ from scripts.transcriber_video import (
     ROLE_FEATURE_GROUPS, ROLE_FEATURE_GROUP_INDICES,
     AudioVideoTranscriber, VideoConfig,
 )
-from scripts.video_features import STRUCTURED_DIM, VELOCITY_SLICES, VIEW_ORDER
+from scripts.fretboard_features import STRUCTURED_DIM
+from scripts.video_features import VELOCITY_SLICES, VIEW_ORDER
 from tests.test_transcriber_events import WindowFixture
 from tests.test_transcriber_model import synthetic_targets
 
@@ -36,8 +37,8 @@ def visual_inputs(batch=1, frames=5, count=5):
         "structured_available": torch.ones(batch, count, len(VIEW_ORDER), STRUCTURED_DIM, dtype=torch.bool),
         "frame_indices": torch.arange(frames).clamp_max(count - 1).expand(batch, -1).clone(),
     }
-    result["structured_available"][:, :, 2:, 186:] = False
-    result["structured"][:, :, 2:, 186:] = 0
+    result["structured_available"][:, :, 2:, 186:194] = False
+    result["structured"][:, :, 2:, 186:194] = 0
     return result
 
 
@@ -139,18 +140,18 @@ class VideoTests(unittest.TestCase):
     def test_config_is_explicit_joint_and_json_serializable(self):
         config = VideoConfig()
         self.assertEqual(asdict(config), {
-            "hidden_size": 64, "temporal_layers": 1, "structured_dim": 194,
-            "input_schema_version": 4, "architecture_version": 5, "modality_dropout": .2,
-            "feature_group_version": "anatomy-representation-groups-v1",
+            "hidden_size": 64, "temporal_layers": 1, "structured_dim": 233,
+            "input_schema_version": 5, "architecture_version": 6, "modality_dropout": .2,
+            "feature_group_version": "anatomy-fretboard-groups-v2",
         })
         self.assertEqual(VideoConfig(**json.loads(json.dumps(asdict(config)))), config)
         with self.assertRaises(FrozenInstanceError):
             config.hidden_size = 12
         for options in (
             {"hidden_size": 0}, {"temporal_layers": 0},
-            {"structured_dim": 98}, {"structured_dim": 186}, {"structured_dim": 193}, {"structured_dim": 195},
-            {"input_schema_version": 1}, {"input_schema_version": 2}, {"input_schema_version": 3},
-            {"architecture_version": 1}, {"architecture_version": 2}, {"architecture_version": 3}, {"architecture_version": 4},
+            {"structured_dim": 98}, {"structured_dim": 194}, {"structured_dim": 232}, {"structured_dim": 234},
+            {"input_schema_version": 1}, {"input_schema_version": 2}, {"input_schema_version": 4},
+            {"architecture_version": 1}, {"architecture_version": 2}, {"architecture_version": 3}, {"architecture_version": 4}, {"architecture_version": 5},
             {"feature_group_version": "unknown"},
             {"modality_dropout": -.1}, {"modality_dropout": 1.1},
             {"modality_dropout": float("nan")}, {"modality_dropout": float("inf")},
@@ -191,8 +192,8 @@ class VideoTests(unittest.TestCase):
 
     def test_role_feature_groups_partition_d194_and_use_role_specific_nonzero_biases(self):
         flattened = [index for group in ROLE_FEATURE_GROUP_INDICES for index in group]
-        self.assertEqual(len(ROLE_FEATURE_GROUPS), 8)
-        self.assertEqual(sorted(flattened), list(range(194)))
+        self.assertEqual(len(ROLE_FEATURE_GROUPS), 11)
+        self.assertEqual(sorted(flattened), list(range(233)))
         self.assertEqual(len(flattened), len(set(flattened)))
         fretting = self.model.position_branch.feature_gates.log_scales.exp()
         plucking = self.model.technique_branch.feature_gates.log_scales.exp()
@@ -1093,7 +1094,9 @@ class VideoRuntimeTests(unittest.TestCase):
         from tests.test_paired_video import bundle_fixture
 
         manifest = synthetic_release(self.root / "release")
-        bundle, _, _ = bundle_fixture(self.root, self.root / "release" / "audio" / "piece-0.flac")
+        from tests.test_paired_video import schema5_bundle_fixture
+
+        bundle, _, _ = schema5_bundle_fixture(self.root, self.root / "release" / "audio" / "piece-0.flac")
         index, _ = build_index(manifest, [bundle], self.root / "index.json", root=self.root)
         feature_config = FeatureConfig(sample_rate=8000, n_fft=512, hop_length=160, n_mels=16, f_max=3000)
         model_config = ModelConfig(architecture_version=2, n_mels=16, hidden_size=8, recurrent_layers=1)
