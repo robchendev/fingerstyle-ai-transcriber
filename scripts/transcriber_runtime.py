@@ -21,7 +21,7 @@ from .connection_supervision import CONNECTION_TYPES, V4_NOTE_TECHNIQUE_TYPES, v
 from torch.utils.data import BatchSampler, DataLoader, SequentialSampler
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 INFERENCE_FORMAT = "fingerstyle-inference"
 INFERENCE_SCHEMA_VERSION = 1
 _PRIOR_NAMES = frozenset({"harmonic_sparsity", "percussion_sparsity"})
@@ -78,7 +78,7 @@ def _device_name(value):
 
 @dataclass(frozen=True)
 class TrainingConfig:
-    epochs: int = 20
+    epochs: int = 100
     learning_rate: float = 0.001
     weight_decay: float = 0.0001
     gradient_clip: float = 1.0
@@ -87,6 +87,10 @@ class TrainingConfig:
     max_steps: int | None = None
     sparsity_weight: float = 0.02
     max_seconds: float | None = None
+    event_patience: int = 12
+    learning_rate_patience: int = 4
+    learning_rate_factor: float = 0.5
+    minimum_learning_rate: float = 0.00001
 
     def __post_init__(self):
         _integer(self.epochs, "epochs", 1)
@@ -102,6 +106,16 @@ class TrainingConfig:
         _finite(self.sparsity_weight, "sparsity_weight")
         if self.max_seconds is not None:
             _finite(self.max_seconds, "max_seconds", positive=True)
+        _integer(self.event_patience, "event_patience", 1)
+        _integer(self.learning_rate_patience, "learning_rate_patience", 1)
+        if self.learning_rate_patience >= self.event_patience:
+            raise ValueError("learning_rate_patience must be less than event_patience")
+        _finite(self.learning_rate_factor, "learning_rate_factor", positive=True)
+        if self.learning_rate_factor >= 1:
+            raise ValueError("learning_rate_factor must be below one")
+        _finite(self.minimum_learning_rate, "minimum_learning_rate", positive=True)
+        if self.minimum_learning_rate > self.learning_rate:
+            raise ValueError("minimum_learning_rate cannot exceed learning_rate")
 
 
 class TrainingBudgetExpired(Exception):
@@ -406,10 +420,10 @@ def _joint_video_config(identity):
 
 
 def _validate_checkpoint(payload):
-    if not isinstance(payload, dict) or type(payload.get("schema_version")) is not int or payload["schema_version"] not in (1, SCHEMA_VERSION):
+    if not isinstance(payload, dict) or type(payload.get("schema_version")) is not int or payload["schema_version"] not in (1, 2, SCHEMA_VERSION):
         raise ValueError("Unsupported checkpoint schema version")
     version = payload["schema_version"]
-    _keys(payload, _CHECKPOINT_KEYS | ({"resume_state"} if version == 2 else set()), "checkpoint")
+    _keys(payload, _CHECKPOINT_KEYS | ({"resume_state"} if version >= 2 else set()), "checkpoint")
     if not isinstance(payload["run_id"], str) or not re.fullmatch("[0-9a-f]{32}", payload["run_id"]):
         raise ValueError("Invalid run identity")
     _identity(payload["identity"])
@@ -418,6 +432,8 @@ def _validate_checkpoint(payload):
     config_keys = set(asdict(TrainingConfig()))
     if version == 1:
         config_keys.discard("max_seconds")
+    if version < 3:
+        config_keys -= {"event_patience", "learning_rate_patience", "learning_rate_factor", "minimum_learning_rate"}
     _keys(payload["training_config"], config_keys, "training config")
     config = TrainingConfig(**payload["training_config"])
     runtime = payload["runtime"]
@@ -456,7 +472,12 @@ def _validate_checkpoint(payload):
             if parameter in parameters:
                 raise ValueError("Duplicate optimizer parameter index")
             parameters.add(parameter)
-        if group.get("lr") != config.learning_rate or group.get("weight_decay") != config.weight_decay:
+        lr = group.get("lr")
+        if (
+            type(lr) not in (int, float) or not math.isfinite(lr)
+            or not config.minimum_learning_rate <= lr <= config.learning_rate
+            or group.get("weight_decay") != config.weight_decay
+        ):
             raise ValueError("Optimizer hyperparameters differ from checkpoint config")
         allowed = set(_OPTIMIZER_OPTIONS) | {"params", "lr", "weight_decay", "decoupled_weight_decay"}
         if set(group) - allowed or not set(_OPTIMIZER_OPTIONS).issubset(group):
@@ -555,7 +576,7 @@ def _validate_checkpoint(payload):
         elif "video" in payload["identity"]:
             raise ValueError("Joint checkpoint history requires actual optimizer update and skipped-batch counts")
         previous_step = step
-    if version == 2:
+    if version >= 2:
         resume_state = payload["resume_state"]
         _keys(resume_state, {"phase", "validation_pending", "event_evaluation_required", "optimizer_updates", "optimizer_skipped_batches", "stopped_by"}, "resume state")
         phase = resume_state["phase"]
@@ -1324,6 +1345,17 @@ def _best_event_selection(history, run_id):
     return best
 
 
+def _event_plateau(history):
+    scores = [
+        entry["validation"]["decoded_events"]["score"]
+        for entry in history if "decoded_events" in entry["validation"]
+    ]
+    if not scores:
+        return 0
+    best = max(range(len(scores)), key=lambda index: scores[index])
+    return len(scores) - 1 - best
+
+
 def _evaluate_events(model, evaluator, *, metric=None, budget=None):
     modes = [(module, module.training) for module in model.modules()]
     rng = _capture_rng()
@@ -1427,10 +1459,12 @@ def run_training(model, train_loader, validation_loader, config, run_dir, identi
         manifest_config_keys = set(asdict(TrainingConfig()))
         if manifest["schema_version"] == 1:
             manifest_config_keys.discard("max_seconds")
+        if manifest["schema_version"] < 3:
+            manifest_config_keys -= {"event_patience", "learning_rate_patience", "learning_rate_factor", "minimum_learning_rate"}
         _keys(manifest["config"], manifest_config_keys, "run training config")
         TrainingConfig(**manifest["config"])
         if (
-            manifest["schema_version"] not in (1, SCHEMA_VERSION) or manifest["run_id"] != run_id
+            manifest["schema_version"] not in (1, 2, SCHEMA_VERSION) or manifest["run_id"] != run_id
             or not _json_equal(manifest["identity"], identity)
             or not _json_equal(_fixed_config(manifest["config"]), _fixed_config(asdict(config)))
             or not _json_equal(_fixed_config(checkpoint["training_config"]), _fixed_config(asdict(config)))
@@ -1524,6 +1558,7 @@ def run_training(model, train_loader, validation_loader, config, run_dir, identi
         initial_updates, initial_skips = optimizer_updates, optimizer_skips
         validation = history[-1]["validation"] if history else None
         expired = False
+        early_stopped = False
         try:
             budget.check()
             budget_resume = checkpoint is not None and checkpoint.get("resume_state", {}).get("stopped_by") == "max_seconds"
@@ -1701,10 +1736,25 @@ def run_training(model, train_loader, validation_loader, config, run_dir, identi
                     best_score = validation["loss"]
                 if event_improved:
                     best_event = _best_event_selection(history, run_id)
+                plateau = _event_plateau(history) if event_evaluator is not None else 0
+                if (
+                    event_evaluator is not None and not event_improved and plateau > 0
+                    and plateau % config.learning_rate_patience == 0
+                ):
+                    before = optimizer.param_groups[0]["lr"]
+                    after = max(config.minimum_learning_rate, before * config.learning_rate_factor)
+                    for group in optimizer.param_groups:
+                        group["lr"] = after
+                    if after < before:
+                        _emit(progress, f"Reduced learning rate: {before:.8g} -> {after:.8g}")
                 phase = "training"
                 save_checkpoint(improved=improved, event_improved=event_improved)
                 state = "complete" if epoch_complete else "paused at step ceiling"
                 _emit(progress, f"Epoch {epoch_index + 1}/{config.epochs}: {state} | elapsed {format_duration(time.perf_counter() - epoch_started)}")
+                if event_evaluator is not None and plateau >= config.event_patience:
+                    early_stopped = True
+                    _emit(progress, f"Early stopping: decoded-event score did not improve for {plateau} validations.")
+                    break
                 budget.check()
         except TrainingBudgetExpired:
             expired = True
@@ -1716,7 +1766,7 @@ def run_training(model, train_loader, validation_loader, config, run_dir, identi
             "next_batch_index": next_batch, "best_score": best_score, "validation": validation,
             "status": "paused" if expired else "complete",
             "training_started": optimizer_updates > initial_updates,
-            "stopped_by": "max_seconds" if expired else "epochs" if epoch >= config.epochs else "max_steps",
+            "stopped_by": "max_seconds" if expired else "decoded_event_patience" if early_stopped else "epochs" if epoch >= config.epochs else "max_steps",
             "validation_pending": phase == "initial_validation" or global_step > (history[-1]["global_step"] if history else 0),
             "resume_phase": phase, "epochs_remaining": max(0, config.epochs - epoch),
             "latest_checkpoint": str(run_dir / "latest.pt"), "best_checkpoint": str(run_dir / "best.pt") if best_score is not None else None,

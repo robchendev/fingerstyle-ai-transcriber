@@ -143,6 +143,7 @@ class VideoTests(unittest.TestCase):
             "hidden_size": 64, "temporal_layers": 1, "structured_dim": 233,
             "input_schema_version": 5, "architecture_version": 6, "modality_dropout": .2,
             "feature_group_version": "anatomy-fretboard-groups-v2",
+            "experiment_mode": "geometry",
         })
         self.assertEqual(VideoConfig(**json.loads(json.dumps(asdict(config)))), config)
         with self.assertRaises(FrozenInstanceError):
@@ -153,6 +154,7 @@ class VideoTests(unittest.TestCase):
             {"input_schema_version": 1}, {"input_schema_version": 2}, {"input_schema_version": 4},
             {"architecture_version": 1}, {"architecture_version": 2}, {"architecture_version": 3}, {"architecture_version": 4}, {"architecture_version": 5},
             {"feature_group_version": "unknown"},
+            {"experiment_mode": "unknown"},
             {"modality_dropout": -.1}, {"modality_dropout": 1.1},
             {"modality_dropout": float("nan")}, {"modality_dropout": float("inf")},
         ):
@@ -236,6 +238,31 @@ class VideoTests(unittest.TestCase):
                 expected,
                 model(self.features, self.conditioning, video=video),
             )
+
+    def test_experiment_modes_mask_geometry_and_can_disable_role_gates(self):
+        torch.manual_seed(17)
+        audio = FingerstyleTranscriber(ModelConfig(
+            architecture_version=4, n_mels=8, hidden_size=8,
+            recurrent_layers=1, max_fret=3, max_voices=2,
+        ))
+        gated = AudioVideoTranscriber(
+            audio, VideoConfig(hidden_size=8, experiment_mode="role-gates"),
+        ).eval()
+        video = copy.deepcopy(self.video)
+        original = gated(self.features, self.conditioning, video=video)
+        video["structured"][..., 194:] += 100
+        self.assert_outputs_equal(
+            original,
+            gated(self.features, self.conditioning, video=video),
+        )
+        neutral = AudioVideoTranscriber(
+            FingerstyleTranscriber(ModelConfig(
+                architecture_version=4, n_mels=8, hidden_size=8,
+                recurrent_layers=1, max_fret=3, max_voices=2,
+            )),
+            VideoConfig(hidden_size=8, experiment_mode="original-hands"),
+        )
+        self.assertIsInstance(neutral.position_branch.feature_gates, torch.nn.Identity)
 
     def test_all_architectures_fuse_before_all_original_heads_once(self):
         for version in (1, 2, 3, 4):

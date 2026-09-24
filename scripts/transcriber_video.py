@@ -43,6 +43,7 @@ class VideoConfig:
     architecture_version: int = 6
     modality_dropout: float = 0.2
     feature_group_version: str | None = ROLE_FEATURE_GROUP_VERSION
+    experiment_mode: str = "geometry"
 
     def __post_init__(self):
         _integer("hidden_size", self.hidden_size, 1)
@@ -58,6 +59,10 @@ class VideoConfig:
         )
         if self.feature_group_version != expected_groups:
             raise ValueError(f"feature_group_version differs from architecture version {self.architecture_version}")
+        if self.experiment_mode not in ("original-hands", "role-gates", "geometry"):
+            raise ValueError("experiment_mode must be original-hands, role-gates, or geometry")
+        if self.architecture_version < 6 and self.experiment_mode != "geometry":
+            raise ValueError("Historical video architectures support only geometry experiment mode")
         expected_contract = (
             (SCHEMA_VERSION, STRUCTURED_DIM) if self.architecture_version == 6
             else (LEGACY_SCHEMA_VERSION, LEGACY_STRUCTURED_DIM)
@@ -171,7 +176,7 @@ class _StructuredBranch(nn.Module):
                 initial_scales if config.architecture_version == 6 else initial_scales[:8],
                 config.architecture_version,
             )
-            if config.architecture_version >= 5
+            if config.architecture_version >= 5 and config.experiment_mode != "original-hands"
             else nn.Identity()
         )
         self.structure_encoder = nn.Sequential(
@@ -261,6 +266,10 @@ class AudioVideoTranscriber(nn.Module):
         present = torch.zeros(batch, frames, len(VIEW_ORDER), dtype=torch.bool, device=features.device)
         if video is not None:
             self._validate_video(video, batch, frames, features.device)
+            if self.video_config.experiment_mode != "geometry":
+                video = dict(video)
+                video["structured_available"] = video["structured_available"].clone()
+                video["structured_available"][..., 194:] = False
             indices = video["frame_indices"]
             mapped = (indices >= 0) & valid
             for view, branch in enumerate((

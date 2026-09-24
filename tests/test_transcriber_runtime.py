@@ -197,6 +197,42 @@ def toy_model(seed=43):
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_training_defaults_use_event_patience_and_learning_rate_reduction(self):
+        config = runtime.TrainingConfig()
+        self.assertEqual(config.epochs, 100)
+        self.assertEqual(config.event_patience, 12)
+        self.assertEqual(config.learning_rate_patience, 4)
+        self.assertEqual(config.learning_rate_factor, .5)
+        history = [
+            {"validation": {"decoded_events": {"score": score}}}
+            for score in (.2, .4, .39, .38)
+        ]
+        self.assertEqual(runtime._event_plateau(history), 2)
+        for options in (
+            {"event_patience": 4, "learning_rate_patience": 4},
+            {"learning_rate_factor": 1},
+            {"minimum_learning_rate": .01},
+        ):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                runtime.TrainingConfig(**options)
+
+    def test_event_patience_stops_training_and_reduces_checkpointed_learning_rate(self):
+        scores = iter((.5, .4, .3, .2))
+        config = runtime.TrainingConfig(
+            epochs=10, device="cpu", event_patience=2,
+            learning_rate_patience=1, learning_rate_factor=.5,
+        )
+        summary, _ = self.train(
+            "early-stop", config=config,
+            event_evaluator=lambda _model: {
+                "score": next(scores), "metric": "synthetic-event-score", "windows": 1,
+            },
+        )
+        self.assertEqual(summary["stopped_by"], "decoded_event_patience")
+        self.assertEqual(summary["epoch"], 3)
+        checkpoint = runtime.load_checkpoint(summary["latest_checkpoint"])
+        self.assertEqual(checkpoint["optimizer_state"]["param_groups"][0]["lr"], .00025)
+
     def test_plucking_thumb_voice_metric_uses_reliable_motion_and_string_proximity(self):
         counts = {
             name: {"count": 0, "correct": 0}
@@ -631,6 +667,11 @@ class RuntimeTests(unittest.TestCase):
         checkpoint["schema_version"] = 1
         checkpoint.pop("resume_state")
         checkpoint["training_config"].pop("max_seconds")
+        for name in (
+            "event_patience", "learning_rate_patience",
+            "learning_rate_factor", "minimum_learning_rate",
+        ):
+            checkpoint["training_config"].pop(name)
         for entry in checkpoint["history"]:
             entry["validation"]["loss_statistics"].pop("percussion_negative")
             entry["validation"].pop("percussion_frame")
