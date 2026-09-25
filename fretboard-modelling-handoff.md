@@ -38,16 +38,19 @@ The following are Git-ignored:
 
 - `data\fretboard-keypoints`
 - `runs\fretboard-selection.log`
+- `data\fretboard-selection-cache`
 - Local detector weights and training runs
 - Prepared corpus bundles and training outputs
 
-The pilot annotation dataset contains:
+The corrected hand-guided pilot annotation dataset contains:
 
 - 400 frames
-- 210 represented source videos
-- 318 train frames
-- 36 validation frames
-- 46 test frames
+- 202 represented source videos
+- 329 train frames
+- 31 validation frames
+- 40 test frames
+- 380 two-hand playing frames
+- 20 intentional zero-hand negatives
 - No source video crossing splits
 - Native source resolutions
 

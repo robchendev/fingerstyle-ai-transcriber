@@ -30,11 +30,13 @@ six points to be available.
 From the repository root:
 
 ```powershell
-.\scripts\video-evidence\.venv\Scripts\python.exe -m scripts.fretboard_annotation select --video-directory runs\video-evidence\sources --shots-directory runs\video-evidence\inspection --target-frames 1000 --candidates-per-video 24 --minimum-per-video 1 --maximum-per-video 12 --output data\fretboard-keypoints 2>&1 | Tee-Object -FilePath runs\fretboard-selection.log
+.\scripts\video-evidence\.venv\Scripts\python.exe -m scripts.fretboard_annotation select --video-directory runs\video-evidence\sources --shots-directory runs\video-evidence\inspection --hands-directory runs\video-evidence --negative-fraction 0.05 --target-frames 1000 --candidates-per-video 24 --minimum-per-video 1 --maximum-per-video 12 --cache-directory data\fretboard-selection-cache --output data\fretboard-keypoints 2>&1 | Tee-Object -FilePath runs\fretboard-selection.log
 ```
 
-Frames retain native resolution. Selection uses available shot reports,
-rejects unusable frames, and deduplicates visual views across the corpus.
+Frames retain native resolution. Selection uses source-bound hand observations,
+prefers two-hand playing frames, limits zero-hand negatives to 5%, uses
+available shot reports, and deduplicates visual views across the corpus.
+Candidate descriptors are cached per video for resumable selection.
 
 ## Test the UI now on Windows
 

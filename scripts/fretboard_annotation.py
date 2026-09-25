@@ -75,7 +75,7 @@ def _frame_feature(frame):
 def select_diverse_candidates(candidates, target, *, minimum_per_video=1, maximum_per_video=12):
     if type(target) is not int or target < 1:
         raise ValueError("target must be a positive integer.")
-    if type(minimum_per_video) is not int or type(maximum_per_video) is not int or not 1 <= minimum_per_video <= maximum_per_video:
+    if type(minimum_per_video) is not int or type(maximum_per_video) is not int or not 0 <= minimum_per_video <= maximum_per_video:
         raise ValueError("Invalid per-video selection bounds.")
     if not candidates:
         raise ValueError("No usable frame candidates were found.")
@@ -103,8 +103,8 @@ def select_diverse_candidates(candidates, target, *, minimum_per_video=1, maximu
             if candidate["id"] in selected_ids or counts[digest] >= maximum_per_video:
                 continue
             distance = min(
-                1 - float(np.dot(candidate["feature"], chosen["feature"]))
-                for chosen in selected
+                (1 - float(np.dot(candidate["feature"], chosen["feature"])) for chosen in selected),
+                default=1.,
             )
             score = distance + .05 * candidate["quality"]
             key = score, candidate["quality"], candidate["id"]
@@ -117,6 +117,68 @@ def select_diverse_candidates(candidates, target, *, minimum_per_video=1, maximu
         selected_ids.add(row["id"])
         counts[row["videoSha256"]] += 1
     return selected
+
+
+def _hand_evidence_catalog(directory):
+    if directory is None:
+        return {}
+    catalog = {}
+    for report_path in sorted(Path(directory).rglob("hands.json")):
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            digest = report.get("videoSha256")
+            arrays_path = report_path.with_name(report.get("arrays", ""))
+            time_base = report.get("timeBase")
+            count = report.get("frameCount")
+            if (
+                report.get("kind") != "fingerstyle-hand-observations"
+                or not isinstance(digest, str)
+                or not arrays_path.is_file()
+                or not isinstance(time_base, list) or len(time_base) != 2
+                or any(type(value) is not int or value <= 0 for value in time_base)
+                or type(count) is not int or count <= 0
+            ):
+                continue
+            previous = catalog.get(digest)
+            if previous is None or count > previous["frameCount"]:
+                catalog[digest] = {
+                    "report": report_path, "arrays": arrays_path,
+                    "timeBase": time_base, "frameCount": count,
+                }
+        except (OSError, ValueError, TypeError):
+            continue
+    return catalog
+
+
+def _hand_evidence_times(entry):
+    if entry is None:
+        return None
+    try:
+        with np.load(entry["arrays"], allow_pickle=False) as source:
+            pts = source["pts"]
+            counts = source["hand_count"]
+    except (OSError, ValueError, KeyError) as error:
+        raise ValueError(f"Invalid hand evidence archive: {entry['arrays']}: {error}") from error
+    if (
+        pts.dtype != np.int64 or counts.dtype != np.int8
+        or pts.shape != (entry["frameCount"],) or counts.shape != pts.shape
+        or (np.diff(pts) <= 0).any() or not np.isin(counts, (0, 1, 2)).all()
+    ):
+        raise ValueError(f"Invalid hand evidence timeline: {entry['arrays']}")
+    scale = entry["timeBase"][0] / entry["timeBase"][1]
+    return pts.astype(np.float64) * scale, counts
+
+
+def _sample_evidence_times(times, counts, count, *, playing):
+    selected = np.flatnonzero(counts > 0 if playing else counts == 0)
+    if not len(selected):
+        return []
+    if playing:
+        two_hands = selected[counts[selected] == 2]
+        if len(two_hands) >= min(count, 4):
+            selected = two_hands
+    indices = np.linspace(0, len(selected) - 1, min(count, len(selected))).round().astype(int)
+    return [(float(times[selected[index]]), int(counts[selected[index]])) for index in indices]
 
 
 def _candidate_times(video_digest, duration, count, shots_directory):
@@ -157,15 +219,51 @@ def _candidate_times(video_digest, duration, count, shots_directory):
 
 def select_dataset(output, videos, *, target_frames=1000, candidates_per_video=24,
                    minimum_per_video=1, maximum_per_video=12, jpeg_quality=95,
-                   shots_directory=None):
+                   shots_directory=None, hands_directory=None, negative_fraction=.05,
+                   cache_directory=None):
     output = Path(output).resolve()
     if output.exists():
         raise ValueError(f"Refusing to overwrite annotation dataset: {output}")
     if type(candidates_per_video) is not int or candidates_per_video < 2:
         raise ValueError("candidates_per_video must be an integer >= 2.")
+    if (
+        isinstance(negative_fraction, bool)
+        or not isinstance(negative_fraction, (int, float))
+        or not math.isfinite(negative_fraction)
+        or not 0 <= negative_fraction < .5
+    ):
+        raise ValueError("negative_fraction must be from zero through less than one half.")
+    hand_catalog = _hand_evidence_catalog(hands_directory)
+    cache_root = None if cache_directory is None else Path(cache_directory).resolve()
+    if cache_root is not None:
+        cache_root.mkdir(parents=True, exist_ok=True)
     candidates = []
-    for video in videos:
+    for video_index, video in enumerate(videos, 1):
         digest = _sha256(video)
+        cache_path = None if cache_root is None else cache_root / f"{digest}.npz"
+        if cache_path is not None and cache_path.is_file():
+            try:
+                with np.load(cache_path, allow_pickle=False) as cached:
+                    if (
+                        int(cached["candidates_per_video"]) != candidates_per_video
+                        or float(cached["negative_fraction"]) != float(negative_fraction)
+                    ):
+                        raise ValueError("Cached selector settings differ.")
+                    for ordinal in range(len(cached["seconds"])):
+                        candidates.append({
+                            "id": f"{digest[:12]}-{int(cached['ordinals'][ordinal]):04d}",
+                            "video": video, "videoSha256": digest,
+                            "seconds": float(cached["seconds"][ordinal]),
+                            "width": int(cached["widths"][ordinal]),
+                            "height": int(cached["heights"][ordinal]),
+                            "feature": cached["features"][ordinal],
+                            "quality": float(cached["qualities"][ordinal]),
+                            "handCount": None if cached["hand_counts"][ordinal] < 0 else int(cached["hand_counts"][ordinal]),
+                        })
+                print(f"Selection candidates: {video_index}/{len(videos)} cached | {video.name}", flush=True)
+                continue
+            except (OSError, ValueError, KeyError):
+                cache_path.unlink(missing_ok=True)
         capture = cv2.VideoCapture(str(video))
         if not capture.isOpened():
             raise ValueError(f"Could not open video: {video}")
@@ -175,8 +273,22 @@ def select_dataset(output, videos, *, target_frames=1000, candidates_per_video=2
             if not math.isfinite(fps) or fps <= 0 or frame_count <= 0:
                 raise ValueError(f"Video has no reliable duration: {video}")
             duration = frame_count / fps
-            times = _candidate_times(digest, duration, candidates_per_video, shots_directory)
-            for ordinal, seconds in enumerate(times):
+            hand_evidence = _hand_evidence_times(hand_catalog.get(digest))
+            if hands_directory is not None and hand_evidence is None:
+                continue
+            if hand_evidence is None:
+                times = [(value, None) for value in _candidate_times(digest, duration, candidates_per_video, shots_directory)]
+            else:
+                evidence_times, hand_counts = hand_evidence
+                playing = _sample_evidence_times(evidence_times, hand_counts, candidates_per_video, playing=True)
+                negatives = _sample_evidence_times(
+                    evidence_times, hand_counts,
+                    max(1, round(candidates_per_video * negative_fraction)),
+                    playing=False,
+                )
+                times = playing + negatives
+            video_candidates = []
+            for ordinal, (seconds, hand_count) in enumerate(times):
                 capture.set(cv2.CAP_PROP_POS_MSEC, seconds * 1000)
                 ok, frame = capture.read()
                 if not ok:
@@ -185,7 +297,9 @@ def select_dataset(output, videos, *, target_frames=1000, candidates_per_video=2
                 if sharpness < 8 or not 8 <= brightness <= 247:
                     continue
                 quality = min(1., sharpness / 250) * min(1., brightness / 50, (255 - brightness) / 50)
-                candidates.append({
+                if hand_count is not None:
+                    quality *= 1 + .2 * hand_count
+                video_candidates.append({
                     "id": f"{digest[:12]}-{ordinal:04d}",
                     "video": video,
                     "videoSha256": digest,
@@ -194,42 +308,90 @@ def select_dataset(output, videos, *, target_frames=1000, candidates_per_video=2
                     "height": int(frame.shape[0]),
                     "feature": feature,
                     "quality": quality,
+                    "handCount": hand_count,
                 })
+            candidates.extend(video_candidates)
+            if cache_path is not None:
+                pending = cache_path.with_name("." + cache_path.name + ".pending")
+                with pending.open("wb") as stream:
+                    np.savez_compressed(
+                        stream,
+                        candidates_per_video=np.asarray(candidates_per_video, np.int32),
+                        negative_fraction=np.asarray(negative_fraction, np.float64),
+                        ordinals=np.asarray([
+                            int(row["id"].rsplit("-", 1)[1]) for row in video_candidates
+                        ], np.int32),
+                        seconds=np.asarray([row["seconds"] for row in video_candidates], np.float64),
+                        widths=np.asarray([row["width"] for row in video_candidates], np.int32),
+                        heights=np.asarray([row["height"] for row in video_candidates], np.int32),
+                        features=np.asarray([row["feature"] for row in video_candidates], np.float32),
+                        qualities=np.asarray([row["quality"] for row in video_candidates], np.float32),
+                        hand_counts=np.asarray([
+                            -1 if row["handCount"] is None else row["handCount"] for row in video_candidates
+                        ], np.int8),
+                    )
+                pending.replace(cache_path)
         finally:
             capture.release()
+        print(f"Selection candidates: {video_index}/{len(videos)} processed | {video.name}", flush=True)
+    known = hands_directory is not None
+    positives = [row for row in candidates if row["handCount"] is None or row["handCount"] > 0]
+    negatives = [row for row in candidates if row["handCount"] == 0]
+    negative_target = min(len(negatives), round(target_frames * negative_fraction)) if known else 0
+    positive_target = target_frames - negative_target
     selected = select_diverse_candidates(
-        candidates, target_frames,
+        positives, positive_target,
         minimum_per_video=minimum_per_video,
         maximum_per_video=maximum_per_video,
     )
+    if negative_target:
+        selected.extend(select_diverse_candidates(
+            negatives, negative_target,
+            minimum_per_video=0, maximum_per_video=1,
+        ))
+    selected.sort(key=lambda row: (row["videoSha256"], row["seconds"], row["id"]))
     output.mkdir(parents=True)
     try:
         records = []
-        captures = {}
-        try:
-            for row in selected:
-                video = row["video"]
-                capture = captures.setdefault(video, cv2.VideoCapture(str(video)))
-                capture.set(cv2.CAP_PROP_POS_MSEC, row["seconds"] * 1000)
-                ok, frame = capture.read()
-                if not ok:
-                    raise ValueError(f"Could not decode selected frame: {video} at {row['seconds']:.3f}s.")
-                split = _split(row["videoSha256"])
-                relative = Path("images") / split / f"{row['id']}.jpg"
-                destination = output / relative
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                if not cv2.imwrite(str(destination), frame, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality]):
-                    raise OSError(f"Could not save selected frame: {destination}")
-                records.append({
-                    "id": row["id"], "split": split, "image": relative.as_posix(),
-                    "width": row["width"], "height": row["height"],
-                    "sourceVideo": str(video), "sourceVideoSha256": row["videoSha256"],
-                    "sourceSeconds": row["seconds"], "selectionReason": row["selectionReason"],
-                    "selectionQuality": row["quality"],
-                })
-        finally:
-            for capture in captures.values():
+        rows_by_video = {}
+        for row in selected:
+            rows_by_video.setdefault(row["video"], []).append(row)
+        exported = 0
+        for video_index, (video, rows) in enumerate(sorted(rows_by_video.items(), key=lambda item: str(item[0])), 1):
+            capture = cv2.VideoCapture(str(video))
+            try:
+                for row in sorted(rows, key=lambda value: value["seconds"]):
+                    seconds = row["seconds"]
+                    capture.set(cv2.CAP_PROP_POS_MSEC, seconds * 1000)
+                    ok, frame = capture.read()
+                    if not ok:
+                        capture.release()
+                        capture = cv2.VideoCapture(str(video))
+                        capture.set(cv2.CAP_PROP_POS_MSEC, max(0., seconds - .05) * 1000)
+                        ok, frame = capture.read()
+                    if not ok:
+                        raise ValueError(f"Could not decode selected frame: {video} at {seconds:.3f}s.")
+                    split = _split(row["videoSha256"])
+                    relative = Path("images") / split / f"{row['id']}.jpg"
+                    destination = output / relative
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    if not cv2.imwrite(str(destination), frame, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality]):
+                        raise OSError(f"Could not save selected frame: {destination}")
+                    records.append({
+                        "id": row["id"], "split": split, "image": relative.as_posix(),
+                        "width": int(frame.shape[1]), "height": int(frame.shape[0]),
+                        "sourceVideo": str(video), "sourceVideoSha256": row["videoSha256"],
+                        "sourceSeconds": seconds, "selectionReason": row["selectionReason"],
+                        "selectionQuality": row["quality"], "handCount": row["handCount"],
+                    })
+                    exported += 1
+            finally:
                 capture.release()
+            print(
+                f"Selection export: {video_index}/{len(rows_by_video)} videos | "
+                f"{exported}/{len(selected)} frames | {video.name}",
+                flush=True,
+            )
         manifest = {
             "schemaVersion": SCHEMA_VERSION,
             "kind": "fretboard-keypoint-annotation-dataset",
@@ -243,6 +405,8 @@ def select_dataset(output, videos, *, target_frames=1000, candidates_per_video=2
                 "minimumPerVideo": minimum_per_video,
                 "maximumPerVideo": maximum_per_video,
                 "shotReports": shots_directory is not None,
+                "handEvidence": hands_directory is not None,
+                "negativeFraction": float(negative_fraction),
             },
             "records": records,
         }
@@ -684,6 +848,9 @@ def parser():
     selection.add_argument("--maximum-per-video", type=int, default=12)
     selection.add_argument("--jpeg-quality", type=int, default=95)
     selection.add_argument("--shots-directory")
+    selection.add_argument("--hands-directory")
+    selection.add_argument("--negative-fraction", type=float, default=.05)
+    selection.add_argument("--cache-directory", default="data/fretboard-selection-cache")
     ui = commands.add_parser("serve")
     ui.add_argument("--dataset", required=True)
     ui.add_argument("--port", type=int, default=8765)
@@ -712,6 +879,9 @@ def main(argv=None):
             maximum_per_video=args.maximum_per_video,
             jpeg_quality=args.jpeg_quality,
             shots_directory=args.shots_directory,
+            hands_directory=args.hands_directory,
+            negative_fraction=args.negative_fraction,
+            cache_directory=args.cache_directory,
         )
         print(json.dumps({"frames": len(manifest["records"]), "output": str(Path(args.output).resolve())}))
     elif args.command == "serve":

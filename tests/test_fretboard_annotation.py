@@ -11,6 +11,8 @@ from scripts.fretboard_annotation import (
     export_yolo,
     normalize_annotation,
     normalize_preferences,
+    _hand_evidence_times,
+    _sample_evidence_times,
     _candidate_times,
     select_diverse_candidates,
     validate_geometry,
@@ -142,6 +144,26 @@ class FretboardAnnotationTests(unittest.TestCase):
             fallback = _candidate_times("b" * 64, 10., 2, root)
             self.assertEqual(len(fallback), 2)
             self.assertTrue(all(0 < value < 10 for value in fallback))
+
+    def test_hand_evidence_sampling_prefers_two_hands_and_bounds_negatives(self):
+        times = np.arange(10, dtype=np.float64) / 10
+        counts = np.asarray([0, 1, 2, 2, 0, 1, 2, 2, 0, 1], np.int8)
+        playing = _sample_evidence_times(times, counts, 3, playing=True)
+        negatives = _sample_evidence_times(times, counts, 2, playing=False)
+        self.assertEqual(len(playing), 3)
+        self.assertTrue(all(count == 2 for _, count in playing))
+        self.assertEqual(len(negatives), 2)
+        self.assertTrue(all(count == 0 for _, count in negatives))
+
+    def test_hand_evidence_archive_uses_source_pts_and_counts(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "hands.npz"
+            np.savez(path, pts=np.asarray([100, 200], np.int64), hand_count=np.asarray([1, 2], np.int8))
+            times, counts = _hand_evidence_times({
+                "arrays": path, "timeBase": [1, 1000], "frameCount": 2,
+            })
+            np.testing.assert_allclose(times, [.1, .2])
+            np.testing.assert_array_equal(counts, [1, 2])
 
     def test_six_point_contract_normalizes_complete_geometry(self):
         value = normalize_annotation(annotation())
