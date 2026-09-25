@@ -6,16 +6,21 @@ The dataset is stored under `data/`, which is excluded from Git.
 
 ## Keypoints
 
-Place these six ordered points:
+Place these seven ordered points:
 
-1. String 6 at the nut
-2. String 1 at the nut
-3. String 6 at fret 12
-4. String 1 at fret 12
-5. String 6 at the bridge
-6. String 1 at the bridge
+1. String 6 contact point at the nut
+2. String 1 contact point at the nut
+3. String 6 crossing the silver 12th-fret wire
+4. String 1 crossing the silver 12th-fret wire
+5. String 6 contact point at the bridge saddle
+6. String 1 contact point at the bridge saddle
+7. Center of the silver 5th-fret wire
 
-The harness derives the nut, fret-12, and bridge centers from each pair.
+Fret numbers refer to the silver fret wires, not the spaces between wires. Nut
+and bridge points are the string contact points. The harness derives the nut,
+fret-12-wire, and bridge-saddle centers from each outer-string pair. Equal
+temperament places fret 5 at approximately 25.08% and fret 12 at exactly 50%
+of the nut-to-saddle scale length.
 
 Use **Visible** when the point can be placed directly and **Occluded** when its
 position is identifiable despite an obstruction. Clear a point to mark it
@@ -23,7 +28,7 @@ unavailable when it is outside the frame or cannot be identified. Do not
 estimate an off-screen nut or bridge.
 
 `Complete` means the entire frame has been reviewed. It does not require all
-six points to be available.
+seven points to be available.
 
 ## Create the dataset on Windows
 
@@ -59,7 +64,7 @@ Controls:
 
 - Mouse wheel: zoom
 - Middle- or right-button drag: pan
-- `1` through `6`: select a keypoint
+- `1` through `7`: select a keypoint
 - `Q`, `W`, `E`: available, occluded, unavailable
 - Left/right arrows: previous and next frame
 - Enter: complete and advance
@@ -115,7 +120,7 @@ This writes YOLO pose labels under `labels/` and a Windows-local `data.yaml`.
 Only frames marked complete are exported. Reviewed frames with no available
 keypoints are exported as negative examples.
 
-The six-keypoint labels use normalized coordinates, so moving the dataset
+The seven-keypoint labels use normalized coordinates, so moving the dataset
 between macOS and Windows does not change them. Source images remain at native
 resolution; model training can use 4K or a lower `imgsz` without relabeling.
 
@@ -127,7 +132,7 @@ A production target may reach approximately 800-1,150 diverse images:
 - 400-600 model-assisted corrections
 - 100-150 independently reviewed validation frames
 
-Six-point labeling is expected to take roughly 12-24 total hours, spread
+Seven-point labeling is expected to take roughly 12-24 total hours, spread
 across resumable sessions. The selector removes repeated views before labeling.
 
 Do not label the full target before testing whether the labels work. Stop after
@@ -150,7 +155,7 @@ are exported as negative examples.
 
 Before training:
 
-- Confirm all six point definitions use the same physical string ordering.
+- Confirm all outer-string point definitions use the same physical string ordering.
 - Inspect every validation image independently from training images.
 - Keep all frames from one source video in one split.
 - Check that unavailable off-screen points were not guessed.
@@ -220,9 +225,20 @@ After the pilot:
 4. Label representative failures in the same UI.
 5. Retrain and compare against the unchanged held-out set.
 
+Generate resumable model predictions for the selected dataset:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.fretboard_annotation prefill --dataset data\fretboard-keypoints --model runs\fretboard-detector\weights\best.pt --device 0 --image-size 3840 --confidence 0.01
+```
+
+Then open the normal annotation UI. Predicted frames are purple in the progress
+bar. The UI pre-fills all model-proposed points, outlines the original proposal
+with dashed circles, and records each completed review as `accepted` when
+unchanged or `corrected` after edits. Misses and partial predictions remain
+reviewable, and every save is resumable through `predictions.json` and
+`annotations.json`.
+
 Repeat until additional labels no longer improve held-out video behavior.
-Model-assisted pre-label import is not implemented. Diversity selection is
-available through the `select` command.
 
 ### 6. Adopt the trained checkpoint
 
@@ -235,7 +251,7 @@ The final local checkpoint must be recorded with:
 - Training configuration
 - Held-out evaluation report
 
-Do not overwrite an earlier checkpoint or reinterpret a six-point checkpoint
+Do not overwrite an earlier checkpoint or reinterpret a seven-point checkpoint
 as the experimental 40-point model.
 
 ### 7. Process the video corpus

@@ -10,7 +10,7 @@ from scripts.fretboard_training import (
 
 class FretboardTrainingTests(unittest.TestCase):
     def dataset(self, root):
-        keypoints = ["a", "b", "c", "d", "e", "f"]
+        keypoints = ["a", "b", "c", "d", "e", "f", "g"]
         records = []
         annotations = {"keypoints": keypoints}
         for index, split in enumerate(("train", "validation")):
@@ -20,7 +20,7 @@ class FretboardTrainingTests(unittest.TestCase):
             image.parent.mkdir(parents=True)
             label.parent.mkdir(parents=True)
             image.write_bytes(b"image")
-            label.write_text("0 .5 .5 .8 .4 " + " ".join((".2 .3 2",) * 6) + "\n")
+            label.write_text("0 .5 .5 .8 .4 " + " ".join((".2 .3 2",) * 7) + "\n")
             records.append({
                 "id": identifier, "split": split,
                 "image": str(image.relative_to(root)).replace("\\", "/"),
@@ -28,7 +28,7 @@ class FretboardTrainingTests(unittest.TestCase):
             })
         (root / "manifest.json").write_text(json.dumps({"keypoints": keypoints, "records": records}))
         (root / "annotations.json").write_text(json.dumps(annotations))
-        (root / "data.yaml").write_text("kpt_shape: [6, 3]\n")
+        (root / "data.yaml").write_text("kpt_shape: [7, 3]\n")
         return root
 
     def test_validates_split_dataset_and_builds_4k_request(self):

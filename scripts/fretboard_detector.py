@@ -1,4 +1,4 @@
-"""Optional local YOLO adapter for six fretboard keypoints."""
+"""Optional local YOLO adapter for fretboard keypoints."""
 
 from dataclasses import dataclass
 import math
@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .fretboard_geometry import FretboardGeometry, FretboardGeometryError
+from .fretboard_geometry import FretboardGeometry, FretboardGeometryError, fret_scale_position
 
 
 @dataclass(frozen=True)
@@ -46,19 +46,26 @@ def select_detection(keypoints, keypoint_scores, scores, frame_size, config, ima
     points = np.asarray(keypoints, dtype=np.float64)
     point_scores = np.asarray(keypoint_scores, dtype=np.float64)
     scores = np.asarray(scores, dtype=np.float64)
-    if points.ndim != 4 or points.shape[1:] != (3, 2, 2):
-        raise ValueError("keypoints must have shape (N, 3, 2, 2).")
-    if point_scores.shape != points.shape[:3] or scores.shape != (len(points),):
+    if points.ndim != 3 or points.shape[1:] != (7, 2):
+        raise ValueError("keypoints must have shape (N, 7, 2).")
+    if point_scores.shape != points.shape[:2] or scores.shape != (len(points),):
         raise ValueError("Detector score shapes disagree.")
     best = None
     for candidate, confidences, score in zip(points, point_scores, scores, strict=True):
         available = confidences >= config.keypoint_score
+        anchors = candidate[:6].reshape(3, 2, 2)
+        anchor_available = available[:6].reshape(3, 2)
         try:
-            geometry = FretboardGeometry.from_keypoints(candidate, available, frame_size)
+            geometry = FretboardGeometry.from_keypoints(anchors, anchor_available, frame_size)
         except FretboardGeometryError:
             continue
-        value = FretboardDetection(candidate.astype(np.float32), available, float(score), geometry, image_size)
-        key = int(available.all(axis=1).sum()), float(score), -geometry.reprojection_error
+        if available[6]:
+            fret5 = geometry.coordinate(candidate[6])
+            expected_scale = fret_scale_position(5)
+            if abs(fret5.scale_position - expected_scale) > .12 or abs(fret5.string_position - 2.5) > 1.5:
+                continue
+        value = FretboardDetection(anchors.astype(np.float32), anchor_available, float(score), geometry, image_size)
+        key = int(anchor_available.all(axis=1).sum()), int(available[6]), float(score), -geometry.reprojection_error
         if best is None or key > best[0]:
             best = key, value
     return None if best is None else best[1]
@@ -76,8 +83,8 @@ class YoloFretboardDetector:
         self.path = path.resolve()
         self.config = config
         self.model = YOLO(str(self.path))
-        if list(getattr(self.model.model, "kpt_shape", ())) != [6, 3]:
-            raise ValueError("Fretboard detector must emit six keypoints with visibility.")
+        if list(getattr(self.model.model, "kpt_shape", ())) != [7, 3]:
+            raise ValueError("Fretboard detector must emit seven keypoints with visibility.")
 
     def detect(self, frame):
         if not isinstance(frame, np.ndarray) or frame.dtype != np.uint8 or frame.ndim != 3 or frame.shape[2] != 3:
@@ -97,8 +104,8 @@ class YoloFretboardDetector:
             if not count:
                 continue
             selected = select_detection(
-                data[:count, :, :2].reshape(count, 3, 2, 2),
-                data[:count, :, 2].reshape(count, 3, 2),
+                data[:count, :, :2],
+                data[:count, :, 2],
                 scores[:count], (frame.shape[1], frame.shape[0]), self.config, size,
             )
             if selected is not None and (best is None or selected.score > best.score):

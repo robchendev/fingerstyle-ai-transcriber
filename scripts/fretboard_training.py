@@ -1,4 +1,4 @@
-"""Validate and train the six-keypoint fretboard detector."""
+"""Validate and train the fretboard detector."""
 
 import argparse
 from dataclasses import asdict, dataclass
@@ -10,7 +10,7 @@ import platform
 import sys
 
 
-KEYPOINT_COUNT = 6
+KEYPOINT_COUNT = 7
 
 
 def _sha256(path):
@@ -63,7 +63,7 @@ def validate_dataset(dataset):
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     annotations = json.loads(annotations_path.read_text(encoding="utf-8"))
     if manifest.get("keypoints") != annotations.get("keypoints") or len(manifest.get("keypoints", ())) != KEYPOINT_COUNT:
-        raise ValueError("Dataset must use the six-keypoint contract.")
+        raise ValueError("Dataset must use the seven-keypoint contract.")
     splits_by_video = {}
     counts = {"train": 0, "validation": 0, "test": 0}
     assets = {manifest_path: _sha256(manifest_path), annotations_path: _sha256(annotations_path), yaml_path: _sha256(yaml_path)}

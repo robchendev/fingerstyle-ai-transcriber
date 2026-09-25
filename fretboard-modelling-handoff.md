@@ -5,7 +5,7 @@
 - Branch: `fretboard-modelling`
 - Local only; nothing pushed
 - Implementation plan: complete
-- Current blocker: manual six-point annotation
+- Current blocker: manual seven-point annotation
 - Full root suite: 704 passed
 - Focused vision suites: passed
 - Untracked plan: `_plan-fretboard-modelling.md`
@@ -14,7 +14,7 @@
 
 - Native-resolution diverse-frame selection
 - Resumable Windows/macOS browser annotation UI
-- Six-point YOLO pose export
+- Seven-point YOLO pose export with six outer geometry anchors
 - Reproducible 4K detector training wrapper
 - Multiscale scene-cut-aware detector acquisition
 - Per-frame optical-flow tracking
@@ -42,7 +42,8 @@ The following are Git-ignored:
 - Local detector weights and training runs
 - Prepared corpus bundles and training outputs
 
-The corrected hand-guided pilot annotation dataset contains:
+The previous two-hand-heavy pilot is archived at
+`data\fretboard-keypoints-two-hand-backup` and contains:
 
 - 400 frames
 - 202 represented source videos
@@ -54,16 +55,23 @@ The corrected hand-guided pilot annotation dataset contains:
 - No source video crossing splits
 - Native source resolutions
 
+Its replacement is being selected with target proportions of 65% two-hand,
+30% one-hand, and 5% zero-hand frames. Per-video candidate caches make this
+selection resumable.
+
 ## Annotation contract
 
-Label six points:
+Label seven points:
 
-1. Nut — low E / string 6
-2. Nut — high E / string 1
-3. Fret 12 — low E / string 6
-4. Fret 12 — high E / string 1
-5. Bridge — low E / string 6
-6. Bridge — high E / string 1
+1. Nut contact — low E / string 6
+2. Nut contact — high E / string 1
+3. Silver fret-12 wire — low E / string 6
+4. Silver fret-12 wire — high E / string 1
+5. Bridge saddle contact — low E / string 6
+6. Bridge saddle contact — high E / string 1
+7. Silver fret-5 wire — center
+
+Fret labels mean the metal wire, not the fret space.
 
 Each point may be available, occluded, or unavailable. Complete means the
 frame was fully reviewed; off-screen points may remain unavailable.
@@ -135,7 +143,9 @@ Do not accept the detector from confidence scores alone.
 
 - Select missed, rejected, unstable, and low-confidence views.
 - Deduplicate repeated failures.
-- Annotate representative failures.
+- Generate proposals with `python -m scripts.fretboard_annotation prefill`.
+- Review purple predicted frames in the normal annotation UI.
+- Accept unchanged predictions or adjust points before completing the frame.
 - Retrain against the unchanged held-out split.
 - Stop when held-out behavior no longer improves.
 
@@ -200,13 +210,10 @@ Use separate configuration and run directories:
 Keep splits, seeds, and budgets identical. Select from held-out decoded-event
 metrics, not training loss.
 
-## Not yet implemented
+## Optional work not yet implemented
 
-- Automatic model-assisted pre-label import into the annotation UI
 - Automatic hard-example queue generation from a trained detector
 - A plucking-thumb decoder preference
-
-These are optional. The current workflow can complete without them.
 
 ## Voice convention
 
