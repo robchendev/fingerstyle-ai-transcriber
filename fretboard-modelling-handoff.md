@@ -42,22 +42,23 @@ The following are Git-ignored:
 - Local detector weights and training runs
 - Prepared corpus bundles and training outputs
 
-The previous two-hand-heavy pilot is archived at
-`data\fretboard-keypoints-two-hand-backup` and contains:
+The completed balanced pilot is at `data\fretboard-keypoints` and contains:
 
 - 400 frames
 - 202 represented source videos
-- 329 train frames
-- 31 validation frames
-- 40 test frames
-- 380 two-hand playing frames
+- 322 train frames
+- 32 validation frames
+- 46 test frames
+- 260 two-hand frames
+- 120 one-hand frames
 - 20 intentional zero-hand negatives
 - No source video crossing splits
 - Native source resolutions
+- Song titles, source timestamps, and timestamped YouTube links
 
-Its replacement is being selected with target proportions of 65% two-hand,
-30% one-hand, and 5% zero-hand frames. Per-video candidate caches make this
-selection resumable.
+The previous two-hand-heavy pilot is archived at
+`data\fretboard-keypoints-two-hand-backup`. Per-video candidate caches remain
+under `data\fretboard-selection-cache` for future selection runs.
 
 ## Annotation contract
 

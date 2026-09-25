@@ -19,7 +19,9 @@ from scripts.fretboard_annotation import (
     normalize_preferences,
     normalize_prediction,
     prefill_predictions,
+    refresh_dataset_metadata,
     timestamped_source_url,
+    _source_identifier,
     _hand_evidence_times,
     _sample_evidence_times,
     _candidate_times,
@@ -214,6 +216,36 @@ class FretboardAnnotationTests(unittest.TestCase):
             timestamped_source_url("https://youtube.com/watch?v=x", 12),
             "https://youtube.com/watch?v=x&t=12s",
         )
+
+    def test_source_identifier_uses_container_for_generic_source_filename(self):
+        self.assertEqual(_source_identifier(Path("sources") / "giorno-demo" / "source.mkv"), "giorno-demo")
+        self.assertEqual(_source_identifier(Path("sources") / "tab-0001" / "source.mkv"), "tab-0001")
+
+    def test_refresh_dataset_metadata_repairs_generic_source_records(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "manifest.json").write_text(json.dumps({
+                "kind": "fretboard-keypoint-annotation-dataset",
+                "records": [{
+                    "id": "frame",
+                    "sourceVideo": str(Path("sources") / "giorno-demo" / "source.mkv"),
+                    "sourceId": "source",
+                    "sourceTitle": "source",
+                    "sourceUrl": None,
+                }],
+            }))
+            metadata = {
+                "giorno-demo": {
+                    "title": "Giorno's Theme",
+                    "sourceUrl": "https://youtu.be/example",
+                },
+            }
+            with patch("scripts.fretboard_annotation._source_metadata", return_value=metadata):
+                manifest = refresh_dataset_metadata(root)
+            record = manifest["records"][0]
+            self.assertEqual(record["sourceId"], "giorno-demo")
+            self.assertEqual(record["sourceTitle"], "Giorno's Theme")
+            self.assertEqual(record["sourceUrl"], "https://youtu.be/example")
 
     def test_prediction_review_contract_tracks_pending_and_corrected_points(self):
         value = normalize_prediction({

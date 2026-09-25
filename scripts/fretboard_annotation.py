@@ -63,7 +63,8 @@ def _videos(paths, directory):
     return values
 
 
-def _source_metadata(pairs_path="data/pairs.json", source_map_path="runs/video-evidence/source-map-v2.json"):
+def _source_metadata(pairs_path="data/pairs.json", source_map_path="runs/video-evidence/source-map-v2.json",
+                     sources_directory="runs/video-evidence/sources"):
     result = {}
     catalog_path = Path(pairs_path)
     if catalog_path.is_file():
@@ -90,6 +91,20 @@ def _source_metadata(pairs_path="data/pairs.json", source_map_path="runs/video-e
                     result.setdefault(identifier, {}).setdefault("title", row["title"])
                 if isinstance(row.get("sourceUrl"), str):
                     result.setdefault(identifier, {})["sourceUrl"] = row["sourceUrl"]
+    sources = Path(sources_directory)
+    if sources.is_dir():
+        for receipt_path in sorted(sources.glob("*/receipt.json")):
+            try:
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as error:
+                raise ValueError(f"Invalid source receipt: {receipt_path}: {error}") from error
+            identifier, metadata = receipt.get("pairId"), receipt.get("metadata")
+            if not isinstance(identifier, str) or not isinstance(metadata, dict):
+                continue
+            if isinstance(metadata.get("title"), str):
+                result.setdefault(identifier, {})["title"] = metadata["title"]
+            if isinstance(metadata.get("sourceUrl"), str):
+                result.setdefault(identifier, {})["sourceUrl"] = metadata["sourceUrl"]
     return result
 
 
@@ -286,7 +301,33 @@ def _source_titles(catalog_path):
 
 def _source_identifier(video):
     parts = Path(video).parts
-    return next((part for part in reversed(parts) if part.startswith(("tab-", "rc-tab-"))), Path(video).stem)
+    matched = next((part for part in reversed(parts) if part.startswith(("tab-", "rc-tab-"))), None)
+    if matched is not None:
+        return matched
+    path = Path(video)
+    return path.parent.name if path.stem.lower() == "source" else path.stem
+
+
+def refresh_dataset_metadata(dataset):
+    dataset = Path(dataset).resolve()
+    manifest_path = dataset / "manifest.json"
+    if not manifest_path.is_file():
+        raise ValueError("Annotation dataset requires manifest.json.")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if (
+        manifest.get("kind") != "fretboard-keypoint-annotation-dataset"
+        or not isinstance(manifest.get("records"), list)
+    ):
+        raise ValueError("Invalid annotation dataset manifest.")
+    metadata = _source_metadata()
+    for record in manifest["records"]:
+        identifier = _source_identifier(record["sourceVideo"])
+        source = metadata.get(identifier, {})
+        record["sourceId"] = identifier
+        record["sourceTitle"] = source.get("title", identifier)
+        record["sourceUrl"] = source.get("sourceUrl")
+    _publish(manifest_path, manifest)
+    return manifest
 
 
 def _frame_feature(frame):
@@ -1193,6 +1234,8 @@ def parser():
     prefill.add_argument("--device", default="cpu")
     prefill.add_argument("--image-size", type=int, default=1920)
     prefill.add_argument("--confidence", type=float, default=.01)
+    refresh = commands.add_parser("refresh-metadata")
+    refresh.add_argument("--dataset", required=True)
     return result
 
 
@@ -1225,12 +1268,15 @@ def main(argv=None):
         serve(args.dataset, args.port, open_browser=not args.no_browser)
     elif args.command == "export":
         print(json.dumps({"exported": export_yolo(args.dataset)}))
-    else:
+    elif args.command == "prefill":
         predictions = prefill_predictions(
             args.dataset, args.model, device=args.device,
             image_size=args.image_size, confidence=args.confidence,
         )
         print(json.dumps({"predictions": len(predictions["items"])}))
+    else:
+        manifest = refresh_dataset_metadata(args.dataset)
+        print(json.dumps({"records": len(manifest["records"])}))
     return 0
 
 
