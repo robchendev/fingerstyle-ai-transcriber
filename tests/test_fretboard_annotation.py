@@ -42,6 +42,7 @@ class FretboardAnnotationTests(unittest.TestCase):
         self.assertIn('e.key=="Enter"', HTML)
         self.assertIn('e.key=="ArrowLeft"', HTML)
         self.assertIn('e.key=="ArrowRight"', HTML)
+        self.assertIn('$("next").style.visibility=index==state.manifest.records.length-1?"hidden":"visible"', HTML)
         self.assertIn('"complete";if(value.note.trim()', HTML)
         self.assertIn('id="opacity"', HTML)
         self.assertIn('fetch("/api/preferences"', HTML)
